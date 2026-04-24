@@ -106,6 +106,18 @@
             <span class="unit">Hz</span>
           </div>
         </div>
+
+        <div class="form-item">
+          <label class="form-label">作用域：</label>
+          <div class="form-control-wrapper">
+            <select v-model="settings.target" class="form-select">
+              <option value="high">高分辨率分支（默认）</option>
+              <option value="low">低分辨率分支</option>
+              <option value="all">所有分支</option>
+            </select>
+            <span class="unit"></span>
+          </div>
+        </div>
       </div>
 
       <div class="settings-footer">
