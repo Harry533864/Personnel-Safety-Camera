@@ -41,32 +41,33 @@
     </div>
 
     <!-- 相机画面预览 -->
+     <!-- 去掉了`controls`和`loop`属性 -->
     <div class="camera-view-area">
       <div class="video-container" ref="videoContainer">
-        <video
-          v-show="videoLoaded"
+        <video 
           ref="videoPlayer"
           class="video-player"
           autoplay
           muted
           playsinline
         ></video>
-
+        
         <!-- 检测区域叠加层 -->
-        <div class="detection-overlay" v-if="showDetectionOverlay && videoLoaded">
+        <div class="detection-overlay" v-if="showDetectionOverlay">
           <div class="region-marker" style="left: 20%; top: 30%; width: 25%; height: 30%;">
             <span class="region-label">检测区域 1</span>
           </div>
         </div>
 
-        <!-- 视频加载失败的显示层 -->
+        <!-- Placeholder when no video -->
         <div class="video-placeholder" v-if="!videoLoaded">
           <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
             <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
             <circle cx="8.5" cy="8.5" r="1.5"></circle>
             <polyline points="21 15 16 10 5 21"></polyline>
           </svg>
-          <p>{{ errorMessage || '视频加载中...' }}</p>
+          <p>请检查摄像头！</p>
+          <!-- <p class="hint">或点击上方按钮进行设置</p> -->
         </div>
       </div>
 
@@ -84,7 +85,7 @@
             <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
             <circle cx="12" cy="12" r="3"></circle>
           </svg>
-          {{ videoLoaded ? '实时预览' : '连接中...' }}
+          实时预览
         </span>
         <span class="info-item resolution-info" v-if="videoResolution">
           {{ videoResolution }}
@@ -95,23 +96,25 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, nextTick } from "vue";
+import flvjs from 'flv.js';
+import { ref, onMounted, onUnmounted, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useCameraSettingStore, useDetectionSettingStore } from '@/stores/settingsStore';
 
 const router = useRouter();
 const videoPlayer = ref(null);
+const videoContainer = ref(null);
 const videoLoaded = ref(false);
 const videoResolution = ref("");
 const currentTime = ref("");
 const showDetectionOverlay = ref(false);
 const networkSpeed = ref("0.0");
 const networkStatus = ref("normal");
-const errorMessage = ref("");
 
-// WebRTC 相关
-const MEDIAMTX_WHEP_URL = "http://192.168.0.102:8889/stream/whep";   // 推流电脑 IP，使用时修改
-let pc = null;
+// 接收视频流
+let flvPlayer = null;
+const flvUrl = 'http://192.168.0.102:8888/live/stream.flv';
+const errorMessage = ref("");
 
 // 监听`设置相机`的返回结果
 const cameraSettingStore = useCameraSettingStore()
@@ -123,6 +126,7 @@ const detectionSettingStore = useDetectionSettingStore()
   false: 失败  -> 红色
   null: 默认值 -> 灰色
  */
+// const saveCameraState = reactive(cameraSettingStore.getState());
 const cameraState = ref({"active": false, "inactive": false, "unset": true})
 const detectionState = ref({"active": false, "inactive": false, "unset": true})
 
@@ -162,131 +166,171 @@ const simulateNetworkSpeed = () => {
   }
 };
 
-const loadFromSaveState = (saveState, curState) => {
-  if (saveState) {
-    if (saveState.success) {
-      curState.value = { active: true, inactive: false, unset: false };
-    } else if (saveState.unset) {
-      curState.value = { active: false, inactive: false, unset: true };
-    } else {
-      curState.value = { active: false, inactive: true, unset: false };
-    }
-  }
-};
+// 初始化 FLV 播放器
+const initFlvPlayer = () => {
+  const videoEl = videoPlayer.value;
+  if (!videoEl) return;
 
-// ---------- WebRTC 初始化 ----------
-const initWebRTC = async () => {
-  if (!videoPlayer.value) return;
+  // 清理旧实例
+  destroyFlvPlayer();
+
+  if (!flvjs.isSupported()) {
+    errorMessage.value = "当前浏览器不支持 FLV 播放";
+    console.error('flv.js is not supported');
+    return;
+  }
 
   try {
-    // 创建 RTCPeerConnection
-    pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]  // 可加 TURN
+    flvPlayer = flvjs.createPlayer({
+      type: 'flv',
+      url: flvUrl,
+      isLive: true,
+      cors: true,
+      enableWorker: true,
+      enableStashBuffer: false,
+      stashInitialSize: 128,
+      lazyLoad: false,
+      lazyLoadMaxDuration: 0,
+      seekType: 'range',
     });
 
-    // 添加只接收视频的 Transceiver
-    pc.addTransceiver("video", { direction: "recvonly" });
-
-    // 当接收到远程视频轨道时，附加到 video 元素
-    pc.ontrack = (event) => {
-      if (event.track.kind === "video") {
-        const stream = new MediaStream([event.track]);
-        videoPlayer.value.srcObject = stream;
-        videoLoaded.value = true;
-        errorMessage.value = "";
-
-        // 监听分辨率变化（当视频元数据加载后）
-        event.track.onunmute = () => {
-          setTimeout(() => {
-            const settings = event.track.getSettings();
-            if (settings.width && settings.height) {
-              videoResolution.value = `${settings.width}x${settings.height}`;
-            }
-          }, 500);
-        };
-      }
-    };
-
-    // 创建 Offer（SDP）
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // 等待 ICE 候选收集完成（一次性发送，避免 Trickle ICE 复杂度）
-    await new Promise(resolve => {
-      if (pc.iceGatheringState === "complete") {
-        resolve();
-      } else {
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === "complete") resolve();
-        };
+    flvPlayer.on(flvjs.Events.MEDIA_INFO, (mediaInfo) => {
+      console.log('FLV Media Info:', mediaInfo);
+      if (mediaInfo.width && mediaInfo.height) {
+        videoResolution.value = `${mediaInfo.width}x${mediaInfo.height}`;
       }
     });
 
-    // 发送 Offer SDP 到 WHEP 端点
-    const response = await fetch(MEDIAMTX_WHEP_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/sdp" },
-      body: pc.localDescription.sdp
+    flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => {
+      console.log('FLV loading complete');
     });
 
-    if (!response.ok) {
-      throw new Error(`WHEP 请求失败: ${response.status}`);
-    }
+    flvPlayer.on(flvjs.Events.RENDERED_FRAME, () => {
+      videoLoaded.value = true;
+      errorMessage.value = "";
+      console.log('First frame rendered');
+    });
 
-    // 获取 Answer SDP
-    const answerSDP = await response.text();
-    await pc.setRemoteDescription(new RTCSessionDescription({
-      type: "answer",
-      sdp: answerSDP
-    }));
+    flvPlayer.on(flvjs.Events.ERROR, (errorType, errorDetail, errorInfo) => {
+      console.error('FLV Player Error:', errorType, errorDetail, errorInfo);
+      videoLoaded.value = false;
+      errorMessage.value = `播放错误: ${errorType}`;
+      
+      // 自动重连
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        console.log('尝试重新连接...');
+        initFlvPlayer();
+      }, 3000);
+    });
 
-    // 监听连接状态
-    pc.onconnectionstatechange = () => {
-      if (pc?.connectionState === "failed" || pc?.connectionState === "disconnected") {
-        videoLoaded.value = false;
-        errorMessage.value = "WebRTC 连接断开，尝试重连...";
-        // 可在此实现自动重连
-      }
-    };
+    flvPlayer.attachMediaElement(videoEl);
+    flvPlayer.load();
+    flvPlayer.play();
 
   } catch (err) {
-    console.error("WebRTC 初始化失败:", err);
+    console.error('初始化 FLV 播放器失败:', err);
+    errorMessage.value = "播放器初始化失败";
     videoLoaded.value = false;
-    errorMessage.value = "WebRTC 连接失败";
   }
 };
 
-onMounted(async () => {
+// 销毁 FLV 播放器
+const destroyFlvPlayer = () => {
+  if (flvPlayer) {
+    flvPlayer.pause();
+    flvPlayer.unload();
+    flvPlayer.detachMediaElement();
+    flvPlayer.destroy();
+    flvPlayer = null;
+  }
+};
+
+// watch(
+//   () => cameraSettingStore.lastSaveResult,
+//   (newResult) => {
+//     if (newResult) {
+//       if (newResult.success) {
+//         cameraState.value = { active: true, inactive: false, unset: false };
+//         console.log('后端设置成功...');
+//       } else {
+//         cameraState.value = { active: false, inactive: true, unset: false };
+//         console.error('后端设置失败', newResult.message);
+//       }
+//       cameraSettingStore.clearResult();
+//     }
+//   },
+
+//   { immediate: true }
+// );
+
+// watch(
+//   () => detectionSettingStore.lastSaveResult,
+//   (newResult) => {
+//     if (newResult) {
+//       if (newResult.success) {
+//         detectionState.value = { active: true, inactive: false, unset: false };
+//         console.log('后端设置成功...');
+//       } else {
+//         detectionState.value = { active: false, inactive: true, unset: false };
+//         console.error('后端设置失败', newResult.message);
+//       }
+//       detectionSettingStore.clearResult();
+//     }
+//   },
+
+//   { immediate: true }
+// );
+
+onMounted(() => {
   updateTime();
   timeInterval = setInterval(updateTime, 1000);
   speedInterval = setInterval(simulateNetworkSpeed, 2000);
 
-  await nextTick();
-  // initWebRTC();
+//   初始化 FLV 播放器
+  initFlvPlayer();
 
-  const saveCameraState = cameraSettingStore.getState();
-  const saveDetectionState = detectionSettingStore.getState();
-  loadFromSaveState(saveCameraState, cameraState);
-  loadFromSaveState(saveDetectionState, detectionState);
-
-  initWebRTC();
-
-  // 尝试获取设置的分辨率值
-  const saveCameraSettings = cameraSettingStore.getSettings();
-  if (!videoResolution.value && saveCameraSettings.resolution) {
-    videoResolution.value = `${saveCameraSettings.resolution}`;
+  if (videoPlayer.value) {
+    videoPlayer.value.addEventListener("loadeddata", () => {
+      if (!flvPlayer) { // 仅当没有 FLV 播放器时
+        videoLoaded.value = true;
+        const w = videoPlayer.value.videoWidth;
+        const h = videoPlayer.value.videoHeight;
+        if (w && h) {
+          videoResolution.value = `${w}x${h}`;
+        }
+      }
+    });
+    
+    videoPlayer.value.addEventListener("error", () => {
+      if (!flvPlayer) {
+        videoLoaded.value = false;
+      }
+    });
   }
+  
+// //   检查视频是否正常播放
+//   if (videoPlayer.value) {
+//     videoPlayer.value.addEventListener("loadeddata", () => {
+//       videoLoaded.value = true;
+//       const w = videoPlayer.value.videoWidth;
+//       const h = videoPlayer.value.videoHeight;
+//       if (w && h) {
+//         videoResolution.value = `${w}x${h}`;
+//       }
+//     });
+    
+//     videoPlayer.value.addEventListener("error", () => {
+//       videoLoaded.value = false;
+//     });
+//   }
+  
 });
 
 onUnmounted(() => {
-  clearInterval(timeInterval);
-  clearInterval(speedInterval);
-
-  // 关闭 WebRTC 连接
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
+  destroyFlvPlayer();
+  if (timeInterval) clearInterval(timeInterval);
+  if (speedInterval) clearInterval(speedInterval);
 });
 </script>
 
@@ -303,6 +347,7 @@ onUnmounted(() => {
   padding: 0;
 }
 
+/* Operation Bar */
 .operation-bar {
   display: flex;
   justify-content: space-between;
@@ -367,6 +412,7 @@ onUnmounted(() => {
   display: inline;
 }
 
+/* Status Indicator */
 .status-indicator {
   display: flex;
   align-items: center;
@@ -399,7 +445,10 @@ onUnmounted(() => {
   50% { opacity: 0.5; }
 }
 
+/* 相机预览 */
 .camera-view-area {
+  /* width: auto; */
+  /* height: 88%; */
   flex: 1;
   min-height: 0;
   display: flex;
@@ -416,13 +465,17 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: auto;
+  overflow: hidden;
 }
 
-.video-player {
-  display: block;
+ .video-player {
+  width: 90%;
+  height: auto;
+  max-height: 100%;
+  object-fit: cover;  /* 等比例覆盖，填满区域 */
 }
 
+/* Detection Overlay */
 .detection-overlay {
   position: absolute;
   top: 0;
@@ -451,12 +504,8 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
+/* Video Placeholder */
 .video-placeholder {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -465,7 +514,6 @@ onUnmounted(() => {
   gap: 12px;
   text-align: center;
   padding: 20px;
-  background: #0d1117;
 }
 
 .video-placeholder p {
@@ -473,6 +521,12 @@ onUnmounted(() => {
   font-size: 0.9rem;
 }
 
+.video-placeholder .hint {
+  font-size: 0.8rem;
+  color: #6e7681;
+}
+
+/* Video Info Bar */
 .video-info-bar {
   display: flex;
   align-items: center;
@@ -497,6 +551,7 @@ onUnmounted(() => {
   font-weight: 500;
 }
 
+/* Responsive */
 @media (max-width: 768px) {
   .operation-bar {
     padding: 6px 10px;
