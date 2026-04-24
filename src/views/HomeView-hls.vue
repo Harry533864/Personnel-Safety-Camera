@@ -43,6 +43,7 @@
     <!-- 相机画面预览 -->
     <div class="camera-view-area">
       <div class="video-container" ref="videoContainer">
+        <!-- ✅ WebRTC 视频播放：使用 ref 获取 DOM，手动设置 srcObject -->
         <video
           v-show="videoLoaded"
           ref="videoPlayer"
@@ -59,7 +60,7 @@
           </div>
         </div>
 
-        <!-- 视频加载失败的显示层 -->
+        <!-- Placeholder when no video -->
         <div class="video-placeholder" v-if="!videoLoaded">
           <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
             <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
@@ -95,8 +96,9 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, nextTick } from "vue";
 import { useRouter } from "vue-router";
+import Hls from "hls.js";
 import { useCameraSettingStore, useDetectionSettingStore } from '@/stores/settingsStore';
 
 const router = useRouter();
@@ -109,9 +111,9 @@ const networkSpeed = ref("0.0");
 const networkStatus = ref("normal");
 const errorMessage = ref("");
 
-// WebRTC 相关
-const MEDIAMTX_WHEP_URL = "http://192.168.0.102:8889/stream/whep";   // 推流电脑 IP，使用时修改
-let pc = null;
+// ---------- HLS 配置 ----------
+const HLS_URL = "http://192.168.0.102:8080/stream.m3u8"; // 与推流电脑 IP 一致
+let hls = null;
 
 // 监听`设置相机`的返回结果
 const cameraSettingStore = useCameraSettingStore()
@@ -123,6 +125,7 @@ const detectionSettingStore = useDetectionSettingStore()
   false: 失败  -> 红色
   null: 默认值 -> 灰色
  */
+// const saveCameraState = reactive(cameraSettingStore.getState());
 const cameraState = ref({"active": false, "inactive": false, "unset": true})
 const detectionState = ref({"active": false, "inactive": false, "unset": true})
 
@@ -162,97 +165,70 @@ const simulateNetworkSpeed = () => {
   }
 };
 
-const loadFromSaveState = (saveState, curState) => {
-  if (saveState) {
-    if (saveState.success) {
-      curState.value = { active: true, inactive: false, unset: false };
-    } else if (saveState.unset) {
-      curState.value = { active: false, inactive: false, unset: true };
-    } else {
-      curState.value = { active: false, inactive: true, unset: false };
-    }
+const initHls = () => {
+  if (!videoPlayer.value) return;
+
+  const video = videoPlayer.value;
+
+  // 判断浏览器是否原生支持 HLS (如 Safari)
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = HLS_URL;
+    video.addEventListener("loadedmetadata", () => {
+      videoLoaded.value = true;
+      errorMessage.value = "";
+      videoResolution.value = `${video.videoWidth}x${video.videoHeight}`;
+    });
+    video.addEventListener("error", (e) => {
+      console.error("视频错误", e);
+      videoLoaded.value = false;
+      errorMessage.value = "视频源加载失败";
+    });
+  }
+  // 其他浏览器使用 hls.js
+  else if (Hls.isSupported()) {
+    hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,   // 可根据需要开启低延迟
+      backBufferLength: 90      // 保持一定回放缓冲区
+    });
+    hls.loadSource(HLS_URL);
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      videoLoaded.value = true;
+      errorMessage.value = "";
+      video.play().catch(e => console.warn("自动播放受限:", e));
+    });
+
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (data.fatal) {
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            errorMessage.value = "网络错误，正在尝试重连...";
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            errorMessage.value = "媒体错误，尝试恢复...";
+            hls.recoverMediaError();
+            break;
+          default:
+            errorMessage.value = "HLS 加载失败";
+            videoLoaded.value = false;
+            break;
+        }
+      }
+    });
+  }
+  // 完全不支持 HLS
+  else {
+    errorMessage.value = "当前浏览器不支持播放视频流";
   }
 };
 
-// ---------- WebRTC 初始化 ----------
-const initWebRTC = async () => {
-  if (!videoPlayer.value) return;
-
-  try {
-    // 创建 RTCPeerConnection
-    pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]  // 可加 TURN
-    });
-
-    // 添加只接收视频的 Transceiver
-    pc.addTransceiver("video", { direction: "recvonly" });
-
-    // 当接收到远程视频轨道时，附加到 video 元素
-    pc.ontrack = (event) => {
-      if (event.track.kind === "video") {
-        const stream = new MediaStream([event.track]);
-        videoPlayer.value.srcObject = stream;
-        videoLoaded.value = true;
-        errorMessage.value = "";
-
-        // 监听分辨率变化（当视频元数据加载后）
-        event.track.onunmute = () => {
-          setTimeout(() => {
-            const settings = event.track.getSettings();
-            if (settings.width && settings.height) {
-              videoResolution.value = `${settings.width}x${settings.height}`;
-            }
-          }, 500);
-        };
-      }
-    };
-
-    // 创建 Offer（SDP）
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // 等待 ICE 候选收集完成（一次性发送，避免 Trickle ICE 复杂度）
-    await new Promise(resolve => {
-      if (pc.iceGatheringState === "complete") {
-        resolve();
-      } else {
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === "complete") resolve();
-        };
-      }
-    });
-
-    // 发送 Offer SDP 到 WHEP 端点
-    const response = await fetch(MEDIAMTX_WHEP_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/sdp" },
-      body: pc.localDescription.sdp
-    });
-
-    if (!response.ok) {
-      throw new Error(`WHEP 请求失败: ${response.status}`);
-    }
-
-    // 获取 Answer SDP
-    const answerSDP = await response.text();
-    await pc.setRemoteDescription(new RTCSessionDescription({
-      type: "answer",
-      sdp: answerSDP
-    }));
-
-    // 监听连接状态
-    pc.onconnectionstatechange = () => {
-      if (pc?.connectionState === "failed" || pc?.connectionState === "disconnected") {
-        videoLoaded.value = false;
-        errorMessage.value = "WebRTC 连接断开，尝试重连...";
-        // 可在此实现自动重连
-      }
-    };
-
-  } catch (err) {
-    console.error("WebRTC 初始化失败:", err);
-    videoLoaded.value = false;
-    errorMessage.value = "WebRTC 连接失败";
+const checkResolution = () => {
+  const video = videoPlayer.value;
+  if (video && video.videoWidth && video.videoHeight) {
+    videoResolution.value = `${video.videoWidth}x${video.videoHeight}`;
   }
 };
 
@@ -260,32 +236,22 @@ onMounted(async () => {
   updateTime();
   timeInterval = setInterval(updateTime, 1000);
   speedInterval = setInterval(simulateNetworkSpeed, 2000);
+//   resolutionInterval = setInterval(checkResolution, 1000);
 
+  // 等待 DOM 渲染后初始化 HLS
   await nextTick();
-  // initWebRTC();
-
-  const saveCameraState = cameraSettingStore.getState();
-  const saveDetectionState = detectionSettingStore.getState();
-  loadFromSaveState(saveCameraState, cameraState);
-  loadFromSaveState(saveDetectionState, detectionState);
-
-  initWebRTC();
-
-  // 尝试获取设置的分辨率值
-  const saveCameraSettings = cameraSettingStore.getSettings();
-  if (!videoResolution.value && saveCameraSettings.resolution) {
-    videoResolution.value = `${saveCameraSettings.resolution}`;
-  }
+  initHls();
 });
 
 onUnmounted(() => {
-  clearInterval(timeInterval);
-  clearInterval(speedInterval);
+  if (timeInterval) clearInterval(timeInterval);
+  if (speedInterval) clearInterval(speedInterval);
+//   if (resolutionInterval) clearInterval(resolutionInterval);
 
-  // 关闭 WebRTC 连接
-  if (pc) {
-    pc.close();
-    pc = null;
+  // 销毁 hls 实例
+  if (hls) {
+    hls.destroy();
+    hls = null;
   }
 });
 </script>
@@ -416,11 +382,13 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: auto;
+  overflow: hidden;
 }
 
 .video-player {
-  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .detection-overlay {

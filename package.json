@@ -8,7 +8,10 @@
   },
   "dependencies": {
     "vue": "^3.2.47",
-    "vue-router": "^4.1.6"
+    "vue-router": "^4.1.6",
+    "pinia": "^2.1.7",
+    "hls.js": "^1.5.0",
+    "flv.js": "^1.6.2"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^4.0.0",
