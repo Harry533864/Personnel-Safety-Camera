@@ -28,11 +28,20 @@
           <label class="form-label">曝光时间：</label>
           <div class="form-control-wrapper">
             <select v-model="settings.exposure" class="form-select">
-              <option value="auto">自动</option>
-              <option value="1/30">1/30 s</option>
-              <option value="1/60">1/60 s</option>
-              <option value="1/120">1/120 s</option>
-              <option value="1/250">1/250 s</option>
+              <option value="-1">-1</option>
+              <option value="-2">-2</option>
+              <option value="-3">-3</option>
+              <option value="-4">-4</option>
+              <option value="-5">-5</option>
+              <option value="-6">-6</option>
+              <option value="-7">-7</option>
+              <option value="-8">-8</option>
+              <option value="-9">-9</option>
+              <option value="-10">-10</option>
+              <option value="-11">-11</option>
+              <option value="-12">-12</option>
+              <option value="-13">-13</option>
+              <option value="0">自动</option>
             </select>
           </div>
         </div>
@@ -47,6 +56,18 @@
               <option value="15">15</option>
             </select>
             <span class="unit">fps</span>
+          </div>
+        </div>
+
+        <div class="form-item">
+          <label class="form-label">作用域：</label>
+          <div class="form-control-wrapper">
+            <select v-model="settings.target" class="form-select">
+              <option value="high">高分辨率分支（默认）</option>
+              <option value="low">低分辨率分支</option>
+              <option value="all">所有分支</option>
+            </select>
+            <span class="unit"></span>
           </div>
         </div>
 
