@@ -4,7 +4,7 @@ import time
 import threading
 
 class CamStream:
-    def __init__(self, url, ffmpeg_exe="ffmpeg", name="cam_default", width=1920, height=1080, fps=30):
+    def __init__(self, url, ffmpeg_exe="ffmpeg", name="cam_default", width=1920, height=1080, fps=15):
         self.name = name
         self.url = url
         self.ffmpeg_exe = ffmpeg_exe # 默认Linux下的 "ffmpeg" windows下需要直接传入路径
@@ -70,7 +70,8 @@ class CamStream:
 
     def _stream_task(self):
         """实际执行推流的后台任务"""
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        # TODO `0` 还是 `1`取决于实际情况，不应该硬编码
+        cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         # 推流配置初始化
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # 缓存区设置
         # cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width) # 分辨率设置
@@ -84,6 +85,15 @@ class CamStream:
 
         try:
             while self._is_running:
+                # 若改变则重新申请cap
+                # TODO 包装为一个函数
+                if self._res_changed or self._exposure_changed:
+                    if cap is not None:
+                        cap.release()
+                    
+                    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
                 # 1. 检查分辨率是否改变，若改变则关闭旧进程
                 if self._res_changed:
                     if proc:

@@ -9,12 +9,16 @@ from app import app
 from flask import render_template, request, jsonify, send_file
 import os
 
-from Cam.CamStream import CamStream
-FFMPEG_EXE = "D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe"
-URL_LOW = "rtmp://127.0.0.1:1935/cam_low"
-URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
+from app.Cam.CamStream import CamStream
+# TODO 这些应该写入配置文件就好，配置文件添加到gitignore
+FFMPEG_EXE = r"xxx/Cam_flaskvue/app/Cam/ffmpeg/bin/ffmpeg.exe"
+URL_LOW = "rtmp://ip:1935/cam_low"
+URL_HIGH = "rtmp://ip:1935/cam_high"
 stream_low = CamStream(url=URL_LOW, ffmpeg_exe=FFMPEG_EXE, width=1280, height=720, name="cam_low")
 stream_high = CamStream(url=URL_HIGH, ffmpeg_exe=FFMPEG_EXE, width=1920, height=1080, name="cam_high")
+
+# stream_low.start()
+stream_high.start()
 
 
 @app.route('/')
