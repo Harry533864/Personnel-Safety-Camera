@@ -30,6 +30,21 @@
           </svg>
           <span class="btn-label">检测设置</span>
         </button>
+
+        <button
+          class="operation-btn"
+          :class="{ active: detectionRegionState.active, inactive: detectionRegionState.inactive, unset: detectionRegionState.unset }"
+          @click="goToDetectionRegion"
+          title="检测区域"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 4h6v6H4z"></path>
+            <path d="M14 4h6v6h-6z"></path>
+            <path d="M4 14h6v6H4z"></path>
+            <path d="M14 14h6v6h-6z"></path>
+          </svg>
+          <span class="btn-label">检测区域</span>
+        </button>
       </div>
 
       <div class="operation-bar-right">
@@ -54,8 +69,13 @@
 
         <!-- 检测区域叠加层 -->
         <div class="detection-overlay" v-if="showDetectionOverlay && videoLoaded">
-          <div class="region-marker" style="left: 20%; top: 30%; width: 25%; height: 30%;">
-            <span class="region-label">检测区域 1</span>
+          <div
+            v-for="region in persistedRegions"
+            :key="region.id"
+            class="region-marker"
+            :style="getRegionStyle(region)"
+          >
+            <span class="region-label">{{ `检测区域 ${region.id}` }}</span>
           </div>
         </div>
 
@@ -95,16 +115,19 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, nextTick } from "vue";
+import { computed, ref, reactive, onMounted, onUnmounted, nextTick } from "vue";
 import { useRouter } from "vue-router";
-import { useCameraSettingStore, useDetectionSettingStore } from '@/stores/settingsStore';
+import {
+  useCameraSettingStore,
+  useDetectionRegionStore,
+  useDetectionSettingStore,
+} from '@/stores/settingsStore';
 
 const router = useRouter();
 const videoPlayer = ref(null);
 const videoLoaded = ref(false);
 const videoResolution = ref("");
 const currentTime = ref("");
-const showDetectionOverlay = ref(false);
 const networkSpeed = ref("0.0");
 const networkStatus = ref("normal");
 const errorMessage = ref("");
@@ -116,6 +139,7 @@ let pc = null;
 // 监听`设置相机`的返回结果
 const cameraSettingStore = useCameraSettingStore()
 const detectionSettingStore = useDetectionSettingStore()
+const detectionRegionStore = useDetectionRegionStore()
 
 /*
   用于表达各种案件设置的状态
@@ -125,11 +149,43 @@ const detectionSettingStore = useDetectionSettingStore()
  */
 const cameraState = ref({"active": false, "inactive": false, "unset": true})
 const detectionState = ref({"active": false, "inactive": false, "unset": true})
+const detectionRegionState = ref({"active": false, "inactive": false, "unset": true})
 
 // 状态持久化
 
 let timeInterval = null;
 let speedInterval = null;
+
+const parseResolutionString = (value) => {
+  if (!value || !value.includes("x")) {
+    return { width: 1920, height: 1080 };
+  }
+
+  const [width, height] = value.split("x").map(Number);
+  return {
+    width: width || 1920,
+    height: height || 1080,
+  };
+};
+
+const overlayResolution = computed(() => {
+  if (videoResolution.value) {
+    return parseResolutionString(videoResolution.value);
+  }
+
+  return parseResolutionString(cameraSettingStore.settings.resolution);
+});
+
+const currentRegionTarget = computed(
+  () => detectionRegionStore.getCurrentTarget() || detectionSettingStore.settings.target || "all"
+);
+
+const persistedRegions = computed(() =>
+  detectionRegionStore.getRegions(currentRegionTarget.value) || []
+);
+const showDetectionOverlay = computed(
+  () => detectionSettingStore.settings.detectionEnabled && persistedRegions.value.length > 0
+);
 
 const goToCameraSettings = () => {
   router.push("/camera-settings");
@@ -137,6 +193,10 @@ const goToCameraSettings = () => {
 
 const goToDetectionSettings = () => {
   router.push("/detection-settings");
+};
+
+const goToDetectionRegion = () => {
+  router.push("/detection-region");
 };
 
 const updateTime = () => {
@@ -172,6 +232,18 @@ const loadFromSaveState = (saveState, curState) => {
       curState.value = { active: false, inactive: true, unset: false };
     }
   }
+};
+
+const getRegionStyle = (region) => {
+  const { width, height } = overlayResolution.value;
+  const rect = region.rect || {};
+
+  return {
+    left: `${((rect.x1 || 0) / width) * 100}%`,
+    top: `${((rect.y1 || 0) / height) * 100}%`,
+    width: `${(((rect.x2 || 0) - (rect.x1 || 0)) / width) * 100}%`,
+    height: `${(((rect.y2 || 0) - (rect.y1 || 0)) / height) * 100}%`,
+  };
 };
 
 // ---------- WebRTC 初始化 ----------
@@ -266,8 +338,10 @@ onMounted(async () => {
 
   const saveCameraState = cameraSettingStore.getState();
   const saveDetectionState = detectionSettingStore.getState();
+  const saveDetectionRegionState = detectionRegionStore.getState();
   loadFromSaveState(saveCameraState, cameraState);
   loadFromSaveState(saveDetectionState, detectionState);
+  loadFromSaveState(saveDetectionRegionState, detectionRegionState);
 
   initWebRTC();
 
