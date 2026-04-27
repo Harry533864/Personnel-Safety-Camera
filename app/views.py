@@ -7,15 +7,47 @@ This file creates your application.
 
 from app import app
 from flask import render_template, request, jsonify, send_file
+from app.Cam.CamStream import CamStream
+from app.Cam.CamManager import CamManager
 import os
 
-from Cam.CamStream import CamStream
 FFMPEG_EXE = "D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe"
 URL_LOW = "rtmp://127.0.0.1:1935/cam_low"
 URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
-stream_low = CamStream(url=URL_LOW, ffmpeg_exe=FFMPEG_EXE, width=1280, height=720, name="cam_low")
-stream_high = CamStream(url=URL_HIGH, ffmpeg_exe=FFMPEG_EXE, width=1920, height=1080, name="cam_high")
 
+# 摄像头硬件层读取参数设置
+ORI_WIDTH = 1280
+ORI_HEIGHT = 720
+ORI_FPS = 30
+CAMERA_ID = 0
+cam_manager = CamManager(camera_id=CAMERA_ID, width=ORI_WIDTH, height=ORI_HEIGHT, fps=ORI_FPS)
+
+# 两路分流
+HIGH_WIDTH, HIGH_HEIGHT = 1280, 720
+LOW_WIDTH, LOW_HEIGHT = 640, 480
+HIGH_FPS, LOW_FPS = 30, 15
+stream_high = CamStream(
+        name="cam_high",
+        url=URL_HIGH, 
+        ffmpeg_exe=FFMPEG_EXE, 
+        width=HIGH_WIDTH, 
+        height=HIGH_HEIGHT, 
+        fps=HIGH_FPS
+    )
+stream_low = CamStream(
+        name="cam_low",  
+        url=URL_HIGH, 
+        ffmpeg_exe=FFMPEG_EXE, 
+        width=LOW_WIDTH, 
+        height=LOW_HEIGHT, 
+        fps=LOW_FPS
+    )
+# CamStream添加到CamManager类统一管理
+cam_manager.add_worker(stream_high)
+cam_manager.add_worker(stream_low)
+
+
+cam_manager.start() # 全局启动推流 [不用单独启动]
 
 @app.route('/')
 def index():
@@ -25,8 +57,7 @@ def index():
 def start_streams():
     """启动两路推流"""
     try:
-        stream_low.start()
-        stream_high.start()
+        cam_manager.start()
         return jsonify({
             "status": "success", 
             "message": "双路推流请求已执行 (1280x720 & 1920x1080)"
@@ -41,8 +72,7 @@ def start_streams():
 def stop_streams():
     """停止两路推流"""
     try:
-        stream_low.stop()
-        stream_high.stop()
+        cam_manager.stop()
         return jsonify({
             "status": "success", 
             "message": "双路推流已停止"
@@ -56,29 +86,22 @@ def stop_streams():
 @app.route('/api/stream/exposure', methods=['POST'])
 def set_exposure():
     """
-    设置曝光参数
-    接收 JSON 格式: {"value": 0, "target": "all"} 
+    设置曝光参数 (硬件全局生效)
+    接收 JSON 格式: {"value": 0} 
     - value: 0 为自动，-1 ~ -13 为手动
-    - target: 可选值为 "low", "high", "all" (默认 "high")
     """
     data = request.get_json()
-    
     if data is None or 'value' not in data:
         return jsonify({"status": "error", "message": "缺少 value 参数"}), 400
     
     try:
         val = int(data['value'])
-        target = data.get('target', 'high').lower()
-        
-        # 根据 target 决定作用于哪个实例
-        if target in ['low', 'all']:
-            stream_low.set_exposure(val)
-        if target in ['high', 'all']:
-            stream_high.set_exposure(val)
+        # 曝光是硬件属性，直接通过 cam_manager 修改，对所有流同步生效
+        cam_manager.set_exposure(val)
             
         return jsonify({
             "status": "success", 
-            "message": f"曝光请求已接收: {val} (作用目标: {target})"
+            "message": f"全局硬件曝光已设置为: {val} (0为自动)"
         })
     except ValueError:
         return jsonify({"status": "error", "message": "value 必须是整数"}), 400
@@ -86,19 +109,16 @@ def set_exposure():
 @app.route('/api/stream/resolution', methods=['POST'])
 def set_resolution():
     """
-    设置分辨率
-    接收 JSON 格式: {"width": 1920, "height": 1080, "target": "high"}
-    - target: 可选值为 "low", "high", "all" (默认 "high")
+    设置特定流的分辨率 (软件缩放/编码生效)
+    接收 JSON 格式: {"width": 1280, "height": 720, "target": "high"}
+    - target: "low", "high", "all"
     """
     data = request.get_json()
-    
     if data is None or 'width' not in data or 'height' not in data:
         return jsonify({"status": "error", "message": "缺少 width 或 height 参数"}), 400
     
     try:
-        w = int(data['width'])
-        h = int(data['height'])
-        # 分辨率修改通常针对特定流，这里默认只改高画质流
+        w, h = int(data['width']), int(data['height'])
         target = data.get('target', 'high').lower() 
         
         if target in ['low', 'all']:
@@ -108,10 +128,38 @@ def set_resolution():
             
         return jsonify({
             "status": "success", 
-            "message": f"分辨率切换请求已接收: {w}x{h} (作用目标: {target})"
+            "message": f"分辨率切换请求已执行: {w}x{h} (目标: {target})"
         })
     except ValueError:
-        return jsonify({"status": "error", "message": "width 和 height 必须是整数"}), 400
+        return jsonify({"status": "error", "message": "参数必须是整数"}), 400
+    
+@app.route('/api/stream/fps', methods=['POST'])
+def set_fps():
+    """
+    设置特定流的帧率 (FFmpeg 编码帧率)
+    接收 JSON 格式: {"fps": 30, "target": "high"}
+    - target: "low", "high", "all"
+    """
+    data = request.get_json()
+    if data is None or 'fps' not in data:
+        return jsonify({"status": "error", "message": "缺少 fps 参数"}), 400
+    
+    try:
+        new_fps = int(data['fps'])
+        target = data.get('target', 'high').lower()
+        
+        # 注意：此操作会导致对应的 FFmpeg 进程重启以应用新帧率
+        if target in ['low', 'all']:
+            stream_low.set_fps(new_fps)
+        if target in ['high', 'all']:
+            stream_high.set_fps(new_fps)
+            
+        return jsonify({
+            "status": "success", 
+            "message": f"帧率修改请求已执行: {new_fps} (目标: {target})"
+        })
+    except ValueError:
+        return jsonify({"status": "error", "message": "fps 必须是整数"}), 400
 
 ###
 # The functions below should be applicable to all Flask apps.
