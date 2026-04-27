@@ -5,13 +5,52 @@ const STORAGE_KEY_CAMERA = 'camera_settings'
 const STORAGE_KEY_CAMERA_STATE = 'camera_save_result'
 const STORAGE_KEY_DETECTION = 'detection_settings'
 const STORAGE_KEY_DETECTION_STATE = 'detection_save_result'
+const STORAGE_KEY_DETECTION_REGION = 'detection_region_settings'
+const STORAGE_KEY_DETECTION_REGION_STATE = 'detection_region_save_result'
+
+const cloneValue = (value) => JSON.parse(JSON.stringify(value))
+
+const normalizeDetectionRegionData = (raw) => {
+  const defaults = {
+    currentTarget: 'all',
+    byTarget: {
+      all: [],
+      high: [],
+      low: [],
+    },
+  }
+
+  if (!raw) {
+    return cloneValue(defaults)
+  }
+
+  if (Array.isArray(raw)) {
+    return {
+      currentTarget: 'all',
+      byTarget: {
+        all: cloneValue(raw),
+        high: [],
+        low: [],
+      },
+    }
+  }
+
+  return {
+    currentTarget: raw.currentTarget || 'all',
+    byTarget: {
+      all: Array.isArray(raw.byTarget?.all) ? cloneValue(raw.byTarget.all) : [],
+      high: Array.isArray(raw.byTarget?.high) ? cloneValue(raw.byTarget.high) : [],
+      low: Array.isArray(raw.byTarget?.low) ? cloneValue(raw.byTarget.low) : [],
+    },
+  }
+}
 
 const loadFromStorage = (key, defaults) => {
   try {
     const raw = localStorage.getItem(key)
-    return raw ? JSON.parse(raw) : { ...defaults }
+    return raw ? JSON.parse(raw) : cloneValue(defaults)
   } catch {
-    return { ...defaults }
+    return cloneValue(defaults)
   }
 }
 
@@ -139,7 +178,7 @@ const DETECTION_DEFAULTS = {
   matchEnabled: true,
   matchThreshold: 0.50,
   matchFrequency: 5,
-  target: 'high',
+  target: 'all',
 }
 
 // TODO 调试检测接口
@@ -182,6 +221,82 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
     },
     getSettings() {
       return { ...this.settings }
+    },
+    getState() {
+      return { ...this.lastSaveResult }
+    },
+    clearResult() {
+      this.lastSaveResult = { unset: true }
+    },
+  },
+})
+
+// ========== 检测区域 ==========
+const DETECTION_REGION_DEFAULTS = {
+  currentTarget: 'all',
+  byTarget: {
+    all: [],
+    high: [],
+    low: [],
+  },
+}
+
+export const useDetectionRegionStore = defineStore('detectionRegion', {
+  state: () => ({
+    data: normalizeDetectionRegionData(
+      loadFromStorage(STORAGE_KEY_DETECTION_REGION, DETECTION_REGION_DEFAULTS)
+    ),
+    lastSaveResult: loadFromStorage(STORAGE_KEY_DETECTION_REGION_STATE, { unset: true }),
+  }),
+  actions: {
+    async saveRegions(regions, options = {}) {
+      const target = options.target || this.data.currentTarget || 'all'
+      const clear = Boolean(options.clear)
+
+      try {
+        const response = await fetch('/api/detection/regions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            target,
+            clear,
+            ...(clear ? {} : { regions: cloneValue(regions) }),
+          }),
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const data = await response.json()
+        if (data.status === 'success') {
+          this.data.currentTarget = target
+          this.data.byTarget[target] = clear ? [] : cloneValue(regions)
+          saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
+          this.lastSaveResult = { success: true, message: data.message || '保存成功' }
+          saveToStorage(STORAGE_KEY_DETECTION_REGION_STATE, this.lastSaveResult)
+          return true
+        }
+
+        throw new Error(data.message || '检测区域保存失败')
+      } catch (error) {
+        this.lastSaveResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_DETECTION_REGION_STATE, this.lastSaveResult)
+        return false
+      }
+    },
+    async clearRegions(options = {}) {
+      return this.saveRegions([], { ...options, clear: true })
+    },
+    getRegions(target = this.data.currentTarget || 'all') {
+      return cloneValue(this.data.byTarget[target] || [])
+    },
+    getCurrentTarget() {
+      return this.data.currentTarget || 'all'
+    },
+    setCurrentTarget(target) {
+      this.data.currentTarget = target || 'all'
+      saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
     },
     getState() {
       return { ...this.lastSaveResult }
