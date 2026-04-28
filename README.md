@@ -11,19 +11,22 @@ This template should help get you started developing with Vue 3 on the frontend 
 See [Vite Configuration Reference](https://vitejs.dev/config/).
 
 ## Project Setup
-
 ```sh
 npm install
 ```
 
-### Compile and Hot-Reload for Development
+### Modify and Check the Environment Variable
+```sh
+cp .env.sample .env
+```
+- Then modify variables like **VITE_FLASK_BACKEND_URL** and **VITE_VIDEO_STREAM_URL**. Notice that the variable shoule begin with `VITE_`
 
+### Compile and Hot-Reload for Development
 ```sh
 npm run dev
 ```
 
 ### Compile and Minify for Production
-
 ```sh
 npm run build
 ```

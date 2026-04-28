@@ -134,7 +134,8 @@ const networkStatus = ref("normal");
 const errorMessage = ref("");
 
 // WebRTC 相关
-const MEDIAMTX_WHEP_URL = "http://192.168.0.102:8889/cam_high/whep";   // 推流电脑 IP，使用时修改
+const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL
+const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;   // 推流电脑 IP，使用时修改
 let pc = null;
 
 // 监听`设置相机`的返回结果
@@ -401,6 +402,9 @@ const initWebRTC = async () => {
     console.error("WebRTC 初始化失败:", err);
     videoLoaded.value = false;
     errorMessage.value = "WebRTC 连接失败";
+
+    // 尝试重连
+    handleConnectionFailed();
   }
 };
 

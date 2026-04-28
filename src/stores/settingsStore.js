@@ -1,5 +1,12 @@
 import { defineStore } from 'pinia'
 
+// 从环境变量中获取后端路由ip
+const API_URL = import.meta.env.VITE_FLASK_BACKEND_URL;
+
+export function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // ========== 持久化工具函数 ==========
 const STORAGE_KEY_CAMERA = 'camera_settings'
 const STORAGE_KEY_CAMERA_STATE = 'camera_save_result'
@@ -83,7 +90,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
         if (settings.exposure !== this.settings.exposure) {
           console.log("设置曝光...")
           try {
-            const response = await fetch('http://192.168.0.102:5000/api/stream/exposure', {
+            const response = await fetch(`${API_URL}/api/stream/exposure`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -110,7 +117,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
           console.log("设置分辨率...")
           try {
             const [width, height] = settings.resolution.split('x').map(Number)
-            const response = await fetch('http://192.168.0.102:5000/api/stream/resolution', {
+            const response = await fetch(`${API_URL}/api/stream/resolution`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -190,7 +197,7 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
   actions: {
     async saveSettings(settings) {
       try {
-        const response = await fetch('/api/detection/settings', {
+        const response = await fetch(`${API_URL}/api/detection/region`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
