@@ -87,6 +87,7 @@
             <polyline points="21 15 16 10 5 21"></polyline>
           </svg>
           <p>{{ errorMessage || '视频加载中...' }}</p>
+          <button @click="manualReconnect" v-if="manualReconnectVisiable" class="reconnect-btn">重新连接</button>
         </div>
       </div>
 
@@ -151,10 +152,16 @@ const cameraState = ref({"active": false, "inactive": false, "unset": true})
 const detectionState = ref({"active": false, "inactive": false, "unset": true})
 const detectionRegionState = ref({"active": false, "inactive": false, "unset": true})
 
-// 状态持久化
-
 let timeInterval = null;
 let speedInterval = null;
+
+// 重连机制
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let isConnecting = false;
+let manualReconnectVisiable = false;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const BASE_RECONNECT_DELAY = 1000;
 
 const parseResolutionString = (value) => {
   if (!value || !value.includes("x")) {
@@ -244,11 +251,71 @@ const getRegionStyle = (region) => {
     width: `${(((rect.x2 || 0) - (rect.x1 || 0)) / width) * 100}%`,
     height: `${(((rect.y2 || 0) - (rect.y1 || 0)) / height) * 100}%`,
   };
+
+// 关闭现有连接
+const closeWebRTC = () => {
+  if (pc) {
+    pc.ontrack = null;
+    pc.onconnectionstatechange = null;
+    pc.close();
+    pc = null;
+  }
+  videoLoaded.value = false;
+};
+
+// 触发重连（带退避）
+const scheduleReconnect = () => {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    errorMessage.value = '连接失败，请刷新页面后再次尝试连接或手动重连.';
+
+    manualReconnectVisiable = true;
+    return;
+  }
+  const delay = BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts);
+  reconnectTimer = setTimeout(() => {
+    reconnect();
+  }, delay);
+};
+
+// 实际执行重连
+const reconnect = async () => {
+  if (isConnecting) return;
+  isConnecting = true;
+  closeWebRTC();
+  try {
+    await initWebRTC();
+
+    // 连接成功
+    reconnectAttempts = 0;
+    errorMessage.value = '';
+    manualReconnectVisiable = false;
+  } catch (err) {
+    reconnectAttempts++;
+    scheduleReconnect();
+  } finally {
+    isConnecting = false;
+  }
+};
+
+// 处理连接失败（网络断开 or 远端错误）
+const handleConnectionFailed = () => {
+  if (videoLoaded.value === false && reconnectAttempts === 0) {
+    // 初次失败立即开始重连
+    scheduleReconnect();
+  } else if (videoLoaded.value === true) {
+    // 原本连接正常，突然断开
+    videoLoaded.value = false;
+    errorMessage.value = '视频流中断，正在重连...';
+    scheduleReconnect();
+  }
 };
 
 // ---------- WebRTC 初始化 ----------
 const initWebRTC = async () => {
   if (!videoPlayer.value) return;
+  // 先关闭可能存在的旧连接
+  closeWebRTC();
 
   try {
     // 创建 RTCPeerConnection
@@ -314,10 +381,18 @@ const initWebRTC = async () => {
 
     // 监听连接状态
     pc.onconnectionstatechange = () => {
-      if (pc?.connectionState === "failed" || pc?.connectionState === "disconnected") {
-        videoLoaded.value = false;
-        errorMessage.value = "WebRTC 连接断开，尝试重连...";
-        // 可在此实现自动重连
+      if (!pc) return;
+      const state = pc.connectionState;
+
+      if (state === 'failed' || state === 'disconnected') {
+        handleConnectionFailed();
+      } else if (state === 'connected') {
+        // 连接恢复时重置重试次数
+        reconnectAttempts = 0;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
       }
     };
 
@@ -326,6 +401,16 @@ const initWebRTC = async () => {
     videoLoaded.value = false;
     errorMessage.value = "WebRTC 连接失败";
   }
+};
+
+// 手动重连
+const manualReconnect = () => {
+  if (isConnecting) return;
+
+  // 重置重试计数，立即重连
+  reconnectAttempts = 0;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnect();
 };
 
 onMounted(async () => {
@@ -355,12 +440,8 @@ onMounted(async () => {
 onUnmounted(() => {
   clearInterval(timeInterval);
   clearInterval(speedInterval);
-
-  // 关闭 WebRTC 连接
-  if (pc) {
-    pc.close();
-    pc = null;
-  }
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  closeWebRTC();
 });
 </script>
 
@@ -569,6 +650,19 @@ onUnmounted(() => {
 .resolution-info {
   color: #58a6ff;
   font-weight: 500;
+}
+
+.reconnect-btn {
+  margin-top: 12px;
+  padding: 6px 12px;
+  background: #238636;
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+}
+.reconnect-btn:hover {
+  background: #2ea043;
 }
 
 @media (max-width: 768px) {

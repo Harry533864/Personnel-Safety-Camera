@@ -27,22 +27,16 @@
         <div class="form-item">
           <label class="form-label">曝光时间：</label>
           <div class="form-control-wrapper">
-            <select v-model="settings.exposure" class="form-select">
-              <option value="-1">-1</option>
-              <option value="-2">-2</option>
-              <option value="-3">-3</option>
-              <option value="-4">-4</option>
-              <option value="-5">-5</option>
-              <option value="-6">-6</option>
-              <option value="-7">-7</option>
-              <option value="-8">-8</option>
-              <option value="-9">-9</option>
-              <option value="-10">-10</option>
-              <option value="-11">-11</option>
-              <option value="-12">-12</option>
-              <option value="-13">-13</option>
-              <option value="0">自动</option>
-            </select>
+            <input
+              type="number"
+              v-model.number="settings.exposure"
+              class="form-input"
+              min="1"
+              max="10000"
+              step="1"
+              @change="validateExposure"
+            />
+            <span class="unit">1 ~ 10000 us</span>
           </div>
         </div>
 
@@ -115,6 +109,18 @@ const confirmSettings = async () => {
 
   // 返回首页
   router.push("/");
+};
+
+// 校验曝光值
+const validateExposure = () => {
+  let val = settings.exposure
+  if (val === null || val === undefined || isNaN(val)) {
+    settings.exposure = 1000
+  } else if (val < 1) {
+    settings.exposure = 1
+  } else if (val > 10000) {
+    settings.exposure = 10000
+  }
 };
 </script>
 
