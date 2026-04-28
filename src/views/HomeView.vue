@@ -251,6 +251,7 @@ const getRegionStyle = (region) => {
     width: `${(((rect.x2 || 0) - (rect.x1 || 0)) / width) * 100}%`,
     height: `${(((rect.y2 || 0) - (rect.y1 || 0)) / height) * 100}%`,
   };
+};
 
 // 关闭现有连接
 const closeWebRTC = () => {
