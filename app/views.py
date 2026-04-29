@@ -35,8 +35,8 @@ stream_high = CamStream(
         fps=HIGH_FPS
     )
 stream_low = CamStream(
-        name="cam_low",  
-        url=URL_HIGH, 
+        name="cam_low",
+        url=URL_LOW,
         ffmpeg_exe=FFMPEG_EXE, 
         width=LOW_WIDTH, 
         height=LOW_HEIGHT, 

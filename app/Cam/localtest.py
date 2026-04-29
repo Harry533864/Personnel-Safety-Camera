@@ -1,5 +1,5 @@
-from ..CamManager import CamManager
-from ..CamStream import CamStream
+from CamManager import CamManager
+from CamStream import CamStream
 import time
 
 def test_simple_stream():

@@ -24,18 +24,22 @@ class CamStream:
         self._is_running = False
         self._thread = None
         self._need_ffmpeg_restart = True # 标记是否需要重启 FFmpeg（如分辨率改变时）
+        
+        self.set_lock = threading.Lock() # 修改分辨率、帧率时使用的锁 防止ffmpeg_cmd与实际参数不一致
     
     def set_resolution(self, width, height):
-        self.width = width
-        self.height = height
-        self._need_ffmpeg_restart = True
-        print(f"[{self.name}] 目标分辨率变更为: {width}x{height}")
+        with self.set_lock: # 加锁防止推流参数与实际不一致
+            self.width = width
+            self.height = height
+            self._need_ffmpeg_restart = True
+            print(f"[{self.name}] 目标分辨率变更为: {width}x{height}")
     
     def set_fps(self, fps):
         """软件层面动态修改推流帧率"""
-        self.fps = max(1, fps)
-        self._need_ffmpeg_restart = True
-        print(f"[{self.name}] 目标推流帧率变更为: {self.fps}")
+        with self.set_lock: # 加锁防止推流参数与实际不一致
+            self.fps = max(1, fps)
+            self._need_ffmpeg_restart = True
+            print(f"[{self.name}] 目标推流帧率变更为: {self.fps}")
     
     def put_frame(self, frame):
         """接收来自 CamManager 的原始帧 (非阻塞)"""
@@ -76,8 +80,15 @@ class CamStream:
             except queue.Empty:
                 continue
             
+            with self.set_lock:
+                current_w = self.width
+                current_h = self.height
+                current_fps = self.fps
+                need_restart = self._need_ffmpeg_restart
+                self._need_ffmpeg_restart = False # 取出重启状态后立刻重置
+            
             now = time.time()
-            frame_duration = 1.0 / self.fps
+            frame_duration = 1.0 / current_fps # 使用局部变量
             
             if now < next_time:
                 # 时间未到，直接丢弃该帧（实现降帧）
@@ -90,14 +101,14 @@ class CamStream:
                 next_time += frame_duration
                 
             # 分辨率控制
-            current_h, current_w = raw_frame.shape[:2]
-            if current_w != self.width or current_h != self.height:
-                frame = cv2.resize(raw_frame, (self.width, self.height))
+            raw_h, raw_w = raw_frame.shape[:2]
+            if current_w != raw_w or current_h != raw_h:
+                frame = cv2.resize(raw_frame, (current_w, current_h))
             else:
                 frame = raw_frame
                 
             # ffmpeg 管道
-            if self._need_ffmpeg_restart:
+            if need_restart:
                 if proc:
                     proc.stdin.close()
                     proc.wait()
@@ -106,17 +117,17 @@ class CamStream:
                     self.ffmpeg_exe,
                     "-loglevel", "error", "-y",
                     "-f", "rawvideo", "-pix_fmt", "bgr24",
-                    "-s", f"{self.width}x{self.height}",
-                    "-r", str(self.fps),  # 告诉 FFmpeg 预期的帧率
+                    "-s", f"{current_w}x{current_h}",
+                    "-r", str(current_fps),  # 告诉 FFmpeg 预期的帧率
                     "-i", "-", "-an",
                     "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                     "-pix_fmt", "yuv420p",
-                    "-g", str(self.fps * 2),
+                    "-g", str(current_fps * 2),
                     "-maxrate", "2M", "-bufsize", "4M",
                     "-f", "flv", self.url
                 ]
                 proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-                self._need_ffmpeg_restart = False
+                # self._need_ffmpeg_restart = False # 在上锁获取数据快照时已经重置为False了
                 
             # 写入数据
             try:
@@ -124,7 +135,8 @@ class CamStream:
             except BrokenPipeError:
                 # 处理由于网络或服务端异常导致的管道断开，触发下一次循环的重启
                 print(f"[{self.name}] 管道断开，准备重连...")
-                self._need_ffmpeg_restart = True
+                with self.set_lock:
+                    self._need_ffmpeg_restart = True
             except Exception as e:
                 print(f"[{self.name}] 写入异常: {e}")
         
