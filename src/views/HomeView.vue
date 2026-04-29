@@ -134,7 +134,7 @@ const networkStatus = ref("normal");
 const errorMessage = ref("");
 
 // WebRTC 相关
-const MEDIAMTX_WHEP_URL = "http://192.168.0.102:8889/cam_high/whep";   // 推流电脑 IP，使用时修改
+const MEDIAMTX_WHEP_URL = "http://192.168.5.49:8889/cam_high/whep";   // 推流电脑 IP，使用时修改
 let pc = null;
 
 // 监听`设置相机`的返回结果

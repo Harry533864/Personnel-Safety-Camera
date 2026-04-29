@@ -1,10 +1,10 @@
-from ..CamManager import CamManager
-from ..CamStream import CamStream
+from CamManager import CamManager
+from CamStream import CamStream
 import time
 
 def test_simple_stream():
     # 配置你的 FFmpeg 路径和 RTMP 推流地址
-    FFMPEG_EXE = "D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe"
+    FFMPEG_EXE = "D:/Program Files/ffmpeg-8.1-essentials_build/bin/ffmpeg.exe"
     URL = "rtmp://127.0.0.1:1935/cam_test"
     
     # 1. 实例化 Manager（硬件层：1080P, 30fps）

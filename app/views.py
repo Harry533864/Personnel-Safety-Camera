@@ -11,13 +11,13 @@ from app.Cam.CamStream import CamStream
 from app.Cam.CamManager import CamManager
 import os
 
-FFMPEG_EXE = "D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe"
+FFMPEG_EXE = "ffmpeg"
 URL_LOW = "rtmp://127.0.0.1:1935/cam_low"
 URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 
 # 摄像头硬件层读取参数设置
-ORI_WIDTH = 1280
-ORI_HEIGHT = 720
+ORI_WIDTH = 2592
+ORI_HEIGHT = 1944
 ORI_FPS = 30
 CAMERA_ID = 0
 cam_manager = CamManager(camera_id=CAMERA_ID, width=ORI_WIDTH, height=ORI_HEIGHT, fps=ORI_FPS)
@@ -36,7 +36,7 @@ stream_high = CamStream(
     )
 stream_low = CamStream(
         name="cam_low",  
-        url=URL_HIGH, 
+        url=URL_LOW, 
         ffmpeg_exe=FFMPEG_EXE, 
         width=LOW_WIDTH, 
         height=LOW_HEIGHT, 
