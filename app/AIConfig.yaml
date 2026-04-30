@@ -1,0 +1,30 @@
+Info: 相机检测配置文件
+
+# 硬件层
+HardwareLayer:
+  width: 1280
+  height: 720
+  fps: 30
+  camera_id: 0
+
+# 推流层
+LiveStreamLayer:
+  ffmpeg_path: D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe
+  url_low: rtmp://127.0.0.1:1935/cam_low
+  url_high: rtmp://127.0.0.1:1935/cam_high
+  exposure: 0
+  HIGH:
+    width: 1280
+    height: 720
+  LOW:
+    width: 640
+    height: 480
+
+# 检测层
+DetectionLayer:
+  model:
+    base: base_model_path
+    plus1: plus1_model_path
+  confidence: 0.5
+  region: [0, 0, 1280, 720]   # [left-top, right-bottom]
+  iou: 0.3
