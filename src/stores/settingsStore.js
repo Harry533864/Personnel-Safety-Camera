@@ -256,18 +256,57 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
     lastSaveResult: loadFromStorage(STORAGE_KEY_DETECTION_REGION_STATE, { unset: true }),
   }),
   actions: {
-    async saveRegions(regions, options = {}) {
+    async fetchRegions() {
+      try {
+        const response = await fetch(`${API_URL}/api/detection/regions`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const data = await response.json()
+        const rois = Array.isArray(data?.rois)
+          ? data.rois
+          : (Array.isArray(data?.config?.rois) ? data.config.rois : [])
+
+        const nextData = {
+          currentTarget: this.data.currentTarget || 'all',
+          byTarget: {
+            all: [],
+            high: [],
+            low: [],
+          },
+        }
+
+        rois.forEach((roi) => {
+          const target = ['all', 'high', 'low'].includes(roi?.target) ? roi.target : 'all'
+          nextData.byTarget[target].push(cloneValue(roi))
+        })
+
+        this.data = nextData
+        saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
+        return cloneValue(rois)
+      } catch (error) {
+        this.lastSaveResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_DETECTION_REGION_STATE, this.lastSaveResult)
+        return null
+      }
+    },
+    async saveRegions(rois, options = {}) {
       const target = options.target || this.data.currentTarget || 'all'
       const clear = Boolean(options.clear)
 
       try {
-        const response = await fetch('/api/detection/regions', {
+        const response = await fetch(`${API_URL}/api/detection/regions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             target,
             clear,
-            ...(clear ? {} : { regions: cloneValue(regions) }),
+            rois: clear ? [] : cloneValue(rois),
           }),
         })
 
@@ -278,7 +317,7 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
         const data = await response.json()
         if (data.status === 'success') {
           this.data.currentTarget = target
-          this.data.byTarget[target] = clear ? [] : cloneValue(regions)
+          this.data.byTarget[target] = clear ? [] : cloneValue(rois)
           saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
           this.lastSaveResult = { success: true, message: data.message || '保存成功' }
           saveToStorage(STORAGE_KEY_DETECTION_REGION_STATE, this.lastSaveResult)

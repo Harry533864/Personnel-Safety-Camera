@@ -71,11 +71,11 @@
         <div class="detection-overlay" v-if="showDetectionOverlay && videoLoaded">
           <div
             v-for="region in persistedRegions"
-            :key="region.id"
+            :key="region.roi_id || region.id"
             class="region-marker"
             :style="getRegionStyle(region)"
           >
-            <span class="region-label">{{ `检测区域 ${region.id}` }}</span>
+            <span class="region-label">{{ getRegionLabel(region) }}</span>
           </div>
         </div>
 
@@ -244,6 +244,24 @@ const loadFromSaveState = (saveState, curState) => {
 
 const getRegionStyle = (region) => {
   const { width, height } = overlayResolution.value;
+  const polygon = Array.isArray(region.polygon) ? region.polygon : [];
+
+  if (polygon.length >= 4) {
+    const xs = polygon.map((point) => Number(point[0]) * width);
+    const ys = polygon.map((point) => Number(point[1]) * height);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    return {
+      left: `${(minX / width) * 100}%`,
+      top: `${(minY / height) * 100}%`,
+      width: `${((maxX - minX) / width) * 100}%`,
+      height: `${((maxY - minY) / height) * 100}%`,
+    };
+  }
+
   const rect = region.rect || {};
 
   return {
@@ -252,6 +270,15 @@ const getRegionStyle = (region) => {
     width: `${(((rect.x2 || 0) - (rect.x1 || 0)) / width) * 100}%`,
     height: `${(((rect.y2 || 0) - (rect.y1 || 0)) / height) * 100}%`,
   };
+};
+
+const getRegionLabel = (region) => {
+  if (region.name) {
+    return region.name;
+  }
+
+  const suffix = String(region.roi_id || "").split("_").pop();
+  return suffix ? `检测区域 ${suffix}` : "检测区域";
 };
 
 // 关闭现有连接
