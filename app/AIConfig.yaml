@@ -1,46 +1,43 @@
-Info: 相机检测配置文件
-
 model:
-  exe_path: "../inference/cpp_tensorrt/build/camera_tensorrt"   # 默认
-  engine_path: "../inference/models/yolo11n_person.engine"        # 默认
-  config_path: "../inference/configs/config.json"          # 默认
-  roi_config_path: "../inference/configs/roi_config.json"  # 默认
-
+  exe_path: ../inference/cpp_tensorrt/build/camera_tensorrt
+  engine_path: ../inference/models/yolo11n_person.engine
+  runtime_config_dir: ../inference/configs/runtime
+  prestart_mode: false
+  settle_single_frame: false
+  jpeg_quality: 95
+  version: '1.0'
+  camera_id: cam_demo_001
+  detect_enable: false
+  infer_target: all
+  model_name: YOLO11
+  imgsz: 640
+  conf_thres: 0.5
+  iou_thres: 0.1
+  enter_frames: 3
+  exit_frames: 5
+  person_class_ids:
+  - 0
+  rois:
+  - roi_id: hazard_1
+    name: ROI1
+    enabled: true
+    roi_type: forbidden_zone
+    judge_method: foot_point
+    coordinate_mode: normalized
+    polygon:
+    - - 0.1516
+      - 0.1828
+    - - 0.8993
+      - 0.1828
+    - - 0.8993
+      - 0.881
+    - - 0.1516
+      - 0.881
+    overlap_thres: 0.1
+    target: all
 test:
-  source: 0            # 摄像头：写 0 或 "0"
-  # source: "test.mp4"          # 视频文件
-  # source: "/home/jetson/code/Cam_flaskvue/inference/test_img/image.png"        # 图片（.jpg .png .bmp .webp）
-  # 视频专用的可选参数：
-  width: 1280
-  height: 720
-  fps: 30
-
-
-# 硬件层
-HardwareLayer:
-  width: 1280
-  height: 720
-  fps: 30
-  camera_id: 0
-
-# 推流层
-LiveStreamLayer:
-  ffmpeg_path: D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe
-  url_low: rtmp://127.0.0.1:1935/cam_low
-  url_high: rtmp://127.0.0.1:1935/cam_high
-  exposure: 0
-  HIGH:
-    width: 1280
-    height: 720
-  LOW:
-    width: 640
-    height: 480
-
-# 检测层
-DetectionLayer:
-  model:
-    base: base_model_path
-    plus1: plus1_model_path
-  confidence: 0.5
-  region: [0, 0, 1280, 720]   # [left-top, right-bottom]
-  iou: 0.3
+  hot_reload: true
+  image: /home/jetson/code/Cam_flaskvue/inference/test_img/image.png
+  interval: 0.5
+  save_path: hot_reload_result.jpg
+  show: false

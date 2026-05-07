@@ -47,7 +47,7 @@ bool WriteExact(std::ostream& out, const char* data, std::size_t size) {
 /**
  * 从输入流中读取 uint32 小端整数
  *
- * Python 端对应：
+ * Python 端对应:
  * struct.pack("<I", size)
  */
 bool ReadUInt32LE(std::istream& in, uint32_t& value) {
@@ -69,7 +69,7 @@ bool ReadUInt32LE(std::istream& in, uint32_t& value) {
 /**
  * 向输出流中写入 uint32 小端整数
  *
- * Python 端对应：
+ * Python 端对应:
  * struct.unpack("<I", header)[0]
  */
 bool WriteUInt32LE(std::ostream& out, uint32_t value) {
@@ -83,6 +83,10 @@ bool WriteUInt32LE(std::ostream& out, uint32_t value) {
     return WriteExact(out, reinterpret_cast<const char*>(buf), 4);
 }
 
+bool StartsWithDashDash(const std::string& s) {
+    return s.rfind("--", 0) == 0;
+}
+
 }  // namespace
 
 
@@ -93,9 +97,10 @@ int main(int argc, char** argv) {
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-    if (argc < 4) {
+    if (argc < 3) {
         std::cerr << "Usage: ./camera_tensorrt_server "
-                  << "[engine_path] [config_json] [roi_config_json] "
+                  << "[engine_path] [config_json] "
+                  << "[roi_config_json optional] "
                   << "[--prestart] [--settle]"
                   << std::endl;
         return -1;
@@ -103,18 +108,45 @@ int main(int argc, char** argv) {
 
     const std::string engine_path = argv[1];
     const std::string config_path = argv[2];
-    const std::string roi_config_path = argv[3];
+
+    /**
+     * roi_config_path 可选。
+     *
+     * 如果只传:
+     *   ./camera_tensorrt_server engine config.json
+     *
+     * 则 roi_config_path 默认等于 config_path。
+     *
+     * 如果传:
+     *   ./camera_tensorrt_server engine config.json roi_config.json
+     *
+     * 则使用第三个参数作为 ROI fallback 配置。
+     */
+    std::string roi_config_path = config_path;
+    int flag_start_index = 3;
+
+    if (argc >= 4) {
+        const std::string maybe_roi_path = argv[3];
+
+        if (!StartsWithDashDash(maybe_roi_path)) {
+            roi_config_path = maybe_roi_path;
+            flag_start_index = 4;
+        }
+    }
 
     bool prestart_mode = false;
     bool settle_single_frame = false;
 
-    for (int i = 4; i < argc; ++i) {
+    for (int i = flag_start_index; i < argc; ++i) {
         const std::string arg = argv[i];
 
         if (arg == "--prestart") {
             prestart_mode = true;
         } else if (arg == "--settle") {
             settle_single_frame = true;
+        } else {
+            std::cerr << "[C++] warning: unknown argument ignored: "
+                      << arg << std::endl;
         }
     }
 
@@ -122,6 +154,8 @@ int main(int argc, char** argv) {
         /**
          * 这里会加载 TensorRT engine、配置文件、ROI 配置。
          * 只执行一次，不会每一帧重新加载。
+         *
+         * 因此前端修改配置后，需要 Python 端重启 C++ 子进程。
          */
         CameraTensorRTInfer infer(
             engine_path,
@@ -144,7 +178,7 @@ int main(int argc, char** argv) {
             uint32_t input_size = 0;
 
             /**
-             * 通信协议：
+             * 通信协议:
              *
              * Python -> C++:
              *   4 bytes: JPEG 数据长度，uint32，小端
@@ -204,7 +238,7 @@ int main(int argc, char** argv) {
 
             try {
                 /**
-                 * 核心推理：
+                 * 核心推理:
                  * 输入 cv::Mat
                  * 输出已经画好 ROI、检测框、FPS、报警状态的 cv::Mat
                  */
