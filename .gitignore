@@ -34,3 +34,7 @@ venv
 # Environment Variables
 .env
 .flaskenv
+
+# inference
+inference/configs/runtime
+inference/cpp_tensorrt/build
