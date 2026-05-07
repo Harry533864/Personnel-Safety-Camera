@@ -67,18 +67,6 @@
           playsinline
         ></video>
 
-        <!-- 检测区域叠加层 -->
-        <div class="detection-overlay" v-if="showDetectionOverlay && videoLoaded">
-          <div
-            v-for="region in persistedRegions"
-            :key="region.roi_id || region.id"
-            class="region-marker"
-            :style="getRegionStyle(region)"
-          >
-            <span class="region-label">{{ getRegionLabel(region) }}</span>
-          </div>
-        </div>
-
         <!-- 视频加载失败的显示层 -->
         <div class="video-placeholder" v-if="!videoLoaded">
           <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
@@ -164,37 +152,6 @@ let manualReconnectVisiable = false;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BASE_RECONNECT_DELAY = 1000;
 
-const parseResolutionString = (value) => {
-  if (!value || !value.includes("x")) {
-    return { width: 1920, height: 1080 };
-  }
-
-  const [width, height] = value.split("x").map(Number);
-  return {
-    width: width || 1920,
-    height: height || 1080,
-  };
-};
-
-const overlayResolution = computed(() => {
-  if (videoResolution.value) {
-    return parseResolutionString(videoResolution.value);
-  }
-
-  return parseResolutionString(cameraSettingStore.settings.resolution);
-});
-
-const currentRegionTarget = computed(
-  () => detectionRegionStore.getCurrentTarget() || detectionSettingStore.settings.target || "all"
-);
-
-const persistedRegions = computed(() =>
-  detectionRegionStore.getRegions(currentRegionTarget.value) || []
-);
-const showDetectionOverlay = computed(
-  () => detectionSettingStore.settings.detectionEnabled && persistedRegions.value.length > 0
-);
-
 const goToCameraSettings = () => {
   router.push("/camera-settings");
 };
@@ -240,45 +197,6 @@ const loadFromSaveState = (saveState, curState) => {
       curState.value = { active: false, inactive: true, unset: false };
     }
   }
-};
-
-const getRegionStyle = (region) => {
-  const { width, height } = overlayResolution.value;
-  const polygon = Array.isArray(region.polygon) ? region.polygon : [];
-
-  if (polygon.length >= 4) {
-    const xs = polygon.map((point) => Number(point[0]) * width);
-    const ys = polygon.map((point) => Number(point[1]) * height);
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
-
-    return {
-      left: `${(minX / width) * 100}%`,
-      top: `${(minY / height) * 100}%`,
-      width: `${((maxX - minX) / width) * 100}%`,
-      height: `${((maxY - minY) / height) * 100}%`,
-    };
-  }
-
-  const rect = region.rect || {};
-
-  return {
-    left: `${((rect.x1 || 0) / width) * 100}%`,
-    top: `${((rect.y1 || 0) / height) * 100}%`,
-    width: `${(((rect.x2 || 0) - (rect.x1 || 0)) / width) * 100}%`,
-    height: `${(((rect.y2 || 0) - (rect.y1 || 0)) / height) * 100}%`,
-  };
-};
-
-const getRegionLabel = (region) => {
-  if (region.name) {
-    return region.name;
-  }
-
-  const suffix = String(region.roi_id || "").split("_").pop();
-  return suffix ? `检测区域 ${suffix}` : "检测区域";
 };
 
 // 关闭现有连接
@@ -608,34 +526,6 @@ onUnmounted(() => {
 
 .video-player {
   display: block;
-}
-
-.detection-overlay {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  pointer-events: none;
-}
-
-.region-marker {
-  position: absolute;
-  border: 2px solid #3fb950;
-  background: rgba(63, 185, 80, 0.1);
-  border-radius: 4px;
-}
-
-.region-label {
-  position: absolute;
-  top: -20px;
-  left: 0;
-  background: #3fb950;
-  color: #000;
-  padding: 2px 6px;
-  font-size: 0.7rem;
-  border-radius: 3px;
-  white-space: nowrap;
 }
 
 .video-placeholder {

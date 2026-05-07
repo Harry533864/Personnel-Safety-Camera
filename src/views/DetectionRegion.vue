@@ -31,6 +31,13 @@
           </div>
 
           <div class="canvas-frame">
+            <video
+              ref="frameVideoRef"
+              class="frame-video"
+              autoplay
+              muted
+              playsinline
+            ></video>
             <canvas
               ref="canvasRef"
               :width="CANVAS_WIDTH"
@@ -127,7 +134,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
   useCameraSettingStore,
@@ -139,6 +146,8 @@ const CANVAS_WIDTH = 960;
 const CANVAS_HEIGHT = 540;
 const MAX_REGIONS = 3;
 const MIN_RECT_SIZE = 10;
+const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL;
+const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;
 const regionColors = {
   1: "#22c55e",
   2: "#3b82f6",
@@ -151,13 +160,18 @@ const detectionSettingStore = useDetectionSettingStore();
 const detectionRegionStore = useDetectionRegionStore();
 
 const canvasRef = ref(null);
+const frameVideoRef = ref(null);
 const isDrawing = ref(false);
 const isSaving = ref(false);
+const frameLoaded = ref(false);
+const frameError = ref("");
 const startPoint = ref({ x: 0, y: 0 });
 const draftRect = ref(null);
 const candidateRegions = ref([]);
 const committedRegions = ref([]);
 const successFeedback = ref("");
+let framePc = null;
+let frameRefreshTimer = null;
 
 const modalState = ref({
   visible: false,
@@ -326,7 +340,106 @@ function closeModal() {
   modalState.value.visible = false;
 }
 
+function closeFrameStream() {
+  if (frameRefreshTimer) {
+    clearInterval(frameRefreshTimer);
+    frameRefreshTimer = null;
+  }
+
+  if (framePc) {
+    framePc.ontrack = null;
+    framePc.close();
+    framePc = null;
+  }
+
+  if (frameVideoRef.value) {
+    frameVideoRef.value.srcObject = null;
+  }
+}
+
+async function initFrameStream() {
+  if (!frameVideoRef.value) return;
+
+  closeFrameStream();
+  frameLoaded.value = false;
+  frameError.value = "";
+
+  try {
+    framePc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    framePc.addTransceiver("video", { direction: "recvonly" });
+
+    framePc.ontrack = (event) => {
+      if (event.track.kind !== "video") return;
+
+      const stream = new MediaStream([event.track]);
+      frameVideoRef.value.srcObject = stream;
+
+      frameVideoRef.value.onloadeddata = () => {
+        frameLoaded.value = true;
+        redrawCanvas();
+      };
+
+      event.track.onunmute = () => {
+        frameLoaded.value = true;
+        redrawCanvas();
+      };
+    };
+
+    const offer = await framePc.createOffer();
+    await framePc.setLocalDescription(offer);
+
+    await new Promise((resolve) => {
+      if (framePc.iceGatheringState === "complete") {
+        resolve();
+        return;
+      }
+      framePc.onicegatheringstatechange = () => {
+        if (framePc?.iceGatheringState === "complete") {
+          resolve();
+        }
+      };
+    });
+
+    const response = await fetch(MEDIAMTX_WHEP_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: framePc.localDescription.sdp,
+    });
+
+    if (!response.ok) {
+      throw new Error(`WHEP 请求失败: ${response.status}`);
+    }
+
+    const answerSDP = await response.text();
+    await framePc.setRemoteDescription(
+      new RTCSessionDescription({
+        type: "answer",
+        sdp: answerSDP,
+      })
+    );
+
+    frameRefreshTimer = setInterval(() => {
+      if (frameLoaded.value) {
+        redrawCanvas();
+      }
+    }, 200);
+  } catch (error) {
+    frameError.value = "当前视频帧加载失败，已切换为示意底图";
+    frameLoaded.value = false;
+    closeFrameStream();
+  }
+}
+
 function drawBackground(ctx) {
+  const video = frameVideoRef.value;
+  if (frameLoaded.value && video && video.readyState >= 2) {
+    ctx.drawImage(video, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    return;
+  }
+
   const gradient = ctx.createLinearGradient(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
   gradient.addColorStop(0, "#0f172a");
   gradient.addColorStop(1, "#1e293b");
@@ -355,10 +468,10 @@ function drawBackground(ctx) {
 
   ctx.fillStyle = "#e2e8f0";
   ctx.font = "600 20px Arial";
-  ctx.fillText("Mock Video Stream", 28, 36);
+  ctx.fillText("Current Video Frame", 28, 36);
   ctx.font = "14px Arial";
   ctx.fillStyle = "rgba(226, 232, 240, 0.8)";
-  ctx.fillText("拖拽鼠标绘制检测区域", 28, 62);
+  ctx.fillText(frameError.value || "当前视频帧加载中，拖拽鼠标绘制检测区域", 28, 62);
 }
 
 function drawRect(ctx, rect, options = {}) {
@@ -577,6 +690,7 @@ function goBack() {
 
 onMounted(async () => {
   await nextTick();
+  await initFrameStream();
   await syncRegionsFromServer();
   loadSavedRegions();
   redrawCanvas();
@@ -588,6 +702,10 @@ watch(selectedTarget, async () => {
   draftRect.value = null;
   successFeedback.value = "";
   await syncRegionsFromServer();
+});
+
+onUnmounted(() => {
+  closeFrameStream();
 });
 </script>
 
@@ -707,9 +825,18 @@ watch(selectedTarget, async () => {
 }
 
 .canvas-frame {
+  position: relative;
   overflow: hidden;
   border-radius: 12px;
   background: #0f172a;
+}
+
+.frame-video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 canvas {
