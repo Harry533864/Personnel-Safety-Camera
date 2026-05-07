@@ -27,7 +27,7 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 ORI_WIDTH = 1280
 ORI_HEIGHT = 720
 ORI_FPS = 30
-CAMERA_ID = 1
+CAMERA_ID = 0
 cam_manager = CamManager(camera_id=CAMERA_ID, width=ORI_WIDTH, height=ORI_HEIGHT, fps=ORI_FPS)
 
 # 两路分流
@@ -55,7 +55,7 @@ cam_manager.add_worker(stream_high)
 cam_manager.add_worker(stream_low)
 
 
-# cam_manager.start() # 全局启动推流 [不用单独启动]
+cam_manager.start() # 全局启动推流 [不用单独启动]
 
 @app.route('/')
 def index():
