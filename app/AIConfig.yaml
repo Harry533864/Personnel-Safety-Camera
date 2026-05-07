@@ -1,30 +1,51 @@
-Info: 相机检测配置文件
+model:
+  exe_path: ../inference/cpp_tensorrt/build/camera_tensorrt
+  engine_path: ../inference/models/yolo11n_person.engine
 
-# 硬件层
-HardwareLayer:
-  width: 1280
-  height: 720
-  fps: 30
-  camera_id: 0
+  runtime_config_dir: ../inference/configs/runtime
 
-# 推流层
-LiveStreamLayer:
-  ffmpeg_path: D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe
-  url_low: rtmp://127.0.0.1:1935/cam_low
-  url_high: rtmp://127.0.0.1:1935/cam_high
-  exposure: 0
-  HIGH:
-    width: 1280
-    height: 720
-  LOW:
-    width: 640
-    height: 480
+  prestart_mode: false
+  settle_single_frame: false
+  jpeg_quality: 95
 
-# 检测层
-DetectionLayer:
-  model:
-    base: base_model_path
-    plus1: plus1_model_path
-  confidence: 0.5
-  region: [0, 0, 1280, 720]   # [left-top, right-bottom]
-  iou: 0.3
+  version: "1.0"
+  camera_id: cam_demo_001
+  detect_enable: true
+  model_name: "YOLO11"
+
+  imgsz: 640
+  conf_thres: 0.7
+  iou_thres: 0.6
+
+  enter_frames: 3
+  exit_frames: 5
+
+  person_class_ids:
+    - 0
+
+  rois:
+    - roi_id: hazard_1
+      name: 全图危险区域
+      enabled: true
+      roi_type: forbidden_zone
+      judge_method: foot_point
+      coordinate_mode: normalized
+      polygon:
+        - [0.25, 0.25]
+        - [1.0, 0.25]
+        - [0.75, 0.75]
+        - [0.0, 0.75]
+      overlap_thres: 0.2
+
+test:
+  hot_reload: true
+  image: /home/jetson/code/Cam_flaskvue/inference/test_img/image.png
+  interval: 0.5
+  save_path: hot_reload_result.jpg
+  show: false
+
+# test:
+#   source: 0
+#   width: 1280
+#   height: 720
+#   fps: 15

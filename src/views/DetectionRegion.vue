@@ -572,7 +572,7 @@ async function confirmClearAll() {
 
 function goBack() {
   if (isSaving.value) return;
-  router.push("/detection-settings");
+  router.push("/");
 }
 
 onMounted(async () => {

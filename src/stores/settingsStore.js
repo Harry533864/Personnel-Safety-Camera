@@ -65,6 +65,15 @@ const saveToStorage = (key, data) => {
   localStorage.setItem(key, JSON.stringify(data))
 }
 
+const clearStorage = () => {
+  // 清除全部
+  // localStorage.clear();
+
+  // 清除指定 key
+  localStorage.removeItem(STORAGE_KEY_DETECTION_REGION);
+  localStorage.removeItem(STORAGE_KEY_DETECTION_REGION_STATE);
+}
+
 // ========== 相机设置 ==========
 const CAMERA_DEFAULTS = {
   resolution: '1920x1080',
@@ -85,6 +94,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
       const messages = []
       let exposureSuccess = true
       let resolutionSuccess = true
+      let fpsSuccess = true
 
       try {
         if (settings.exposure !== this.settings.exposure) {
@@ -140,8 +150,34 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
           }
         }
 
+        // ---- 处理帧率 ----
+        if (settings.fps !== this.settings.fps) {
+          console.log("设置帧率...")
+          try {
+            const response = await fetch(`${API_URL}/api/stream/fps`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                value: parseInt(settings.fps),
+                target: settings.target || CAMERA_DEFAULTS.target
+              }),
+            })
+            const data = await response.json()
+            if (data.status === 'success') {
+              // 成功，保留新值
+            } else {
+              throw new Error(data.message || '帧率设置失败')
+            }
+          } catch (err) {
+            // 接口异常或业务失败，回滚曝光值
+            finalSettings.fps = this.settings.fps
+            fpsSuccess = false
+            messages.push(`帧率设置失败: ${err.message}`)
+          }
+        }
+
         // ---- 更新 store 和持久化 ----
-        const allSuccess = exposureSuccess && resolutionSuccess
+        const allSuccess = exposureSuccess && resolutionSuccess && fpsSuccess
         if (allSuccess) {
           // 全部成功：完全替换 settings
           this.settings = { ...finalSettings }
@@ -179,16 +215,15 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
 // ========== 检测设置 ==========
 const DETECTION_DEFAULTS = {
   detectionEnabled: true,
-  detectionModel: '240922',
+  detectionModel: 'YOLO11',
   detectionThreshold: 0.50,
   overlapRate: 0.10,
-  matchEnabled: true,
-  matchThreshold: 0.50,
-  matchFrequency: 5,
+  // matchEnabled: true,
+  // matchThreshold: 0.50,
+  // matchFrequency: 5,
   target: 'all',
 }
 
-// TODO 调试检测接口
 export const useDetectionSettingStore = defineStore('detectionSetting', {
   state: () => ({
     settings: loadFromStorage(STORAGE_KEY_DETECTION, DETECTION_DEFAULTS),
@@ -197,7 +232,7 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
   actions: {
     async saveSettings(settings) {
       try {
-        const response = await fetch(`${API_URL}/api/detection/region`, {
+        const response = await fetch(`${API_URL}/api/detection/detect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -242,7 +277,7 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
 const DETECTION_REGION_DEFAULTS = {
   currentTarget: 'all',
   byTarget: {
-    all: [],
+    all: [(0, 0), (1280, 720)],
     high: [],
     low: [],
   },
@@ -258,7 +293,7 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
   actions: {
     async fetchRegions() {
       try {
-        const response = await fetch(`${API_URL}/api/detection/regions`, {
+        const response = await fetch(`${API_URL}/api/detection/fetch_regions`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
         })
@@ -300,7 +335,7 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
       const clear = Boolean(options.clear)
 
       try {
-        const response = await fetch(`${API_URL}/api/detection/regions`, {
+        const response = await fetch(`${API_URL}/api/detection/save_regions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

@@ -47,6 +47,7 @@
               step="0.01"
               :disabled="isLoading"
             />
+            <span class="unit">Confidence</span>
           </div>
         </div>
 
@@ -66,7 +67,7 @@
           </div>
         </div>
 
-        <div class="form-item">
+        <!-- <div class="form-item">
           <label class="form-label">匹配启用：</label>
           <div class="form-control-wrapper">
             <label class="toggle-switch">
@@ -117,7 +118,7 @@
             </select>
             <span class="unit"></span>
           </div>
-        </div>
+        </div> -->
       </div>
 
       <div class="settings-footer">

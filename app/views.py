@@ -9,6 +9,14 @@ from app import app
 from flask import render_template, request, jsonify, send_file
 from app.Cam.CamStream import CamStream
 from app.Cam.CamManager import CamManager
+from app.utils import (
+    read_yaml,
+    update_yaml_detect_state,
+    update_yaml_model_name,
+    update_yaml_conf,
+    update_yaml_iou,
+    update_roi_polygon,
+    )
 import os
 
 FFMPEG_EXE = "D:/CodeSoftware/VisualStudioCode/VsCodeProject/info3180-vuejs-flask-starter/app/Cam/ffmpeg/bin/ffmpeg.exe"
@@ -19,7 +27,7 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 ORI_WIDTH = 1280
 ORI_HEIGHT = 720
 ORI_FPS = 30
-CAMERA_ID = 0
+CAMERA_ID = 1
 cam_manager = CamManager(camera_id=CAMERA_ID, width=ORI_WIDTH, height=ORI_HEIGHT, fps=ORI_FPS)
 
 # 两路分流
@@ -47,7 +55,7 @@ cam_manager.add_worker(stream_high)
 cam_manager.add_worker(stream_low)
 
 
-cam_manager.start() # 全局启动推流 [不用单独启动]
+# cam_manager.start() # 全局启动推流 [不用单独启动]
 
 @app.route('/')
 def index():
@@ -160,6 +168,75 @@ def set_fps():
         })
     except ValueError:
         return jsonify({"status": "error", "message": "fps 必须是整数"}), 400
+
+@app.route('/api/detection/detect', methods=['POST'])
+def update_inference_configuration():
+    data = request.get_json()
+
+    file_path = "D:/KillingTime/傅里叶不想变换/华南理工大学/项目资料/嵌入式AI/Cam_flaskvue/app/AIConfig.yaml"
+
+    try:
+        history = read_yaml(file_path=file_path)['model']
+        history_enable = history['detect_enable']
+        history_model = history['model_name']
+        history_conf = history['conf_thres']
+        history_iou = history['iou_thres']
+
+        if data['detectionEnabled'] != history_enable:
+            update_yaml_detect_state(data['detectionEnabled'], file_path)
+        if data['detectionModel'] != history_model:
+            update_yaml_model_name(data['detectionModel'], file_path)
+        if data['detectionThreshold'] != history_conf:
+            update_yaml_conf(data['detectionThreshold'], file_path)
+        if data['overlapRate'] != history_iou:
+            update_yaml_iou(data['overlapRate'], file_path)
+
+        return jsonify({
+            "status": "success", 
+            "message": "检测设置已更新。"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"{e}"}), 400
+
+@app.route('/api/detection/fetch_regions', methods=['GET'])
+def get_detection_regions():
+    """
+    获取检测区域（ROIs）
+    数据格式：
+        - 直接包含 rois 数组: {"rois": [...]}
+        - 或包含 config.rois: {"config": {"rois": [...]}}
+    每个 roi 对象至少包含 "target" 字段，值为 'all'、'high' 或 'low'
+    """
+    # TODO 从 AIConfig.yaml 中读取实际数据
+    sample_rois = [
+        {"id": 1, "name": "区域A", "target": "all", "x": 100, "y": 200, "width": 50, "height": 50},
+    ]
+
+    response_data = {
+        "rois": sample_rois
+    }
+
+    return jsonify(response_data)
+
+@app.route('/api/detection/save_regions', methods=['POST'])
+def update_detection_regions():
+    data = request.get_json()
+
+    # TODO 替换为实际路径
+    file_path = "/Cam_flaskvue/app/AIConfig.yaml"
+    history = read_yaml(file_path=file_path)['model']['rois']
+    print(history)
+
+    try:
+        update_roi_polygon(file_path=file_path, roi_id='hazard_1', new_polygon=data['rois'][1]['polygon'])
+
+        return jsonify({
+            "status": "success", 
+            "message": "检测区域已保存。"
+        })
+    except Exception as e:
+        print(e)
+        return jsonify({"status": "error", "message": f"{e}"}), 400
 
 ###
 # The functions below should be applicable to all Flask apps.
