@@ -276,7 +276,7 @@ function getOverlapThreshold() {
 function toBackendRoi(region) {
   return {
     roi_id: `hazard_${region.id}`,
-    name: `检测区域${region.id}`,
+    name: `ROI${region.id}`,
     enabled: true,
     roi_type: "forbidden_zone",
     judge_method: "foot_point",

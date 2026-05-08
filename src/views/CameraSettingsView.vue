@@ -16,9 +16,9 @@
           <label class="form-label">分辨率：</label>
           <div class="form-control-wrapper">
             <select v-model="settings.resolution" class="form-select">
-              <option value="2560x1440">2592 x 1944</option>
               <option value="1920x1080">1920 x 1080</option>
               <option value="1280x720">1280 x 720</option>
+              <option value="1024x576">1024 x 576</option>
             </select>
             <span class="unit">Pix</span>
           </div>
