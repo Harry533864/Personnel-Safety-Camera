@@ -31,12 +31,12 @@
               type="number"
               v-model.number="settings.exposure"
               class="form-input"
-              min="1"
+              min="0"
               max="10000"
               step="1"
               @change="validateExposure"
             />
-            <span class="unit">1 ~ 10000 us</span>
+            <span class="unit">1 ~ 10000 us；0表示自动。</span>
           </div>
         </div>
 
@@ -78,7 +78,7 @@
 </template>
 
 <script setup>
-import { ref, reactive } from "vue";
+import { ref, reactive, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { useCameraSettingStore } from '@/stores/settingsStore'
 
@@ -86,6 +86,7 @@ const router = useRouter();
 const cameraSettingStore = useCameraSettingStore();
 const settings = reactive(cameraSettingStore.getSettings());    // 从 store 加载已保存的设置，无则使用默认值
 const isLoading = ref(false);
+let pendingTimer = null;
 
 const goBack = () => {
   if (isLoading.value) return;
@@ -93,22 +94,29 @@ const goBack = () => {
 };
 
 const confirmSettings = async () => {
+  // 如果已经有定时器在等待，直接返回，防止重复触发
+  if (pendingTimer) return;
+
   isLoading.value = true;
   try {
     const success = await cameraSettingStore.saveSettings(settings);
     if (success) {
-      router.push("/");
+      // 保存成功，等待 3 秒再跳转
+      pendingTimer = setTimeout(() => {
+        router.push("/");
+        pendingTimer = null;
+      }, 5000);
     } else {
       alert('保存失败，请重试');
+      isLoading.value = false;
     }
   } catch (e) {
     alert('保存异常：' + e.message);
-  } finally {
     isLoading.value = false;
   }
 
   // 返回首页
-  router.push("/");
+  // router.push("/");
 };
 
 // 校验曝光值
@@ -116,12 +124,16 @@ const validateExposure = () => {
   let val = settings.exposure
   if (val === null || val === undefined || isNaN(val)) {
     settings.exposure = 1000
-  } else if (val < 1) {
-    settings.exposure = 1
+  } else if (val < 0) {
+    settings.exposure = 0
   } else if (val > 10000) {
     settings.exposure = 10000
   }
 };
+
+onUnmounted(() => {
+  if (pendingTimer) clearTimeout(pendingTimer);
+});
 </script>
 
 <style scoped>

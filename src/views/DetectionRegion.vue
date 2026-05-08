@@ -31,6 +31,13 @@
           </div>
 
           <div class="canvas-frame">
+            <video
+              ref="frameVideoRef"
+              class="frame-video"
+              autoplay
+              muted
+              playsinline
+            ></video>
             <canvas
               ref="canvasRef"
               :width="CANVAS_WIDTH"
@@ -68,9 +75,8 @@
               <div v-for="region in committedRegions" :key="region.id" class="region-card">
                 <div class="region-title">
                   <span class="region-dot" :style="{ backgroundColor: regionColors[region.id] }"></span>
-                  <strong>编号 {{ region.id }}</strong>
+                  <strong>{{ getRegionDisplayName(region.id) }}</strong>
                 </div>
-                <pre>{{ JSON.stringify(toBackendRect(region.rect), null, 2) }}</pre>
               </div>
             </div>
             <p v-else class="empty-text">暂无正式区域</p>
@@ -80,16 +86,10 @@
             <h3>候选区域</h3>
             <div v-if="candidateRegions.length" class="region-list">
               <div v-for="(region, index) in candidateRegions" :key="region.tempId" class="region-card candidate">
-                <strong>候选 {{ index + 1 }}</strong>
-                <pre>{{ JSON.stringify(toBackendRect(region.rect), null, 2) }}</pre>
+                <strong>{{ getRegionDisplayName(index + 1) }}</strong>
               </div>
             </div>
             <p v-else class="empty-text">暂无候选区域</p>
-          </div>
-
-          <div class="info-card">
-            <h3>发送给后端的数据（原视频像素坐标）</h3>
-            <pre>{{ JSON.stringify(formalPayload, null, 2) }}</pre>
           </div>
 
           <div class="info-card">
@@ -134,10 +134,11 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
   useCameraSettingStore,
+  useDetectionSettingStore,
   useDetectionRegionStore,
 } from "@/stores/settingsStore";
 
@@ -145,6 +146,8 @@ const CANVAS_WIDTH = 960;
 const CANVAS_HEIGHT = 540;
 const MAX_REGIONS = 3;
 const MIN_RECT_SIZE = 10;
+const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL;
+const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;
 const regionColors = {
   1: "#22c55e",
   2: "#3b82f6",
@@ -153,15 +156,22 @@ const regionColors = {
 
 const router = useRouter();
 const cameraSettingStore = useCameraSettingStore();
+const detectionSettingStore = useDetectionSettingStore();
 const detectionRegionStore = useDetectionRegionStore();
 
 const canvasRef = ref(null);
+const frameVideoRef = ref(null);
 const isDrawing = ref(false);
 const isSaving = ref(false);
+const frameLoaded = ref(false);
+const frameError = ref("");
 const startPoint = ref({ x: 0, y: 0 });
 const draftRect = ref(null);
 const candidateRegions = ref([]);
 const committedRegions = ref([]);
+const successFeedback = ref("");
+let framePc = null;
+let frameRefreshTimer = null;
 
 const modalState = ref({
   visible: false,
@@ -190,19 +200,15 @@ const sourceResolution = computed(() => {
   };
 });
 
-const formalPayload = computed(() =>
-  committedRegions.value.map((region) => ({
-    id: region.id,
-    rect: toBackendRect(region.rect),
-  }))
-);
-
 const saveStatusText = computed(() => {
   const state = detectionRegionStore.getState();
   if (state.unset) {
     return "尚未提交检测区域";
   }
-  return state.success ? "最近一次提交成功" : `最近一次提交失败：${state.message || "未知错误"}`;
+  if (state.success) {
+    return successFeedback.value || state.message || "最近一次提交成功";
+  }
+  return `最近一次提交失败：${state.message || "未知错误"}`;
 });
 
 const saveStatusClass = computed(() => {
@@ -242,27 +248,69 @@ function normalizeRect(start, end) {
   return { x, y, w, h };
 }
 
-function toBackendRect(rect) {
-  const scaleX = sourceResolution.value.width / CANVAS_WIDTH;
-  const scaleY = sourceResolution.value.height / CANVAS_HEIGHT;
+function getRegionDisplayName(id) {
+  return `候选区域${id}`;
+}
 
+function normalizePoint(x, y) {
+  return [
+    Number((x / CANVAS_WIDTH).toFixed(4)),
+    Number((y / CANVAS_HEIGHT).toFixed(4)),
+  ];
+}
+
+function rectToPolygon(rect) {
+  return [
+    normalizePoint(rect.x, rect.y),
+    normalizePoint(rect.x + rect.w, rect.y),
+    normalizePoint(rect.x + rect.w, rect.y + rect.h),
+    normalizePoint(rect.x, rect.y + rect.h),
+  ];
+}
+
+function getOverlapThreshold() {
+  const overlap = Number(detectionSettingStore.settings.overlapRate);
+  return Number.isFinite(overlap) ? overlap : 0.2;
+}
+
+function toBackendRoi(region) {
   return {
-    x1: Math.round(rect.x * scaleX),
-    y1: Math.round(rect.y * scaleY),
-    x2: Math.round((rect.x + rect.w) * scaleX),
-    y2: Math.round((rect.y + rect.h) * scaleY),
+    roi_id: `hazard_${region.id}`,
+    name: `检测区域${region.id}`,
+    enabled: true,
+    roi_type: "forbidden_zone",
+    judge_method: "foot_point",
+    coordinate_mode: "normalized",
+    polygon: rectToPolygon(region.rect),
+    overlap_thres: getOverlapThreshold(),
   };
 }
 
-function fromStoredRect(rect = {}) {
-  const scaleX = CANVAS_WIDTH / sourceResolution.value.width;
-  const scaleY = CANVAS_HEIGHT / sourceResolution.value.height;
+function fromStoredRegion(region = {}) {
+  const polygon = Array.isArray(region.polygon) ? region.polygon : [];
+  if (polygon.length >= 4) {
+    const xs = polygon.map((point) => Number(point[0]) * CANVAS_WIDTH);
+    const ys = polygon.map((point) => Number(point[1]) * CANVAS_HEIGHT);
 
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    return {
+      x: clamp(minX, 0, CANVAS_WIDTH),
+      y: clamp(minY, 0, CANVAS_HEIGHT),
+      w: clamp(maxX - minX, 0, CANVAS_WIDTH),
+      h: clamp(maxY - minY, 0, CANVAS_HEIGHT),
+    };
+  }
+
+  const rect = region.rect || {};
   return {
-    x: clamp((rect.x1 || 0) * scaleX, 0, CANVAS_WIDTH),
-    y: clamp((rect.y1 || 0) * scaleY, 0, CANVAS_HEIGHT),
-    w: clamp(((rect.x2 || 0) - (rect.x1 || 0)) * scaleX, 0, CANVAS_WIDTH),
-    h: clamp(((rect.y2 || 0) - (rect.y1 || 0)) * scaleY, 0, CANVAS_HEIGHT),
+    x: clamp(rect.x || 0, 0, CANVAS_WIDTH),
+    y: clamp(rect.y || 0, 0, CANVAS_HEIGHT),
+    w: clamp(rect.w || 0, 0, CANVAS_WIDTH),
+    h: clamp(rect.h || 0, 0, CANVAS_HEIGHT),
   };
 }
 
@@ -292,7 +340,106 @@ function closeModal() {
   modalState.value.visible = false;
 }
 
+function closeFrameStream() {
+  if (frameRefreshTimer) {
+    clearInterval(frameRefreshTimer);
+    frameRefreshTimer = null;
+  }
+
+  if (framePc) {
+    framePc.ontrack = null;
+    framePc.close();
+    framePc = null;
+  }
+
+  if (frameVideoRef.value) {
+    frameVideoRef.value.srcObject = null;
+  }
+}
+
+async function initFrameStream() {
+  if (!frameVideoRef.value) return;
+
+  closeFrameStream();
+  frameLoaded.value = false;
+  frameError.value = "";
+
+  try {
+    framePc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+
+    framePc.addTransceiver("video", { direction: "recvonly" });
+
+    framePc.ontrack = (event) => {
+      if (event.track.kind !== "video") return;
+
+      const stream = new MediaStream([event.track]);
+      frameVideoRef.value.srcObject = stream;
+
+      frameVideoRef.value.onloadeddata = () => {
+        frameLoaded.value = true;
+        redrawCanvas();
+      };
+
+      event.track.onunmute = () => {
+        frameLoaded.value = true;
+        redrawCanvas();
+      };
+    };
+
+    const offer = await framePc.createOffer();
+    await framePc.setLocalDescription(offer);
+
+    await new Promise((resolve) => {
+      if (framePc.iceGatheringState === "complete") {
+        resolve();
+        return;
+      }
+      framePc.onicegatheringstatechange = () => {
+        if (framePc?.iceGatheringState === "complete") {
+          resolve();
+        }
+      };
+    });
+
+    const response = await fetch(MEDIAMTX_WHEP_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/sdp" },
+      body: framePc.localDescription.sdp,
+    });
+
+    if (!response.ok) {
+      throw new Error(`WHEP 请求失败: ${response.status}`);
+    }
+
+    const answerSDP = await response.text();
+    await framePc.setRemoteDescription(
+      new RTCSessionDescription({
+        type: "answer",
+        sdp: answerSDP,
+      })
+    );
+
+    frameRefreshTimer = setInterval(() => {
+      if (frameLoaded.value) {
+        redrawCanvas();
+      }
+    }, 200);
+  } catch (error) {
+    frameError.value = "当前视频帧加载失败，已切换为示意底图";
+    frameLoaded.value = false;
+    closeFrameStream();
+  }
+}
+
 function drawBackground(ctx) {
+  const video = frameVideoRef.value;
+  if (frameLoaded.value && video && video.readyState >= 2) {
+    ctx.drawImage(video, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    return;
+  }
+
   const gradient = ctx.createLinearGradient(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
   gradient.addColorStop(0, "#0f172a");
   gradient.addColorStop(1, "#1e293b");
@@ -321,10 +468,10 @@ function drawBackground(ctx) {
 
   ctx.fillStyle = "#e2e8f0";
   ctx.font = "600 20px Arial";
-  ctx.fillText("Mock Video Stream", 28, 36);
+  ctx.fillText("Current Video Frame", 28, 36);
   ctx.font = "14px Arial";
   ctx.fillStyle = "rgba(226, 232, 240, 0.8)";
-  ctx.fillText("拖拽鼠标绘制检测区域", 28, 62);
+  ctx.fillText(frameError.value || "当前视频帧加载中，拖拽鼠标绘制检测区域", 28, 62);
 }
 
 function drawRect(ctx, rect, options = {}) {
@@ -393,9 +540,19 @@ function redrawCanvas() {
 
 function loadSavedRegions() {
   committedRegions.value = detectionRegionStore.getRegions(selectedTarget.value).map((region) => ({
-    id: region.id,
-    rect: fromStoredRect(region.rect),
+    id: Number(String(region.roi_id || "").split("_").pop()) || 1,
+    rect: fromStoredRegion(region),
   }));
+}
+
+async function syncRegionsFromServer() {
+  const rois = await detectionRegionStore.fetchRegions();
+  if (rois === null) {
+    return false;
+  }
+  loadSavedRegions();
+  redrawCanvas();
+  return true;
 }
 
 function beginDraw(event) {
@@ -474,10 +631,8 @@ async function addDetectionRegions() {
   const nextCommitted = [...committedRegions.value, ...pendingRegions].sort(
     (left, right) => left.id - right.id
   );
-  const payload = nextCommitted.map((region) => ({
-    id: region.id,
-    rect: toBackendRect(region.rect),
-  }));
+  const payload = nextCommitted.map((region) => toBackendRoi(region));
+  const successMessage = pendingRegions.map((region) => `${getRegionDisplayName(region.id)}保存成功`).join(" / ");
 
   isSaving.value = true;
   try {
@@ -486,12 +641,15 @@ async function addDetectionRegions() {
     });
     if (!success) {
       const state = detectionRegionStore.getState();
+      successFeedback.value = "";
       openAlert(state.message || "检测区域保存失败");
       return;
     }
 
-    committedRegions.value = nextCommitted;
+    await syncRegionsFromServer();
+    committedRegions.value = committedRegions.value.length ? committedRegions.value : nextCommitted;
     candidateRegions.value = [];
+    successFeedback.value = successMessage;
     redrawCanvas();
   } finally {
     isSaving.value = false;
@@ -508,13 +666,16 @@ async function confirmClearAll() {
     });
     if (!success) {
       const state = detectionRegionStore.getState();
+      successFeedback.value = "";
       openAlert(state.message || "清除检测区域失败");
       return;
     }
 
+    await syncRegionsFromServer();
     committedRegions.value = [];
     candidateRegions.value = [];
     draftRect.value = null;
+    successFeedback.value = "已清除所有检测区域";
     closeModal();
     redrawCanvas();
   } finally {
@@ -524,21 +685,27 @@ async function confirmClearAll() {
 
 function goBack() {
   if (isSaving.value) return;
-  router.push("/detection-settings");
+  router.push("/");
 }
 
 onMounted(async () => {
   await nextTick();
+  await initFrameStream();
+  await syncRegionsFromServer();
   loadSavedRegions();
   redrawCanvas();
 });
 
-watch(selectedTarget, () => {
+watch(selectedTarget, async () => {
   detectionRegionStore.setCurrentTarget(selectedTarget.value);
   candidateRegions.value = [];
   draftRect.value = null;
-  loadSavedRegions();
-  redrawCanvas();
+  successFeedback.value = "";
+  await syncRegionsFromServer();
+});
+
+onUnmounted(() => {
+  closeFrameStream();
 });
 </script>
 
@@ -658,9 +825,18 @@ watch(selectedTarget, () => {
 }
 
 .canvas-frame {
+  position: relative;
   overflow: hidden;
   border-radius: 12px;
   background: #0f172a;
+}
+
+.frame-video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 canvas {
@@ -780,17 +956,6 @@ button:disabled {
 
 .empty-text {
   color: #888;
-}
-
-pre {
-  margin: 0;
-  padding: 12px;
-  border-radius: 8px;
-  background: #0f172a;
-  color: #e2e8f0;
-  font-size: 12px;
-  line-height: 1.5;
-  overflow: auto;
 }
 
 .status-text {

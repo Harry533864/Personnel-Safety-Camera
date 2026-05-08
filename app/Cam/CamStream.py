@@ -289,7 +289,6 @@ class CamStream:
                 raw_frame = self.frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-
             with self.set_lock:
                 current_w = self.width
                 current_h = self.height
