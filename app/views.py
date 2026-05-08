@@ -292,14 +292,14 @@ def set_resolution():
 def set_fps():
     data = request.get_json(silent=True) or {}
 
-    if "fps" not in data:
+    if "value" not in data:
         return jsonify({
             "status": "error",
             "message": "缺少 fps 参数"
         }), 400
 
     try:
-        fps = int(data["fps"])
+        fps = int(data["value"])
         target = data.get("target", "high")
 
         for stream in get_target_streams(target):

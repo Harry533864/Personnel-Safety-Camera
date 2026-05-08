@@ -25,14 +25,14 @@ model:
     judge_method: foot_point
     coordinate_mode: normalized
     polygon:
-    - - 0.2808
-      - 0.1449
-    - - 0.5819
-      - 0.1449
-    - - 0.5819
-      - 0.4594
-    - - 0.2808
-      - 0.4594
+    - - 0.3924
+      - 0.0
+    - - 0.5982
+      - 0.0
+    - - 0.5982
+      - 0.3144
+    - - 0.3924
+      - 0.3144
     overlap_thres: 0.1
     target: all
 test:

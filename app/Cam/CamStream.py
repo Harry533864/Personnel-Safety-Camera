@@ -74,7 +74,7 @@ class CamStream:
             "-preset", "ultrafast",
             "-tune", "zerolatency",
             "-profile:v", "baseline",
-            "-level", "3.1",
+            "-level", "5.1",
             "-g", str(current_fps),
             "-keyint_min", str(current_fps),
             "-sc_threshold", "0",

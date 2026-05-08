@@ -38,3 +38,4 @@ venv
 # inference
 inference/configs/runtime
 inference/cpp_tensorrt/build
+app/AIConfig.yaml
