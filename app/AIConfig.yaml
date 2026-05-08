@@ -19,20 +19,20 @@ model:
   - 0
   rois:
   - roi_id: hazard_1
-    name: 检测区域1
+    name: ROI1
     enabled: true
     roi_type: forbidden_zone
     judge_method: foot_point
     coordinate_mode: normalized
     polygon:
-    - - 0.3924
-      - 0.0
-    - - 0.5982
-      - 0.0
-    - - 0.5982
-      - 0.3144
-    - - 0.3924
-      - 0.3144
+    - - 0.6371
+      - 0.2475
+    - - 0.9282
+      - 0.2475
+    - - 0.9282
+      - 0.7271
+    - - 0.6371
+      - 0.7271
     overlap_thres: 0.1
     target: all
 test:

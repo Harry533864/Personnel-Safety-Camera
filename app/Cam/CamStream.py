@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import subprocess
 import time
 import threading
 import queue
@@ -13,30 +12,26 @@ class CamStream:
     """
     流处理工作线程（消费者）。
 
-    负责：
     1. 接收 CamManager 送来的原始帧
     2. 控制当前推流 FPS
     3. resize 到目标推流分辨率
     4. 根据 enable_infer 决定是否调用 model.inference(frame)
-    5. 将最终图像写入 FFmpeg 推流
+    5. 使用 GStreamer + x264enc 软件编码推 RTMP
+
     """
 
     def __init__(
         self,
         name,
         url,
-        ffmpeg_exe="ffmpeg",
         width=1280,
         height=720,
         fps=15,
-
-        # AI 推理相关参数
         enable_infer=False,
         ai_config_path=None,
     ):
         self.name = name
         self.url = url
-        self.ffmpeg_exe = ffmpeg_exe
 
         self.width = int(width)
         self.height = int(height)
@@ -45,61 +40,141 @@ class CamStream:
         self.frame_queue = queue.Queue(maxsize=2)
         self._is_running = False
         self._thread = None
-        self._need_ffmpeg_restart = True
 
+        self._need_writer_restart = True
         self.set_lock = threading.Lock()
 
-        # =========================
-        # AI 推理相关
-        # =========================
         self.enable_infer = bool(enable_infer)
         self.ai_config_path = ai_config_path
         self.ai_model = None
         self.ai_lock = threading.RLock()
 
-    def _build_ffmpeg_cmd(self, current_w=None, current_h=None, current_fps=None):
-        return [
-            self.ffmpeg_exe,
-            "-loglevel", "warning", "-y",
-            "-fflags", "nobuffer",
-            "-flags", "low_delay",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{current_w}x{current_h}",
-            "-r", str(current_fps),
-            "-i", "-", "-an",
-            "-vf", "format=yuv420p",
+    # =========================================================
+    # GStreamer 推流相关
+    # =========================================================
 
-            # H.264 编码
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-profile:v", "baseline",
-            "-level", "5.1",
-            "-g", str(current_fps),
-            "-keyint_min", str(current_fps),
-            "-sc_threshold", "0",
-            "-bf", "0",
-            "-b:v", "4000k",
-            "-maxrate", "4000k",
-            "-bufsize", "1000k",
-            "-flush_packets", "1",
-            "-f", "flv",
-            "-flvflags", "no_duration_filesize",
-            self.url,
-        ]
+    def _suggest_bitrate_kbps(self, w, h, fps):
+        """
+        x264enc 的 bitrate 单位是 kbps。
+        """
+        pixels = int(w) * int(h)
+
+        if pixels >= 2560 * 1440:
+            return 12000
+        elif pixels >= 1920 * 1080:
+            return 8000
+        elif pixels >= 1280 * 720:
+            return 4000
+        else:
+            return 2500
+
+    def _build_gst_pipeline(self, current_w, current_h, current_fps):
+        """
+        OpenCV VideoWriter 使用的 GStreamer pipeline。
+
+        输入是 OpenCV BGR frame。
+        编码器使用 x264enc 软件编码。
+        """
+        current_w = int(current_w)
+        current_h = int(current_h)
+        current_fps = max(1, int(current_fps))
+
+        bitrate_kbps = self._suggest_bitrate_kbps(
+            current_w,
+            current_h,
+            current_fps,
+        )
+
+        pipeline = (
+            f"appsrc is-live=true block=false format=time do-timestamp=true "
+            f"! video/x-raw,format=BGR,width={current_w},height={current_h},framerate={current_fps}/1 "
+            f"! queue leaky=downstream max-size-buffers=2 "
+            f"! videoconvert "
+            f"! video/x-raw,format=I420 "
+            f"! x264enc "
+            f"bitrate={bitrate_kbps} "
+            f"speed-preset=ultrafast "
+            f"tune=zerolatency "
+            f"key-int-max={current_fps} "
+            f"bframes=0 "
+            f"byte-stream=false "
+            f"! h264parse config-interval=1 "
+            f"! flvmux streamable=true "
+            f"! rtmpsink location={self.url} sync=false async=false"
+        )
+
+        return pipeline
+
+    def _open_writer(self, current_w, current_h, current_fps):
+        pipeline = self._build_gst_pipeline(
+            current_w=current_w,
+            current_h=current_h,
+            current_fps=current_fps,
+        )
+
+        print(f"[{self.name}] GStreamer pipeline:")
+        print(pipeline)
+
+        writer = cv2.VideoWriter(
+            pipeline,
+            cv2.CAP_GSTREAMER,
+            0,
+            float(current_fps),
+            (int(current_w), int(current_h)),
+            True,
+        )
+
+        if not writer.isOpened():
+            raise RuntimeError(
+                f"[{self.name}] 无法打开 GStreamer VideoWriter。"
+                f"请检查 x264enc / rtmpsink / flvmux / MediaMTX 是否正常。"
+            )
+
+        print(
+            f"[{self.name}] GStreamer 已启动: "
+            f"{current_w}x{current_h}@{current_fps}, url={self.url}"
+        )
+
+        return writer
+
+    def _close_writer(self, writer):
+        if writer is None:
+            return
+
+        try:
+            writer.release()
+        except Exception as e:
+            print(f"[{self.name}] 释放 GStreamer writer 失败: {e}")
+
+    # =========================================================
+    # 前端控制接口
+    # =========================================================
 
     def set_resolution(self, width, height):
+        width = int(width)
+        height = int(height)
+
+        if width <= 0 or height <= 0:
+            raise ValueError("width 和 height 必须大于 0")
+
+        if width % 2 != 0 or height % 2 != 0:
+            raise ValueError("H.264/I420 要求 width 和 height 必须是偶数")
+
         with self.set_lock:
-            self.width = int(width)
-            self.height = int(height)
-            self._need_ffmpeg_restart = True
-            print(f"[{self.name}] 目标分辨率变更为: {self.width}x{self.height}")
+            self.width = width
+            self.height = height
+            self._need_writer_restart = True
+
+        print(f"[{self.name}] 目标分辨率变更为: {self.width}x{self.height}")
 
     def set_fps(self, fps):
+        fps = max(1, int(fps))
+
         with self.set_lock:
-            self.fps = max(1, int(fps))
-            self._need_ffmpeg_restart = True
-            print(f"[{self.name}] 目标推流帧率变更为: {self.fps}")
+            self.fps = fps
+            self._need_writer_restart = True
+
+        print(f"[{self.name}] 目标推流帧率变更为: {self.fps}")
 
     def set_infer_enable(
         self,
@@ -107,19 +182,6 @@ class CamStream:
         reload_when_enable: bool = True,
         release_when_disable: bool = True,
     ):
-        """
-        前端控制是否开启 AI 推理。
-
-        enable=True:
-            开启推理。
-            如果模型还没创建，会创建 Model, 并启动 C++ 推理子进程。
-            如果 reload_when_enable=True, 会重新读取 AIConfig.yaml。
-
-        enable=False:
-            关闭推理。
-            后续推流直接使用原始帧。
-            如果 release_when_disable=True, 会关闭 C++ 推理子进程，释放资源。
-        """
         enable = bool(enable)
 
         with self.ai_lock:
@@ -150,14 +212,6 @@ class CamStream:
                 print(f"[{self.name}] AI 推理状态变化: {old_enable} -> {enable}")
 
     def reload_ai_config(self):
-        """
-        后端更新 AIConfig.yaml 后调用。
-
-        作用：
-        1. 如果 AI 模型还没创建，则创建
-        2. 如果 AI 模型已经创建，则调用 model.reload_config()
-        3. model.reload_config() 内部会重新生成 runtime json 并重启 C++ 推理进程
-        """
         with self.ai_lock:
             if not self.enable_infer:
                 print(f"[{self.name}] 当前未开启 AI 推理，跳过 reload_ai_config")
@@ -167,6 +221,9 @@ class CamStream:
             model.reload_config()
             print(f"[{self.name}] AI 配置已重载, C++ 推理进程已重启")
 
+    # =========================================================
+    # 队列与线程控制
+    # =========================================================
 
     def put_frame(self, frame):
         if not self._is_running:
@@ -191,7 +248,7 @@ class CamStream:
         self._thread = threading.Thread(target=self._worker_task, daemon=True)
         self._thread.start()
 
-        print(f"[CamStream[{self.name}]] 推流消费者已启动: {self.url}")
+        print(f"[CamStream[{self.name}]] GStreamer 推流消费者已启动: {self.url}")
 
     def stop(self):
         self._is_running = False
@@ -203,10 +260,11 @@ class CamStream:
 
         self._close_ai_model()
 
+    # =========================================================
+    # AI 推理相关
+    # =========================================================
+
     def _ensure_ai_model_locked(self):
-        """
-        调用这个函数前需要已经持有 self.ai_lock。
-        """
         if self.ai_model is not None:
             return self.ai_model
 
@@ -229,9 +287,6 @@ class CamStream:
         return self.ai_model
 
     def _close_ai_model_locked(self):
-        """
-        调用前需要已经持有 self.ai_lock。
-        """
         if self.ai_model is None:
             return
 
@@ -247,15 +302,6 @@ class CamStream:
             self._close_ai_model_locked()
 
     def _run_inference_if_enabled(self, frame):
-        """
-        对当前帧进行 AI 推理。
-
-        输入:
-            frame: BGR 图像，尺寸已经是当前推流分辨率
-
-        输出:
-            result: 推理后的 BGR 图像
-        """
         with self.ai_lock:
             enable_infer = self.enable_infer
 
@@ -280,8 +326,45 @@ class CamStream:
             print(f"[{self.name}] AI 推理失败，使用原始帧继续推流: {e}")
             return frame
 
+    # =========================================================
+    # 图像格式整理
+    # =========================================================
+
+    def _prepare_frame_for_writer(self, frame, current_w, current_h):
+        if frame is None:
+            return None
+
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+        if frame.ndim == 3 and frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            print(f"[{self.name}] 非法帧格式: shape={frame.shape}")
+            return None
+
+        if frame.shape[:2] != (current_h, current_w):
+            print(
+                f"[{self.name}] 推理后尺寸不一致: "
+                f"{frame.shape[1]}x{frame.shape[0]} -> {current_w}x{current_h}"
+            )
+            frame = cv2.resize(frame, (current_w, current_h))
+
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+
+        return frame
+
+    # =========================================================
+    # 主工作线程
+    # =========================================================
+
     def _worker_task(self):
-        proc = None
+        writer = None
         next_time = time.time()
 
         while self._is_running:
@@ -289,13 +372,45 @@ class CamStream:
                 raw_frame = self.frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            with self.set_lock:
-                current_w = self.width
-                current_h = self.height
-                current_fps = self.fps
-                need_restart = self._need_ffmpeg_restart
-                self._need_ffmpeg_restart = False
 
+            with self.set_lock:
+                current_w = int(self.width)
+                current_h = int(self.height)
+                current_fps = max(1, int(self.fps))
+                need_restart = self._need_writer_restart
+
+            # 1. 分辨率/FPS 变化时，先重启 GStreamer writer
+            if need_restart or writer is None or not writer.isOpened():
+                self._close_writer(writer)
+                writer = None
+
+                try:
+                    writer = self._open_writer(
+                        current_w=current_w,
+                        current_h=current_h,
+                        current_fps=current_fps,
+                    )
+
+                    with self.set_lock:
+                        if (
+                            self.width == current_w
+                            and self.height == current_h
+                            and self.fps == current_fps
+                        ):
+                            self._need_writer_restart = False
+
+                    next_time = time.time()
+
+                except Exception as e:
+                    print(f"[{self.name}] 启动 GStreamer writer 失败: {e}")
+
+                    with self.set_lock:
+                        self._need_writer_restart = True
+
+                    time.sleep(1.0)
+                    continue
+
+            # 2. FPS 控制
             now = time.time()
             frame_duration = 1.0 / current_fps
 
@@ -307,7 +422,7 @@ class CamStream:
             else:
                 next_time += frame_duration
 
-            # 1. 分辨率控制
+            # 3. resize 到当前推流目标尺寸
             raw_h, raw_w = raw_frame.shape[:2]
 
             if current_w != raw_w or current_h != raw_h:
@@ -315,81 +430,37 @@ class CamStream:
             else:
                 frame = raw_frame
 
-            # 2. AI 推理
-            # 注意：推理放在 resize 后，这样 C++ 返回图像尺寸就是推流尺寸。
+            # 4. AI 推理
             frame = self._run_inference_if_enabled(frame)
 
-            # 3. FFmpeg 重启
-            if need_restart:
-                if proc:
-                    try:
-                        if proc.stdin:
-                            proc.stdin.close()
-                    except Exception:
-                        pass
+            # 5. 写入前格式检查
+            frame = self._prepare_frame_for_writer(
+                frame,
+                current_w=current_w,
+                current_h=current_h,
+            )
 
-                    try:
-                        proc.wait(timeout=3)
-                    except Exception:
-                        proc.kill()
+            if frame is None:
+                continue
 
-                ffmpeg_cmd = self._build_ffmpeg_cmd(
-                    current_w=current_w,
-                    current_h=current_h,
-                    current_fps=current_fps,
-                )
-
-                proc = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdin=subprocess.PIPE,
-                    bufsize=0,
-                )
-
-                print(
-                    f"[{self.name}] FFmpeg 已启动: "
-                    f"{current_w}x{current_h}@{current_fps}, url={self.url}"
-                )
-
-            # 4. 写入 FFmpeg
+            # 6. 写入 GStreamer
             try:
-                if proc is None:
+                if writer is None or not writer.isOpened():
+                    print(f"[{self.name}] GStreamer writer 已关闭，准备重启")
                     with self.set_lock:
-                        self._need_ffmpeg_restart = True
+                        self._need_writer_restart = True
                     continue
 
-                if proc.poll() is not None:
-                    print(f"[{self.name}] FFmpeg 进程已退出，准备重启...")
-                    with self.set_lock:
-                        self._need_ffmpeg_restart = True
-                    continue
+                writer.write(frame)
 
-                if frame.dtype != np.uint8:
-                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+            except Exception as e:
+                print(f"[{self.name}] 写入 GStreamer 异常: {e}")
 
-                if not frame.flags["C_CONTIGUOUS"]:
-                    frame = np.ascontiguousarray(frame)
-
-                proc.stdin.write(frame.tobytes())
-
-            except BrokenPipeError:
-                print(f"[{self.name}] FFmpeg 管道断开，准备重连...")
                 with self.set_lock:
-                    self._need_ffmpeg_restart = True
+                    self._need_writer_restart = True
 
-            except (ValueError, OSError) as exc:
-                print(f"[{self.name}] 写入 FFmpeg 异常: {exc}")
-                with self.set_lock:
-                    self._need_ffmpeg_restart = True
+                self._close_writer(writer)
+                writer = None
 
-        if proc:
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-            except Exception:
-                pass
-
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
+        self._close_writer(writer)
+        print(f"[{self.name}] GStreamer worker 退出")

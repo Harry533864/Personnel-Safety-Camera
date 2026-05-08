@@ -25,7 +25,6 @@ AI_CONFIG_PATH = Path("/home/jetson/code/Cam_flaskvue/app/AIConfig.yaml")
 # 推流配置
 # =========================================================
 
-FFMPEG_EXE = "ffmpeg"
 URL_LOW = "rtmp://127.0.0.1:1935/cam_low"
 URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 
@@ -36,7 +35,7 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 CAMERA_ID = 0
 ORI_WIDTH = 2592
 ORI_HEIGHT = 1944
-ORI_FPS = 30
+ORI_FPS = 60
 
 cam_manager = CamManager(
     camera_id=CAMERA_ID,
@@ -54,7 +53,6 @@ AI_INFER_ENABLE, AI_INFER_TARGET = read_ai_startup_state(AI_CONFIG_PATH)
 stream_high = CamStream(
     name="cam_high",
     url=URL_HIGH,
-    ffmpeg_exe=FFMPEG_EXE,
     width=1280,
     height=720,
     fps=30,
@@ -69,7 +67,6 @@ stream_high = CamStream(
 stream_low = CamStream(
     name="cam_low",
     url=URL_LOW,
-    ffmpeg_exe=FFMPEG_EXE,
     width=640,
     height=480,
     fps=15,
