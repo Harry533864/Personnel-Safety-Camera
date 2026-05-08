@@ -81,28 +81,6 @@ stream_low = CamStream(
     ai_config_path=str(AI_CONFIG_PATH),
 )
 
-# stream_high = CamStream(
-#     name="cam_high",
-#     url=URL_HIGH,
-#     ffmpeg_exe=FFMPEG_EXE,
-#     width=1280,
-#     height=720,
-#     fps=30,
-#     enable_infer=False,
-#     ai_config_path=str(AI_CONFIG_PATH),
-# )
-
-# stream_low = CamStream(
-#     name="cam_low",
-#     url=URL_LOW,
-#     ffmpeg_exe=FFMPEG_EXE,
-#     width=640,
-#     height=480,
-#     fps=15,
-#     enable_infer=False,
-#     ai_config_path=str(AI_CONFIG_PATH),
-# )
-
 cam_manager.add_worker(stream_high)
 cam_manager.add_worker(stream_low)
 

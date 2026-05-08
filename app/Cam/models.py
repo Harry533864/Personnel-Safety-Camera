@@ -548,276 +548,171 @@ class Model:
             pass
 
 
-def _parse_video_source(source):
-    """
-    将 YAML 中的 source 统一转为可以在 cv2.VideoCapture 中使用的值。
-
-    - 整数 0      -> "/dev/video0"
-    - 字符串 "0" -> "/dev/video0"
-    - RTSP/视频文件/图片路径 -> 原样返回
-    """
-    if isinstance(source, int):
-        return f"/dev/video{source}"
-
-    if isinstance(source, str) and source.isdigit():
-        return f"/dev/video{int(source)}"
-
-    return source
-
-
-def run_image_test(model, image_path):
-    image_path = Path(image_path)
-
-    if not image_path.exists():
-        raise FileNotFoundError(f"测试图片不存在: {image_path}")
-
-    frame = cv2.imread(str(image_path))
-
-    if frame is None:
-        raise RuntimeError(f"无法读取测试图片: {image_path}")
-
-    result = model.inference(frame)
-
-    cv2.imwrite("test_result.jpg", result)
-    print("测试结果已保存到 test_result.jpg")
-
-
-def run_hot_reload_image_test(
-    model,
-    image_path,
-    interval=0.5,
-    save_path="hot_reload_result.jpg",
-    show=False
-):
-    """
-    热更新测试函数。
-
-    功能:
-    1. 使用同一张图片持续推理
-    2. 检测 AIConfig.yaml 是否被手动修改
-    3. 一旦检测到修改，自动调用 model.reload_config()
-    4. model.reload_config() 会重新生成 runtime json，并重启 C++ 推理进程
-    5. 继续用同一张图片推理
-
-    参数:
-        model:
-            Model 对象
-
-        image_path:
-            测试图片路径
-
-        interval:
-            每次推理之间的间隔，单位秒
-
-        save_path:
-            推理结果保存路径。每次推理都会覆盖这个文件。
-
-        show:
-            是否使用 cv2.imshow 显示结果。
-            如果 Jetson 没有图形界面，建议保持 False。
-    """
-    image_path = Path(image_path)
-
-    if not image_path.exists():
-        raise FileNotFoundError(f"测试图片不存在: {image_path}")
-
-    frame = cv2.imread(str(image_path))
-
-    if frame is None:
-        raise RuntimeError(f"无法读取测试图片: {image_path}")
-
-    config_path = Path(model.config_path)
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"AIConfig.yaml 不存在: {config_path}")
-
-    last_mtime_ns = config_path.stat().st_mtime_ns
-
-    print("=" * 80)
-    print("热更新图片推理测试已启动")
-    print(f"测试图片: {image_path}")
-    print(f"配置文件: {config_path}")
-    print(f"结果保存: {save_path}")
-    print("现在你可以手动修改 AIConfig.yaml，例如修改 conf_thres、iou_thres、ROI polygon 等")
-    print("保存 AIConfig.yaml 后，程序会自动重启 C++ 推理进程")
-    print("按 Ctrl+C 退出")
-    if show:
-        print("OpenCV 窗口中按 q 或 ESC 也可以退出")
-    print("=" * 80)
-
-    frame_index = 0
-
-    try:
-        while True:
-            current_mtime_ns = config_path.stat().st_mtime_ns
-
-            if current_mtime_ns != last_mtime_ns:
-                print("\n检测到 AIConfig.yaml 已修改，准备重新加载配置...")
-
-                # 等一下，避免前端或编辑器还没有完全写完文件
-                time.sleep(0.3)
-
-                try:
-                    model.reload_config()
-                    last_mtime_ns = config_path.stat().st_mtime_ns
-                    print("配置重载成功，C++ 推理进程已重启\n")
-                except Exception as e:
-                    print(f"配置重载失败: {e}")
-                    print("请检查 AIConfig.yaml 格式或参数是否合法")
-                    print("程序会继续监听配置文件变化\n")
-
-                    # 失败后也更新时间戳，避免同一个错误配置反复 reload
-                    last_mtime_ns = config_path.stat().st_mtime_ns
-
-                    time.sleep(interval)
-                    continue
-
-            try:
-                result = model.inference(frame)
-
-                cv2.imwrite(str(save_path), result)
-
-                print(
-                    f"\rframe={frame_index}, "
-                    f"result saved to {save_path}",
-                    end="",
-                    flush=True
-                )
-
-                if show:
-                    cv2.imshow("Hot Reload TensorRT Result", result)
-                    key = cv2.waitKey(1) & 0xFF
-
-                    if key == ord("q") or key == 27:
-                        print("\n收到退出指令")
-                        break
-
-                frame_index += 1
-                time.sleep(interval)
-
-            except Exception as e:
-                print(f"\n推理失败: {e}")
-                print("等待下一轮推理...")
-                time.sleep(interval)
-
-    except KeyboardInterrupt:
-        print("\n用户手动退出热更新测试")
-
-    finally:
-        if show:
-            cv2.destroyAllWindows()
-
-
-def run_video_test(model, source, width=None, height=None, fps=None):
-    source = _parse_video_source(source)
-
-    cap = cv2.VideoCapture(source)
-
-    if not cap.isOpened():
-        raise RuntimeError(f"无法打开视频源: {source}")
-
-    if width is not None:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
-
-    if height is not None:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-
-    if fps is not None:
-        cap.set(cv2.CAP_PROP_FPS, int(fps))
-
-    frame_count = 0
-
-    while True:
-        ret, frame = cap.read()
-
-        if not ret or frame is None:
-            print("读取图像失败或视频结束")
-            break
-
-        result = model.inference(frame)
-
-        if frame_count < 10:
-            cv2.imwrite(f"test_frame_{frame_count}.jpg", result)
-            print(f"已保存 test_frame_{frame_count}.jpg")
-        elif frame_count == 10:
-            print("测试帧保存完毕，退出测试")
-            break
-
-        frame_count += 1
-
-    cap.release()
-    cv2.destroyAllWindows()
 
 def main():
+    CAMERA_ID = 0              # Jetson/Linux: /dev/video0
+    WIDTH = 1280
+    HEIGHT = 720
+    FPS = 30
+
+    WARMUP_FRAMES = 10         # 前 10 帧预热，不统计 FPS
+    MAX_FRAMES = 300           # 测试 300 帧后退出；改成 0 表示一直跑
+    REPORT_INTERVAL = 2.0      # 每隔 2 秒打印一次 FPS
+    SHOW = False               # Jetson 无桌面环境建议 False
+    SAVE_FIRST_FRAMES = 0      # 保存前 3 帧推理结果
+
+    # =========================
+    # 初始化 C++ 推理接口
+    # =========================
     with Model() as model:
-        test_cfg = model.cfg.get("test", {})
+        # =========================
+        # 打开摄像头
+        # =========================
+        source = f"/dev/video{CAMERA_ID}"
 
-        hot_reload = bool(test_cfg.get("hot_reload", False))
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
 
-        if hot_reload:
-            image_path = test_cfg.get("image", "test.jpg")
-            interval = float(test_cfg.get("interval", 0.5))
-            save_path = test_cfg.get("save_path", "hot_reload_result.jpg")
-            show = bool(test_cfg.get("show", False))
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开摄像头: {source}")
 
-            run_hot_reload_image_test(
-                model=model,
-                image_path=image_path,
-                interval=interval,
-                save_path=save_path,
-                show=show
-            )
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, FPS)
 
-            return
+        # 尽量减少摄像头缓存，降低延迟
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        source = test_cfg.get("source", 0)
-        width = test_cfg.get("width", None)
-        height = test_cfg.get("height", None)
-        fps = test_cfg.get("fps", None)
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
 
-        source_path = Path(str(source))
+        print("=" * 80)
+        print("摄像头实时推理 FPS 测试")
+        print(f"camera      : {source}")
+        print(f"request     : {WIDTH}x{HEIGHT}@{FPS}")
+        print(f"actual      : {actual_w}x{actual_h}@{actual_fps:.2f}")
+        print("=" * 80)
 
-        image_suffixes = {
-            ".jpg", ".jpeg", ".png", ".bmp", ".webp"
-        }
+        frame_idx = 0
+        valid_count = 0
 
-        if isinstance(source, str) and source_path.suffix.lower() in image_suffixes:
-            run_image_test(model, source)
-        else:
-            run_video_test(
-                model=model,
-                source=source,
-                width=width,
-                height=height,
-                fps=fps
-            )
+        total_infer_time = 0.0
+        total_e2e_time = 0.0
 
+        window_count = 0
+        window_infer_time = 0.0
+        window_e2e_time = 0.0
+        window_start = time.perf_counter()
 
-# def main():
-#     with Model() as model:
-#         test_cfg = model.cfg.get("test", {})
+        try:
+            while True:
+                e2e_start = time.perf_counter()
 
-#         source = test_cfg.get("source", 0)
-#         width = test_cfg.get("width", None)
-#         height = test_cfg.get("height", None)
-#         fps = test_cfg.get("fps", None)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print("读取摄像头失败")
+                    continue
 
-#         source_path = Path(str(source))
+                # 参照推流代码：读取后统一 resize 到目标分辨率
+                if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
+                    frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
-#         image_suffixes = {
-#             ".jpg", ".jpeg", ".png", ".bmp", ".webp"
-#         }
+                if frame.dtype != np.uint8:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
 
-#         if isinstance(source, str) and source_path.suffix.lower() in image_suffixes:
-#             run_image_test(model, source)
-#         else:
-#             run_video_test(
-#                 model=model,
-#                 source=source,
-#                 width=width,
-#                 height=height,
-#                 fps=fps
-#             )
+                if not frame.flags["C_CONTIGUOUS"]:
+                    frame = np.ascontiguousarray(frame)
+
+                # =========================
+                # Python 调 C++ 推理
+                # =========================
+                infer_start = time.perf_counter()
+                result = model.inference(frame)
+                infer_end = time.perf_counter()
+
+                e2e_end = time.perf_counter()
+
+                frame_idx += 1
+
+                if frame_idx <= SAVE_FIRST_FRAMES:
+                    save_name = f"infer_test_frame_{frame_idx}.jpg"
+                    cv2.imwrite(save_name, result)
+                    print(f"已保存: {save_name}")
+
+                # 预热帧不统计
+                if frame_idx <= WARMUP_FRAMES:
+                    print(f"\r预热中: {frame_idx}/{WARMUP_FRAMES}", end="", flush=True)
+                    continue
+
+                if frame_idx == WARMUP_FRAMES + 1:
+                    print("\n预热结束，开始统计 FPS")
+
+                infer_time = infer_end - infer_start
+                e2e_time = e2e_end - e2e_start
+
+                valid_count += 1
+
+                total_infer_time += infer_time
+                total_e2e_time += e2e_time
+
+                window_count += 1
+                window_infer_time += infer_time
+                window_e2e_time += e2e_time
+
+                if SHOW:
+                    cv2.imshow("result", result)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q") or key == 27:
+                        break
+
+                now = time.perf_counter()
+
+                if now - window_start >= REPORT_INTERVAL:
+                    infer_fps = window_count / window_infer_time
+                    total_fps = window_count / window_e2e_time
+                    avg_infer_ms = window_infer_time / window_count * 1000
+                    avg_total_ms = window_e2e_time / window_count * 1000
+
+                    print(
+                        f"[实时] "
+                        f"frames={valid_count}, "
+                        f"infer_fps={infer_fps:.2f}, "
+                        f"total_fps={total_fps:.2f}, "
+                        f"avg_infer={avg_infer_ms:.2f} ms, "
+                        f"avg_total={avg_total_ms:.2f} ms"
+                    )
+
+                    window_count = 0
+                    window_infer_time = 0.0
+                    window_e2e_time = 0.0
+                    window_start = now
+
+                if MAX_FRAMES > 0 and valid_count >= MAX_FRAMES:
+                    break
+
+        except KeyboardInterrupt:
+            print("\n用户退出")
+
+        finally:
+            cap.release()
+
+            if SHOW:
+                cv2.destroyAllWindows()
+
+            if valid_count > 0:
+                avg_infer_fps = valid_count / total_infer_time
+                avg_total_fps = valid_count / total_e2e_time
+                avg_infer_ms = total_infer_time / valid_count * 1000
+                avg_total_ms = total_e2e_time / valid_count * 1000
+
+                print("=" * 80)
+                print("最终统计")
+                print(f"统计帧数       : {valid_count}")
+                print(f"平均 infer_fps : {avg_infer_fps:.2f}")
+                print(f"平均 total_fps : {avg_total_fps:.2f}")
+                print(f"平均 infer耗时 : {avg_infer_ms:.2f} ms")
+                print(f"平均 total耗时 : {avg_total_ms:.2f} ms")
+                print("=" * 80)
 
 
 if __name__ == "__main__":

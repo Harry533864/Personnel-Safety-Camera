@@ -33,7 +33,6 @@ class CamStream:
         # AI 推理相关参数
         enable_infer=False,
         ai_config_path=None,
-        ai_model=None,
     ):
         self.name = name
         self.url = url
@@ -55,11 +54,8 @@ class CamStream:
         # =========================
         self.enable_infer = bool(enable_infer)
         self.ai_config_path = ai_config_path
-        self.ai_model = ai_model
+        self.ai_model = None
         self.ai_lock = threading.RLock()
-
-        # 如果 ai_model 是外部传进来的，则不由 CamStream 负责释放
-        self._own_ai_model = ai_model is None
 
     def _build_ffmpeg_cmd(self, current_w=None, current_h=None, current_fps=None):
         return [
@@ -83,9 +79,9 @@ class CamStream:
             "-keyint_min", str(current_fps),
             "-sc_threshold", "0",
             "-bf", "0",
-            "-b:v", "1500k",
-            "-maxrate", "1500k",
-            "-bufsize", "300k",
+            "-b:v", "4000k",
+            "-maxrate", "4000k",
+            "-bufsize", "1000k",
             "-flush_packets", "1",
             "-f", "flv",
             "-flvflags", "no_duration_filesize",
@@ -171,51 +167,6 @@ class CamStream:
             model.reload_config()
             print(f"[{self.name}] AI 配置已重载, C++ 推理进程已重启")
 
-    def update_ai_config(self, new_cfg):
-        """
-        可选接口。
-
-        如果你希望 CamStream 直接写 AIConfig.yaml, 可以调用这个。
-        当前更推荐由 Flask 接口写 YAML, 然后调用 reload_ai_config()。
-        """
-        with self.ai_lock:
-            if not self.enable_infer:
-                print(f"[{self.name}] 当前未开启 AI 推理，跳过 update_ai_config")
-                return
-
-            model = self._ensure_ai_model_locked()
-
-            if not hasattr(model, "update_config"):
-                raise RuntimeError("当前 Model 没有 update_config() 方法")
-
-            model.update_config(new_cfg)
-            print(f"[{self.name}] AI 配置已更新，C++ 推理进程已重启")
-
-    def get_infer_status(self):
-        """
-        返回当前流的 AI 推理状态。
-        给后端 /api/infer/status 接口使用。
-        """
-        with self.ai_lock:
-            cpp_alive = False
-
-            if self.ai_model is not None:
-                proc = getattr(self.ai_model, "proc", None)
-
-                if proc is not None:
-                    cpp_alive = proc.poll() is None
-
-            return {
-                "name": self.name,
-                "enable_infer": self.enable_infer,
-                "model_created": self.ai_model is not None,
-                "cpp_process_alive": cpp_alive,
-                "url": self.url,
-                "width": self.width,
-                "height": self.height,
-                "fps": self.fps,
-                "ai_config_path": str(self.ai_config_path) if self.ai_config_path else None,
-            }
 
     def put_frame(self, frame):
         if not self._is_running:
@@ -284,11 +235,10 @@ class CamStream:
         if self.ai_model is None:
             return
 
-        if self._own_ai_model:
-            try:
-                self.ai_model.close()
-            except Exception as e:
-                print(f"[{self.name}] 关闭 AI 模型失败: {e}")
+        try:
+            self.ai_model.close()
+        except Exception as e:
+            print(f"[{self.name}] 关闭 AI 模型失败: {e}")
 
         self.ai_model = None
 

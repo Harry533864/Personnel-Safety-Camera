@@ -7,7 +7,7 @@ model:
   jpeg_quality: 95
   version: '1.0'
   camera_id: cam_demo_001
-  detect_enable: false
+  detect_enable: true
   infer_target: all
   model_name: YOLO11
   imgsz: 640
@@ -19,20 +19,20 @@ model:
   - 0
   rois:
   - roi_id: hazard_1
-    name: ROI1
+    name: 检测区域1
     enabled: true
     roi_type: forbidden_zone
     judge_method: foot_point
     coordinate_mode: normalized
     polygon:
-    - - 0.1516
-      - 0.1828
-    - - 0.8993
-      - 0.1828
-    - - 0.8993
-      - 0.881
-    - - 0.1516
-      - 0.881
+    - - 0.2808
+      - 0.1449
+    - - 0.5819
+      - 0.1449
+    - - 0.5819
+      - 0.4594
+    - - 0.2808
+      - 0.4594
     overlap_thres: 0.1
     target: all
 test:

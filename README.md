@@ -36,5 +36,5 @@ Remember to always create a virtual environment and install the packages in your
 $ python -m venv venv (you may need to use python3 instead)
 $ source venv/bin/activate (or .\venv\Scripts\activate on Windows)
 $ pip install -r requirements.txt
-$ flask --app app --debug run --host=0.0.0.0
+$ flask --app app run --host=0.0.0.0
 ```
