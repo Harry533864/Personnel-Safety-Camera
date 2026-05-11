@@ -20,6 +20,7 @@ from app.utils import (
 # =========================================================
 
 AI_CONFIG_PATH = Path("/home/jetson/code/Cam_flaskvue/app/AIConfig.yaml")
+MODEL_FILE_PATH = Path("/home/jetson/code/Cam_flaskvue/inference/models")
 
 # =========================================================
 # 推流配置
@@ -460,6 +461,113 @@ def update_detection_regions():
             "status": "error",
             "message": str(e)
         }), 400
+        
+        
+# =========================================================
+# 模型管理接口
+# =========================================================
+@app.route("/api/models/upload", methods=["POST"])
+def upload_model():
+    """
+    接收模型文件上传。
+    接收字段:
+    - model_name: 字符串
+    - engine_file: .engine 文件
+    - txt_file: .txt 文件
+    """
+    model_name = request.form.get("model_name")
+    engine_file = request.files.get("engine_file")
+    txt_file = request.files.get("txt_file")
+
+    # 检查文件是否齐全
+    if not model_name or not engine_file or not txt_file:
+        return jsonify({
+            "status": "error",
+            "message": "缺少必要参数：需要 model_name, engine_file, txt_file"
+        }), 400
+
+    # 检查是否有以 .engine 后缀的文件
+    if not engine_file.filename.endswith('.engine'):
+        return jsonify({"status": "error", "message": "engine_file 必须是 .engine 文件"}), 400
+        
+    # 检查是否有以 .txt 后缀的文件
+    if not txt_file.filename.endswith('.txt'):
+        return jsonify({"status": "error", "message": "txt_file 必须是 .txt 文件"}), 400
+
+    try:
+        # 2. 读取并检查配置
+        cfg = read_yaml(AI_CONFIG_PATH)
+        # 如果没有model_names字段则为空列表
+        model_names = cfg.get("model_names") or []
+        if not isinstance(model_names, list):
+            model_names = []
+
+        # 模型名称已存在时返回错误
+        if model_name in model_names:
+            return jsonify({
+                "status": "error",
+                "message": f"模型 '{model_name}' 已存在，请使用其他名称"
+            }), 400
+
+        # 3. 确定保存路径并创建文件夹
+        # /inference/models/<model_name>/
+        save_dir = MODEL_FILE_PATH / model_name
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # 4. 保存并重命名文件
+        # /inference/models/<model_name>/<model_name>.engine
+        # /inference/models/<model_name>/<model_name>.txt
+        engine_path = save_dir / f"{model_name}.engine"
+        txt_path = save_dir / f"{model_name}.txt"
+        engine_file.save(str(engine_path))
+        txt_file.save(str(txt_path))
+
+        # 5. 更新 AIConfig.yaml 中的 model_names 列表字段
+        model_names.append(model_name)
+        cfg["model_names"] = model_names
+        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+
+        return jsonify({
+            "status": "success",
+            "message": f"模型 '{model_name}' 成功上传并配置",
+            "data": {
+                "model_name": model_name,
+                "engine_path": str(engine_path),
+                "txt_path": str(txt_path)
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"上传模型失败: {str(e)}"
+        }), 500
+
+
+@app.route("/api/models/list", methods=["GET"])
+def get_model_list():
+    """
+    获取当前已配置的模型名称列表
+    """
+    try:
+        cfg = read_yaml(AI_CONFIG_PATH)
+        # 容错处理：确保返回的一定是 list
+        model_names = cfg.get("model_names") or [] 
+        if not isinstance(model_names, list):
+            model_names = [] # 没有字段 model_names 则为空列表
+
+        return jsonify({
+            "status": "success",
+            "models": model_names # 直接返回字段列表(没有时返回空列表)
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"获取模型列表失败: {str(e)}"
+        }), 500
+        
+
 
 
 # =========================
