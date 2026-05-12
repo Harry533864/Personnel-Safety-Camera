@@ -1,6 +1,6 @@
 model:
   exe_path: ../inference/cpp_tensorrt/build/camera_tensorrt
-  engine_path: ../inference/models/yolo11n_person.engine
+  model_path: ../inference/models
   runtime_config_dir: ../inference/configs/runtime
   prestart_mode: false
   settle_single_frame: false
@@ -9,7 +9,7 @@ model:
   camera_id: cam_demo_001
   detect_enable: true
   infer_target: all
-  model_name: YOLO11
+  model_name: yolov11_person
   imgsz: 640
   conf_thres: 0.5
   iou_thres: 0.1
@@ -25,14 +25,14 @@ model:
     judge_method: foot_point
     coordinate_mode: normalized
     polygon:
-    - - 0.6371
-      - 0.2475
-    - - 0.9282
-      - 0.2475
-    - - 0.9282
-      - 0.7271
-    - - 0.6371
-      - 0.7271
+    - - 0.4276
+      - 0.1762
+    - - 0.8592
+      - 0.1762
+    - - 0.8592
+      - 0.6401
+    - - 0.4276
+      - 0.6401
     overlap_thres: 0.1
     target: all
 test:
@@ -41,3 +41,6 @@ test:
   interval: 0.5
   save_path: hot_reload_result.jpg
   show: false
+model_names:
+- yolov11
+- yolov11_person

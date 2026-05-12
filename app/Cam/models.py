@@ -155,9 +155,9 @@ class Model:
             model_cfg.get("exe_path", "build/camera_tensorrt_server")
         )
 
-        self.engine_path = self._resolve_path(
-            model_cfg.get("engine_path", "weights/yolo11n_person.engine")
-        )
+        model_path = model_cfg.get("model_path", "../inference/models")
+        model_name = model_cfg.get("model_name", "yolov11")
+        self.engine_path = self._resolve_path(f"{model_path}/{model_name}/{model_name}.engine")
 
         self.prestart_mode = bool(model_cfg.get("prestart_mode", False))
         self.settle_single_frame = bool(model_cfg.get("settle_single_frame", False))
@@ -220,14 +220,22 @@ class Model:
 
         rois = self._get_rois_from_config(model_cfg)
 
+        model_path = model_cfg.get("model_path", "../inference/models")
+        model_name = model_cfg.get("model_name", "yolov11")
+        class_names_path = self._resolve_path(f"{model_path}/{model_name}/{model_name}.txt")
+        class_names = model_cfg.get("class_name", ["person"])
+        if class_names_path.exists():
+            with open(class_names_path, "r", encoding="utf-8") as f:
+                class_names = [line.strip() for line in f if line.strip()]
+
         runtime_config = {
             "version": str(model_cfg.get("version", "1.0")),
             "camera_id": model_cfg.get("camera_id", "cam_default"),
             "detect_enable": bool(model_cfg.get("detect_enable", True)),
-            "model_name": model_cfg.get("model_name", "person_detector"),
+            "model_name": model_name,
+            "class_name": class_names,
             "backend": "tensorrt",
-
-            # C++ 真正使用的 engine_path 来自命令行 argv[1]，
+          
             # 这里保留只是为了 runtime json 可读、可追踪。
             "engine_path": str(self.engine_path),
 
