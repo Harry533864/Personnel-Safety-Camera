@@ -14,6 +14,8 @@ const STORAGE_KEY_DETECTION = 'detection_settings'
 const STORAGE_KEY_DETECTION_STATE = 'detection_save_result'
 const STORAGE_KEY_DETECTION_REGION = 'detection_region_settings'
 const STORAGE_KEY_DETECTION_REGION_STATE = 'detection_region_save_result'
+const STORAGE_KEY_MODEL_LIST = 'model_management_list'
+const STORAGE_KEY_MODEL_UPLOAD_STATE = 'model_upload_result'
 
 const cloneValue = (value) => JSON.parse(JSON.stringify(value))
 
@@ -269,6 +271,118 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
     },
     clearResult() {
       this.lastSaveResult = { unset: true }
+    },
+  },
+})
+
+// ========== 模型管理 ==========
+const MODEL_MANAGEMENT_DEFAULTS = {
+  models: [],
+}
+
+export const useModelManagementStore = defineStore('modelManagement', {
+  state: () => ({
+    models: loadFromStorage(STORAGE_KEY_MODEL_LIST, MODEL_MANAGEMENT_DEFAULTS.models),
+    uploadProgress: 0,
+    isUploading: false,
+    lastUploadResult: loadFromStorage(STORAGE_KEY_MODEL_UPLOAD_STATE, { unset: true }),
+  }),
+  actions: {
+    async fetchModels() {
+      try {
+        const response = await fetch(`${API_URL}/api/models/list`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        })
+
+        const data = await response.json()
+
+        if (!response.ok || data.status !== 'success') {
+          throw new Error(data.message || `HTTP ${response.status}`)
+        }
+
+        this.models = Array.isArray(data.models) ? [...data.models] : []
+        saveToStorage(STORAGE_KEY_MODEL_LIST, this.models)
+        return [...this.models]
+      } catch (error) {
+        this.lastUploadResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_MODEL_UPLOAD_STATE, this.lastUploadResult)
+        return null
+      }
+    },
+    async uploadModel({ modelName, engineFile, txtFile }) {
+      this.isUploading = true
+      this.uploadProgress = 0
+
+      try {
+        const result = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest()
+          const formData = new FormData()
+
+          formData.append('model_name', modelName)
+          formData.append('engine_file', engineFile)
+          formData.append('txt_file', txtFile)
+
+          xhr.upload.addEventListener('progress', (event) => {
+            if (event.lengthComputable && event.total > 0) {
+              this.uploadProgress = Math.round((event.loaded / event.total) * 100)
+            }
+          })
+
+          xhr.addEventListener('load', () => {
+            let data = {}
+
+            try {
+              data = xhr.responseText ? JSON.parse(xhr.responseText) : {}
+            } catch {
+              data = {}
+            }
+
+            if (xhr.status >= 200 && xhr.status < 300 && data.status === 'success') {
+              resolve(data)
+            } else {
+              reject(new Error(data.message || `HTTP ${xhr.status}`))
+            }
+          })
+
+          xhr.addEventListener('error', () => {
+            reject(new Error('上传模型失败: 网络连接异常'))
+          })
+
+          xhr.addEventListener('abort', () => {
+            reject(new Error('上传已取消'))
+          })
+
+          xhr.open('POST', `${API_URL}/api/models/upload`)
+          xhr.send(formData)
+        })
+
+        this.uploadProgress = 100
+        this.lastUploadResult = { success: true, message: result.message || '上传成功' }
+        saveToStorage(STORAGE_KEY_MODEL_UPLOAD_STATE, this.lastUploadResult)
+        await this.fetchModels()
+        return { success: true, message: result.message || '上传成功', data: result.data || null }
+      } catch (error) {
+        this.lastUploadResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_MODEL_UPLOAD_STATE, this.lastUploadResult)
+        return { success: false, message: error.message }
+      } finally {
+        this.isUploading = false
+      }
+    },
+    getModels() {
+      return [...this.models]
+    },
+    getState() {
+      return { ...this.lastUploadResult }
+    },
+    clearResult() {
+      this.lastUploadResult = { unset: true }
+      saveToStorage(STORAGE_KEY_MODEL_UPLOAD_STATE, this.lastUploadResult)
+    },
+    resetProgress() {
+      this.uploadProgress = 0
+      this.isUploading = false
     },
   },
 })

@@ -38,12 +38,32 @@
           title="检测区域"
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 4h6v6H4z"></path>
-            <path d="M14 4h6v6h-6z"></path>
-            <path d="M4 14h6v6H4z"></path>
-            <path d="M14 14h6v6h-6z"></path>
+            <path d="M3 3h6"></path>
+            <path d="M3 3v6"></path>
+            <path d="M21 3h-6"></path>
+            <path d="M21 3v6"></path>
+            <path d="M3 21h6"></path>
+            <path d="M3 21v-6"></path>
+            <path d="M21 21h-6"></path>
+            <path d="M21 21v-6"></path>
+            <path d="M12 8v8"></path>
+            <path d="M8 12h8"></path>
           </svg>
           <span class="btn-label">检测区域</span>
+        </button>
+
+        <button
+          class="operation-btn"
+          :class="{ active: modelManagementState.active, inactive: modelManagementState.inactive, unset: modelManagementState.unset }"
+          @click="goToModelManagement"
+          title="上传模型"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 16V4"></path>
+            <path d="M7 9l5-5 5 5"></path>
+            <path d="M4 20h16"></path>
+          </svg>
+          <span class="btn-label">上传模型</span>
         </button>
       </div>
 
@@ -110,6 +130,7 @@ import {
   useCameraSettingStore,
   useDetectionRegionStore,
   useDetectionSettingStore,
+  useModelManagementStore,
 } from '@/stores/settingsStore';
 
 const router = useRouter();
@@ -130,6 +151,7 @@ let pc = null;
 const cameraSettingStore = useCameraSettingStore()
 const detectionSettingStore = useDetectionSettingStore()
 const detectionRegionStore = useDetectionRegionStore()
+const modelManagementStore = useModelManagementStore()
 
 /*
   用于表达各种案件设置的状态
@@ -140,6 +162,7 @@ const detectionRegionStore = useDetectionRegionStore()
 const cameraState = ref({"active": false, "inactive": false, "unset": true})
 const detectionState = ref({"active": false, "inactive": false, "unset": true})
 const detectionRegionState = ref({"active": false, "inactive": false, "unset": true})
+const modelManagementState = ref({"active": false, "inactive": false, "unset": true})
 
 let timeInterval = null;
 let speedInterval = null;
@@ -162,6 +185,10 @@ const goToDetectionSettings = () => {
 
 const goToDetectionRegion = () => {
   router.push("/detection-region");
+};
+
+const goToModelManagement = () => {
+  router.push("/model-management");
 };
 
 const updateTime = () => {
@@ -374,9 +401,11 @@ onMounted(async () => {
   const saveCameraState = cameraSettingStore.getState();
   const saveDetectionState = detectionSettingStore.getState();
   const saveDetectionRegionState = detectionRegionStore.getState();
+  const saveModelManagementState = modelManagementStore.getState();
   loadFromSaveState(saveCameraState, cameraState);
   loadFromSaveState(saveDetectionState, detectionState);
   loadFromSaveState(saveDetectionRegionState, detectionRegionState);
+  loadFromSaveState(saveModelManagementState, modelManagementState);
 
   initWebRTC();
 

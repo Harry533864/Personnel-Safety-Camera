@@ -5,6 +5,7 @@ import homeRoutes from './home'
 import cameraRoutes from './cameraSetting'
 import detectionRoutes from './detectionSetting'
 import detectionRegionRoutes from './detectionRegion'
+import modelManagementRoutes from './modelManagement'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -12,7 +13,8 @@ const router = createRouter({
     ...homeRoutes,
     ...cameraRoutes,
     ...detectionRoutes,
-    ...detectionRegionRoutes
+    ...detectionRegionRoutes,
+    ...modelManagementRoutes
   ]
 })
 

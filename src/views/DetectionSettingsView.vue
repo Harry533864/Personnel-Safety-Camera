@@ -25,13 +25,20 @@
         <div class="form-item">
           <label class="form-label">检测模型：</label>
           <div class="form-control-wrapper">
-            <input 
-              type="text" 
-              v-model="settings.detectionModel" 
-              class="form-input"
-              placeholder="输入模型编号"
-              :disabled="isLoading"
-            />
+            <select
+              v-model="settings.detectionModel"
+              class="form-select"
+              :disabled="isLoading || modelsLoading"
+            >
+              <option
+                v-for="model in modelOptions"
+                :key="model"
+                :value="model"
+              >
+                {{ model }}
+              </option>
+            </select>
+            <span class="unit" v-if="modelsLoading">加载中</span>
           </div>
         </div>
 
@@ -132,14 +139,23 @@
 </template>
 
 <script setup>
-import { ref, reactive } from "vue";
+import { computed, ref, reactive, onMounted } from "vue";
 import { useRouter } from "vue-router";
-import { useDetectionSettingStore } from '@/stores/settingsStore'
+import { useDetectionSettingStore, useModelManagementStore } from '@/stores/settingsStore'
 
 const router = useRouter();
 const detectionSettingStore = useDetectionSettingStore()
+const modelManagementStore = useModelManagementStore()
 const settings = reactive(detectionSettingStore.getSettings());
 const isLoading = ref(false);
+const modelsLoading = ref(false);
+const modelOptions = computed(() => {
+  const models = modelManagementStore.getModels();
+  if (models.length) {
+    return models;
+  }
+  return settings.detectionModel ? [settings.detectionModel] : [];
+});
 
 const goBack = () => {
   if (isLoading.value) return;
@@ -164,6 +180,16 @@ const confirmSettings = async () => {
   // 返回首页
   router.push("/");
 };
+
+onMounted(async () => {
+  if (modelManagementStore.getModels().length) {
+    return;
+  }
+
+  modelsLoading.value = true;
+  await modelManagementStore.fetchModels();
+  modelsLoading.value = false;
+});
 </script>
 
 <style scoped>
