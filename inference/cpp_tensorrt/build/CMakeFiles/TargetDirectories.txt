@@ -1,3 +1,0 @@
-/home/jetson/code/Cam_flaskvue/inference/cpp_tensorrt/build/CMakeFiles/camera_tensorrt.dir
-/home/jetson/code/Cam_flaskvue/inference/cpp_tensorrt/build/CMakeFiles/edit_cache.dir
-/home/jetson/code/Cam_flaskvue/inference/cpp_tensorrt/build/CMakeFiles/rebuild_cache.dir
