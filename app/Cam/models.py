@@ -46,6 +46,7 @@ class Model:
 
         输出:
             result: C++ 推理并绘图后的图像，np.ndarray，BGR 格式
+            alarm_flag: bool, ROI warning_zone / forbidden_zone 稳定触发时为 True
         """
         frame = self._check_frame(frame)
 
@@ -62,7 +63,7 @@ class Model:
 
         with self.lock:
             self._write_packet(input_bytes)
-            output_bytes = self._read_packet()
+            alarm_flag, output_bytes = self._read_packet()
 
         if not output_bytes:
             raise RuntimeError("C++ 返回空结果，可能是图像解码或推理失败")
@@ -403,17 +404,24 @@ class Model:
             raise RuntimeError("C++ stdin 已断开，写入失败")
 
     def _read_packet(self):
-        header = self._read_exact(4)
+        """
+        C++ -> Python 返回协议:
+            4 bytes: alarm_flag，uint32，小端，0/1
+            4 bytes: JPEG 结果图长度，uint32，小端
+            N bytes: JPEG 编码后的结果图
+        """
+        header = self._read_exact(8)
 
-        if len(header) != 4:
-            raise RuntimeError("读取 C++ 返回长度失败")
+        if len(header) != 8:
+            raise RuntimeError("读取 C++ 返回头失败")
 
-        size = struct.unpack("<I", header)[0]
+        alarm_value, size = struct.unpack("<II", header)
+        alarm_flag = bool(alarm_value)
 
         if size == 0:
-            return b""
+            return alarm_flag, b""
 
-        return self._read_exact(size)
+        return alarm_flag, self._read_exact(size)
 
     def _read_exact(self, size):
         if self.proc is None:
@@ -612,6 +620,9 @@ def main():
         window_e2e_time = 0.0
         window_start = time.perf_counter()
 
+        total_alarm_count = 0
+        window_alarm_count = 0
+
         try:
             while True:
                 e2e_start = time.perf_counter()
@@ -635,7 +646,7 @@ def main():
                 # Python 调 C++ 推理
                 # =========================
                 infer_start = time.perf_counter()
-                result = model.inference(frame)
+                result, alarm_flag = model.inference(frame)
                 infer_end = time.perf_counter()
 
                 e2e_end = time.perf_counter()
@@ -659,6 +670,10 @@ def main():
                 e2e_time = e2e_end - e2e_start
 
                 valid_count += 1
+
+                if alarm_flag:
+                    total_alarm_count += 1
+                    window_alarm_count += 1
 
                 total_infer_time += infer_time
                 total_e2e_time += e2e_time
@@ -687,12 +702,14 @@ def main():
                         f"infer_fps={infer_fps:.2f}, "
                         f"total_fps={total_fps:.2f}, "
                         f"avg_infer={avg_infer_ms:.2f} ms, "
-                        f"avg_total={avg_total_ms:.2f} ms"
+                        f"avg_total={avg_total_ms:.2f} ms, "
+                        f"alarm_frames={window_alarm_count}"
                     )
 
                     window_count = 0
                     window_infer_time = 0.0
                     window_e2e_time = 0.0
+                    window_alarm_count = 0
                     window_start = now
 
                 if MAX_FRAMES > 0 and valid_count >= MAX_FRAMES:
@@ -720,6 +737,7 @@ def main():
                 print(f"平均 total_fps : {avg_total_fps:.2f}")
                 print(f"平均 infer耗时 : {avg_infer_ms:.2f} ms")
                 print(f"平均 total耗时 : {avg_total_ms:.2f} ms")
+                print(f"报警帧数       : {total_alarm_count}")
                 print("=" * 80)
 
 

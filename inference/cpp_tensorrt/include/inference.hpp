@@ -10,6 +10,13 @@
 #include "roi_alarm.hpp"
 #include "trt_detector.hpp"
 
+struct CameraInferResult {
+    cv::Mat image;
+    bool alarm = false;
+    bool warning = false;
+    SystemState system_state = SystemState::Safe;
+};
+
 class CameraTensorRTInfer {
 public:
     CameraTensorRTInfer(
@@ -20,7 +27,7 @@ public:
         bool settle_single_frame = false
     );
 
-    cv::Mat Infer(const cv::Mat& input_img);
+    CameraInferResult Infer(const cv::Mat& input_img);
 
 private:
     void DrawResult(
@@ -28,6 +35,11 @@ private:
         const FrameResult& frame_result,
         const std::chrono::steady_clock::time_point& begin,
         const std::chrono::steady_clock::time_point& end
+    );
+
+    void DrawROIWarnings(
+        cv::Mat& frame,
+        const FrameResult& frame_result
     );
 
 private:

@@ -83,6 +83,48 @@ bool WriteUInt32LE(std::ostream& out, uint32_t value) {
     return WriteExact(out, reinterpret_cast<const char*>(buf), 4);
 }
 
+/**
+ * C++ -> Python 输出协议:
+ *   4 bytes: alarm_flag，uint32，小端，0/1
+ *   4 bytes: JPEG 结果图长度，uint32，小端
+ *   N bytes: JPEG 编码后的结果图
+ */
+bool WriteResultPacket(
+    std::ostream& out,
+    bool alarm_flag,
+    const std::vector<unsigned char>& output_buffer
+) {
+    if (output_buffer.size() > UINT32_MAX) {
+        return false;
+    }
+
+    const uint32_t alarm_value = alarm_flag ? 1U : 0U;
+    const uint32_t output_size = static_cast<uint32_t>(output_buffer.size());
+
+    if (!WriteUInt32LE(out, alarm_value)) {
+        return false;
+    }
+
+    if (!WriteUInt32LE(out, output_size)) {
+        return false;
+    }
+
+    if (output_size == 0) {
+        return true;
+    }
+
+    return WriteExact(
+        out,
+        reinterpret_cast<const char*>(output_buffer.data()),
+        output_buffer.size()
+    );
+}
+
+bool WriteEmptyResultPacket(std::ostream& out) {
+    const std::vector<unsigned char> empty;
+    return WriteResultPacket(out, false, empty);
+}
+
 bool StartsWithDashDash(const std::string& s) {
     return s.rfind("--", 0) == 0;
 }
@@ -185,6 +227,7 @@ int main(int argc, char** argv) {
              *   N bytes: JPEG 编码后的图像
              *
              * C++ -> Python:
+             *   4 bytes: alarm_flag，uint32，小端，0/1
              *   4 bytes: JPEG 结果图长度，uint32，小端
              *   N bytes: JPEG 编码后的结果图
              */
@@ -209,7 +252,7 @@ int main(int argc, char** argv) {
                 std::cerr << "[C++] input packet too large: "
                           << input_size << " bytes" << std::endl;
 
-                WriteUInt32LE(std::cout, 0);
+                WriteEmptyResultPacket(std::cout);
                 std::cout.flush();
                 continue;
             }
@@ -229,12 +272,12 @@ int main(int argc, char** argv) {
             if (input_img.empty()) {
                 std::cerr << "[C++] failed to decode input image." << std::endl;
 
-                WriteUInt32LE(std::cout, 0);
+                WriteEmptyResultPacket(std::cout);
                 std::cout.flush();
                 continue;
             }
 
-            cv::Mat result_img;
+            CameraInferResult infer_result;
 
             try {
                 /**
@@ -242,12 +285,12 @@ int main(int argc, char** argv) {
                  * 输入 cv::Mat
                  * 输出已经画好 ROI、检测框、FPS、报警状态的 cv::Mat
                  */
-                result_img = infer.Infer(input_img);
+                infer_result = infer.Infer(input_img);
             } catch (const std::exception& e) {
                 std::cerr << "[C++] inference failed: "
                           << e.what() << std::endl;
 
-                WriteUInt32LE(std::cout, 0);
+                WriteEmptyResultPacket(std::cout);
                 std::cout.flush();
                 continue;
             }
@@ -261,7 +304,7 @@ int main(int argc, char** argv) {
 
             bool encode_ok = cv::imencode(
                 ".jpg",
-                result_img,
+                infer_result.image,
                 output_buffer,
                 encode_params
             );
@@ -269,7 +312,7 @@ int main(int argc, char** argv) {
             if (!encode_ok || output_buffer.empty()) {
                 std::cerr << "[C++] failed to encode output image." << std::endl;
 
-                WriteUInt32LE(std::cout, 0);
+                WriteEmptyResultPacket(std::cout);
                 std::cout.flush();
                 continue;
             }
@@ -277,24 +320,16 @@ int main(int argc, char** argv) {
             if (output_buffer.size() > UINT32_MAX) {
                 std::cerr << "[C++] output image too large." << std::endl;
 
-                WriteUInt32LE(std::cout, 0);
+                WriteEmptyResultPacket(std::cout);
                 std::cout.flush();
                 continue;
             }
 
-            const uint32_t output_size =
-                static_cast<uint32_t>(output_buffer.size());
-
-            if (!WriteUInt32LE(std::cout, output_size)) {
-                std::cerr << "[C++] failed to write output size." << std::endl;
-                break;
-            }
-
-            if (!WriteExact(
+            if (!WriteResultPacket(
                     std::cout,
-                    reinterpret_cast<const char*>(output_buffer.data()),
-                    output_buffer.size())) {
-                std::cerr << "[C++] failed to write output image bytes." << std::endl;
+                    infer_result.alarm,
+                    output_buffer)) {
+                std::cerr << "[C++] failed to write output packet." << std::endl;
                 break;
             }
 

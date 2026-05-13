@@ -60,13 +60,13 @@ class CamStream:
         pixels = int(w) * int(h)
 
         if pixels >= 2560 * 1440:
-            return 12000
+            return 15000
         elif pixels >= 1920 * 1080:
-            return 8000
+            return 12000
         elif pixels >= 1280 * 720:
-            return 4000
+            return 8000
         else:
-            return 2500
+            return 4000
 
     def _build_gst_pipeline(self, current_w, current_h, current_fps):
         """
@@ -93,7 +93,7 @@ class CamStream:
             f"! video/x-raw,format=I420 "
             f"! x264enc "
             f"bitrate={bitrate_kbps} "
-            f"speed-preset=ultrafast "
+            f"speed-preset=faster "
             f"tune=zerolatency "
             f"key-int-max={current_fps} "
             f"bframes=0 "
