@@ -370,6 +370,28 @@ export const useModelManagementStore = defineStore('modelManagement', {
         this.isUploading = false
       }
     },
+    async deleteModel(modelName) {
+      if (!confirm(`确定要删除模型 ${modelName} 吗？`)) return { success: false, message: '已取消删除' };
+      
+      try {
+        const response = await fetch(`${API_URL}/api/models/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model_name: modelName }),
+        })
+
+        const data = await response.json()
+
+        if (!response.ok || data.status !== 'success') {
+          throw new Error(data.message || `HTTP ${response.status}`)
+        }
+
+        await this.fetchModels()
+        return { success: true, message: data.message || '删除成功' }
+      } catch (error) {
+        return { success: false, message: error.message }
+      }
+    },
     getModels() {
       return [...this.models]
     },

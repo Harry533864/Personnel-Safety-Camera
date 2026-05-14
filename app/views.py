@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from app import app
 from flask import request, jsonify, render_template
@@ -566,8 +567,48 @@ def get_model_list():
             "status": "error",
             "message": f"获取模型列表失败: {str(e)}"
         }), 500
-        
 
+
+@app.route("/api/models/delete", methods=["POST"])
+def delete_model():
+    """
+    删除指定的模型及其文件
+    """
+    data = request.get_json(silent=True) or {}
+    model_name = data.get("model_name")
+    
+    if not model_name:
+        return jsonify({"status": "error", "message": "缺少 model_name 参数"}), 400
+        
+    try:
+        cfg = read_yaml(AI_CONFIG_PATH)
+        model_names = cfg.get("model_names") or []
+        if not isinstance(model_names, list):
+            model_names = []
+            
+        if model_name not in model_names:
+            return jsonify({"status": "error", "message": f"模型 '{model_name}' 不存在"}), 404
+            
+        # 1. 移除模型配置
+        model_names.remove(model_name)
+        cfg["model_names"] = model_names
+        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+        
+        # 2. 删除对应的模型文件夹
+        model_dir = MODEL_FILE_PATH / model_name
+        if model_dir.exists() and model_dir.is_dir():
+            shutil.rmtree(str(model_dir))
+            
+        return jsonify({
+            "status": "success",
+            "message": f"模型 '{model_name}' 及相关文件删除成功"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"删除模型失败: {str(e)}"
+        }), 500
 
 
 # =========================

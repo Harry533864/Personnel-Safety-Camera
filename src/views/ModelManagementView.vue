@@ -88,7 +88,12 @@
               <tbody>
                 <tr v-for="model in modelRows" :key="model">
                   <td>{{ model }}</td>
-                  <td>已上传</td>
+                  <td>
+                    <div style="display: flex; align-items: center; justify-content: space-between;">
+                      <span>已上传</span>
+                      <button class="delete-btn" @click="deleteModel(model)" :disabled="isUploading">删除</button>
+                    </div>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -175,6 +180,15 @@ const refreshModels = async () => {
 
   if (models === null) {
     alert(modelManagementStore.getState().message || "获取模型列表失败");
+  }
+};
+
+const deleteModel = async (modelName) => {
+  const result = await modelManagementStore.deleteModel(modelName);
+  if (!result.success && result.message !== '已取消删除') {
+    alert(result.message);
+  } else if (result.success) {
+    alert(result.message);
   }
 };
 
@@ -447,6 +461,25 @@ onMounted(async () => {
   background: #fff;
   color: #666;
   font-weight: 600;
+}
+
+.delete-btn {
+  padding: 4px 12px;
+  background: #ff4d4f;
+  border: 1px solid transparent;
+  color: white;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.delete-btn:hover:not(:disabled) {
+  background: #ff7875;
+}
+
+.delete-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .empty-text {

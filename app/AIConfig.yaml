@@ -42,5 +42,4 @@ test:
   save_path: hot_reload_result.jpg
   show: false
 model_names:
-- yolov11
 - yolov11_person

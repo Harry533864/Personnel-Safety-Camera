@@ -56,14 +56,14 @@
           class="operation-btn"
           :class="{ active: modelManagementState.active, inactive: modelManagementState.inactive, unset: modelManagementState.unset }"
           @click="goToModelManagement"
-          title="上传模型"
+          title="模型管理"
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 16V4"></path>
             <path d="M7 9l5-5 5 5"></path>
             <path d="M4 20h16"></path>
           </svg>
-          <span class="btn-label">上传模型</span>
+          <span class="btn-label">模型管理</span>
         </button>
       </div>
 
