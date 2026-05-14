@@ -12,6 +12,11 @@ import cv2
 import numpy as np
 from ruamel.yaml import YAML
 
+try:
+    import Jetson.GPIO as GPIO
+except Exception:
+    GPIO = None
+
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -32,8 +37,19 @@ class Model:
 
         self.proc = None
         self.lock = threading.RLock()
+        
+        # GPIO报警
+        self.alarm_gpio = None
+        self.alarm_level = 1
+        self.alarm_idle_level = 0
+        self.alarm_duration = 0
+
+        self.alarm_active = False
+        self.alarm_end_time = None
+        self.alarm_led_on = False
 
         self._load_config_and_prepare_runtime()
+        self._init_alarm_gpio()
         self._check_files()
         self.proc = self._start_cpp_server()
 
@@ -75,6 +91,8 @@ class Model:
 
         if result is None:
             raise RuntimeError("Python 解码 C++ 返回图像失败")
+        
+        self._handle_alarm_gpio(alarm_flag)
 
         return result
 
@@ -95,6 +113,7 @@ class Model:
         with self.lock:
             self.close()
             self._load_config_and_prepare_runtime()
+            self._init_alarm_gpio()
             self._check_files()
             self.proc = self._start_cpp_server()
 
@@ -116,6 +135,7 @@ class Model:
             self._write_yaml_atomic(self.config_path, new_cfg)
             self.close()
             self._load_config_and_prepare_runtime()
+            self._init_alarm_gpio()
             self._check_files()
             self.proc = self._start_cpp_server()
 
@@ -147,6 +167,110 @@ class Model:
 
             self.proc = None
 
+            if self.alarm_timer:
+                self.alarm_timer.cancel()
+                self.alarm_timer = None
+
+            if self.alarm_gpio is not None and GPIO is not None:
+                try:
+                    GPIO.output(self.alarm_gpio, self.alarm_idle_level)
+                    GPIO.cleanup(self.alarm_gpio)
+                except Exception:
+                    pass
+
+            self.alarm_gpio = None
+
+    def _init_alarm_gpio(self):
+        """
+        从 AIConfig.yaml 读取 exception_output，并初始化 GPIO。
+        默认使用 Jetson.GPIO 的 BOARD 编号。
+        """
+        cfg = self.cfg.get("exception_output", {}) or {}
+
+        gpio = cfg.get("gpio", None)
+        if gpio is None:
+            return
+
+        if GPIO is None:
+            print("[alarm_gpio] Jetson.GPIO 未安装，跳过 GPIO 报警输出", file=sys.stderr)
+            return
+
+        self.alarm_gpio = int(gpio)
+        self.alarm_level = 1 if int(cfg.get("output_level", 1)) else 0
+        self.alarm_idle_level = 0 if self.alarm_level == 1 else 1
+        self.alarm_duration = float(cfg.get("duration", 0))
+
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(self.alarm_gpio, GPIO.OUT, initial=self.alarm_idle_level)
+
+        print(
+            f"[alarm_gpio] gpio={self.alarm_gpio}, "
+            f"level={self.alarm_level}, duration={self.alarm_duration}s"
+        )
+
+
+    def _handle_alarm_gpio(self, alarm_flag):
+        """
+        alarm_flag=False：立即恢复 LED 空闲状态
+        alarm_flag=True ：只触发一次报警
+        duration > 0   ：达到持续时间后自动恢复，但 alarm_flag 不变 False 前不重复触发
+        duration = 0   ：报警期间一直亮，直到 alarm_flag=False
+        """
+        if self.alarm_gpio is None or GPIO is None:
+            return
+
+        now = time.monotonic()
+
+        # 当前无报警：立即恢复 LED，并重置报警状态
+        if not alarm_flag:
+            if self.alarm_led_on:
+                GPIO.output(self.alarm_gpio, self.alarm_idle_level)
+                print(
+                    f"[alarm_gpio] 报警结束，GPIO {self.alarm_gpio} "
+                    f"输出 {self.alarm_idle_level}"
+                )
+
+            self.alarm_active = False
+            self.alarm_led_on = False
+            self.alarm_end_time = None
+            return
+
+        # 第一次进入报警状态
+        if not self.alarm_active:
+            self.alarm_active = True
+            self.alarm_led_on = True
+
+            GPIO.output(self.alarm_gpio, self.alarm_level)
+
+            if self.alarm_duration > 0:
+                self.alarm_end_time = now + self.alarm_duration
+            else:
+                self.alarm_end_time = None
+
+            print(
+                f"[alarm_gpio] 报警触发，GPIO {self.alarm_gpio} "
+                f"输出 {self.alarm_level}，持续 {self.alarm_duration}s"
+            )
+
+            return
+
+        # 已经处于报警状态，不重复触发
+        # 如果配置了 duration，到时间后恢复空闲电平
+        if (
+            self.alarm_duration > 0
+            and self.alarm_led_on
+            and self.alarm_end_time is not None
+            and now >= self.alarm_end_time
+        ):
+            GPIO.output(self.alarm_gpio, self.alarm_idle_level)
+            self.alarm_led_on = False
+
+            print(
+                f"[alarm_gpio] 报警持续时间结束，GPIO {self.alarm_gpio} "
+                f"输出 {self.alarm_idle_level}"
+            )
+            
     def _load_config_and_prepare_runtime(self):
         self.cfg = self._load_yaml(self.config_path)
 

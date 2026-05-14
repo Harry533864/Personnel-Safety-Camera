@@ -612,6 +612,126 @@ def delete_model():
 
 
 # =========================
+# 异常检测GPIO配置接口
+# =========================
+
+def normalize_gpio_output_level(value):
+    """
+    归一化 GPIO 输出电平。
+    支持前端传：
+    - 1 / 0
+    - true / false
+    - "high" / "low"
+    - "on" / "off"
+    - "高" / "低"
+    """
+    if isinstance(value, bool):
+        return 1 if value else 0
+
+    if isinstance(value, (int, float)):
+        if float(value) == 1:
+            return 1
+        if float(value) == 0:
+            return 0
+        raise ValueError("output_level 只能是 0 或 1")
+
+    value_str = str(value).strip().lower()
+
+    if value_str in ["1", "true", "high", "on", "高", "高电平"]:
+        return 1
+
+    if value_str in ["0", "false", "low", "off", "低", "低电平"]:
+        return 0
+
+    raise ValueError("output_level 只能是 0/1、true/false、high/low")
+
+
+@app.route("/api/detection/exception_output", methods=["POST"])
+def update_exception_output_configuration():
+    """
+    异常输出配置。
+
+    前端请求示例：
+    {
+        "gpio": 18,
+        "output_level": 1,
+        "duration": 5
+    }
+
+    参数说明：
+    - gpio: Jetson GPIO 引脚号
+    - output_level: 输出电平，1=高电平，0=低电平
+    - duration: 持续时间，单位秒；0 表示一直保持
+    """
+    data = request.get_json(silent=True) or {}
+
+    gpio_raw = data.get("gpio", data.get("gpio_pin", data.get("gpioPin")))
+    level_raw = data.get(
+        "output_level",
+        data.get("level", data.get("outputLevel"))
+    )
+    duration_raw = data.get(
+        "duration",
+        data.get("duration_sec", data.get("durationSec", 0))
+    )
+
+    if gpio_raw is None:
+        return jsonify({
+            "status": "error",
+            "message": "缺少 gpio 参数"
+        }), 400
+
+    if level_raw is None:
+        return jsonify({
+            "status": "error",
+            "message": "缺少 output_level 参数"
+        }), 400
+
+    try:
+        gpio = int(gpio_raw)
+        if gpio < 0:
+            raise ValueError("gpio 必须是大于等于 0 的整数")
+
+        output_level = normalize_gpio_output_level(level_raw)
+
+        duration = float(duration_raw)
+        if duration < 0:
+            raise ValueError("duration 必须大于等于 0，0 表示一直保持")
+
+        # 如果是整数秒，写入 YAML 时保持为 int，避免 5.0
+        if duration.is_integer():
+            duration = int(duration)
+
+        cfg = read_yaml(AI_CONFIG_PATH)
+
+        cfg["exception_output"] = {
+            "gpio": gpio,
+            "output_level": output_level,
+            "duration": duration
+        }
+
+        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+
+        # 如果推理流运行中，让它重新读取配置
+        reloaded = reload_enabled_streams()
+
+        return jsonify({
+            "status": "success",
+            "message": "异常输出配置已更新",
+            "data": {
+                "exception_output": cfg["exception_output"],
+                "reloaded": reloaded
+            }
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 400
+    
+
+# =========================
 # Flask 默认辅助函数
 # =========================
 

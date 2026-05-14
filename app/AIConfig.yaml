@@ -9,7 +9,7 @@ model:
   camera_id: cam_demo_001
   detect_enable: true
   infer_target: all
-  model_name: yolov11_person
+  model_name: yolo11
   imgsz: 640
   conf_thres: 0.5
   iou_thres: 0.1
@@ -25,14 +25,14 @@ model:
     judge_method: foot_point
     coordinate_mode: normalized
     polygon:
-    - - 0.0499
-      - 0.0446
-    - - 0.952
-      - 0.0446
-    - - 0.952
-      - 0.9568
-    - - 0.0499
-      - 0.9568
+    - - 0.5342
+      - 0.0512
+    - - 0.9394
+      - 0.0512
+    - - 0.9394
+      - 0.8787
+    - - 0.5342
+      - 0.8787
     overlap_thres: 0.1
     target: all
 test:
@@ -42,4 +42,8 @@ test:
   save_path: hot_reload_result.jpg
   show: false
 model_names:
-- yolov11_person
+- yolo11
+exception_output:
+  gpio: 29
+  output_level: 1
+  duration: 2
