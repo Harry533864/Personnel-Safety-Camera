@@ -167,10 +167,6 @@ class Model:
 
             self.proc = None
 
-            if self.alarm_timer:
-                self.alarm_timer.cancel()
-                self.alarm_timer = None
-
             if self.alarm_gpios and GPIO is not None:
                 try:
                     for p in self.alarm_gpios:

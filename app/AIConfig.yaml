@@ -44,6 +44,7 @@ test:
 model_names:
 - yolo11
 exception_output:
-  gpio: 29
+  gpio:
+  - 32
   output_level: 1
-  duration: 2
+  duration: 0
