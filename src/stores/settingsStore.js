@@ -16,6 +16,8 @@ const STORAGE_KEY_DETECTION_REGION = 'detection_region_settings'
 const STORAGE_KEY_DETECTION_REGION_STATE = 'detection_region_save_result'
 const STORAGE_KEY_MODEL_LIST = 'model_management_list'
 const STORAGE_KEY_MODEL_UPLOAD_STATE = 'model_upload_result'
+const STORAGE_KEY_EXCEPTION_OUTPUT = 'exception_output_settings'
+const STORAGE_KEY_EXCEPTION_OUTPUT_STATE = 'exception_output_save_result'
 
 const cloneValue = (value) => JSON.parse(JSON.stringify(value))
 
@@ -405,6 +407,66 @@ export const useModelManagementStore = defineStore('modelManagement', {
     resetProgress() {
       this.uploadProgress = 0
       this.isUploading = false
+    },
+  },
+})
+
+// ========== 异常输出配置 ==========
+const EXCEPTION_OUTPUT_DEFAULTS = {
+  gpio: 7,
+  outputLevel: 1,
+  duration: 0,
+}
+
+export const useExceptionOutputStore = defineStore('exceptionOutput', {
+  state: () => ({
+    settings: loadFromStorage(STORAGE_KEY_EXCEPTION_OUTPUT, EXCEPTION_OUTPUT_DEFAULTS),
+    lastSaveResult: loadFromStorage(STORAGE_KEY_EXCEPTION_OUTPUT_STATE, { unset: true }),
+  }),
+  actions: {
+    async saveSettings(settings) {
+      const payload = {
+        gpio: Number(settings.gpio),
+        output_level: Number(settings.outputLevel),
+        duration: Number(settings.duration),
+      }
+
+      try {
+        const response = await fetch(`${API_URL}/api/detection/exception_output`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const data = await response.json()
+        if (data.status === 'success') {
+          this.settings = { ...settings }
+          saveToStorage(STORAGE_KEY_EXCEPTION_OUTPUT, this.settings)
+          this.lastSaveResult = { success: true, message: data.message || '保存成功' }
+          saveToStorage(STORAGE_KEY_EXCEPTION_OUTPUT_STATE, this.lastSaveResult)
+          return true
+        }
+
+        throw new Error(data.message || '保存失败')
+      } catch (error) {
+        this.lastSaveResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_EXCEPTION_OUTPUT_STATE, this.lastSaveResult)
+        return false
+      }
+    },
+    getSettings() {
+      return { ...this.settings }
+    },
+    getState() {
+      return { ...this.lastSaveResult }
+    },
+    clearResult() {
+      this.lastSaveResult = { unset: true }
+      saveToStorage(STORAGE_KEY_EXCEPTION_OUTPUT_STATE, this.lastSaveResult)
     },
   },
 })

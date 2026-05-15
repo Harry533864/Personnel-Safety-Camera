@@ -6,6 +6,7 @@ import cameraRoutes from './cameraSetting'
 import detectionRoutes from './detectionSetting'
 import detectionRegionRoutes from './detectionRegion'
 import modelManagementRoutes from './modelManagement'
+import exceptionOutputRoutes from './exceptionOutput'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -14,7 +15,8 @@ const router = createRouter({
     ...cameraRoutes,
     ...detectionRoutes,
     ...detectionRegionRoutes,
-    ...modelManagementRoutes
+    ...modelManagementRoutes,
+    ...exceptionOutputRoutes
   ]
 })
 

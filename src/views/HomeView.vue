@@ -65,6 +65,20 @@
           </svg>
           <span class="btn-label">模型管理</span>
         </button>
+
+        <button
+          class="operation-btn"
+          :class="{ active: exceptionOutputState.active, inactive: exceptionOutputState.inactive, unset: exceptionOutputState.unset }"
+          @click="goToExceptionOutput"
+          title="异常检测配置"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <path d="M12 9v4"></path>
+            <path d="M12 17h.01"></path>
+          </svg>
+          <span class="btn-label">异常检测配置</span>
+        </button>
       </div>
 
       <div class="operation-bar-right">
@@ -131,6 +145,7 @@ import {
   useDetectionRegionStore,
   useDetectionSettingStore,
   useModelManagementStore,
+  useExceptionOutputStore,
 } from '@/stores/settingsStore';
 
 const router = useRouter();
@@ -152,6 +167,7 @@ const cameraSettingStore = useCameraSettingStore()
 const detectionSettingStore = useDetectionSettingStore()
 const detectionRegionStore = useDetectionRegionStore()
 const modelManagementStore = useModelManagementStore()
+const exceptionOutputStore = useExceptionOutputStore()
 
 /*
   用于表达各种案件设置的状态
@@ -163,6 +179,7 @@ const cameraState = ref({"active": false, "inactive": false, "unset": true})
 const detectionState = ref({"active": false, "inactive": false, "unset": true})
 const detectionRegionState = ref({"active": false, "inactive": false, "unset": true})
 const modelManagementState = ref({"active": false, "inactive": false, "unset": true})
+const exceptionOutputState = ref({"active": false, "inactive": false, "unset": true})
 
 let timeInterval = null;
 let speedInterval = null;
@@ -189,6 +206,10 @@ const goToDetectionRegion = () => {
 
 const goToModelManagement = () => {
   router.push("/model-management");
+};
+
+const goToExceptionOutput = () => {
+  router.push("/exception-output");
 };
 
 const updateTime = () => {
@@ -402,10 +423,12 @@ onMounted(async () => {
   const saveDetectionState = detectionSettingStore.getState();
   const saveDetectionRegionState = detectionRegionStore.getState();
   const saveModelManagementState = modelManagementStore.getState();
+  const saveExceptionOutputState = exceptionOutputStore.getState();
   loadFromSaveState(saveCameraState, cameraState);
   loadFromSaveState(saveDetectionState, detectionState);
   loadFromSaveState(saveDetectionRegionState, detectionRegionState);
   loadFromSaveState(saveModelManagementState, modelManagementState);
+  loadFromSaveState(saveExceptionOutputState, exceptionOutputState);
 
   initWebRTC();
 
