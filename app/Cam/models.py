@@ -39,7 +39,7 @@ class Model:
         self.lock = threading.RLock()
         
         # GPIO报警
-        self.alarm_gpio = None
+        self.alarm_gpios = []
         self.alarm_level = 1
         self.alarm_idle_level = 0
         self.alarm_duration = 0
@@ -171,14 +171,15 @@ class Model:
                 self.alarm_timer.cancel()
                 self.alarm_timer = None
 
-            if self.alarm_gpio is not None and GPIO is not None:
+            if self.alarm_gpios and GPIO is not None:
                 try:
-                    GPIO.output(self.alarm_gpio, self.alarm_idle_level)
-                    GPIO.cleanup(self.alarm_gpio)
+                    for p in self.alarm_gpios:
+                        GPIO.output(p, self.alarm_idle_level)
+                    GPIO.cleanup(self.alarm_gpios)
                 except Exception:
                     pass
 
-            self.alarm_gpio = None
+            self.alarm_gpios = []
 
     def _init_alarm_gpio(self):
         """
@@ -195,17 +196,28 @@ class Model:
             print("[alarm_gpio] Jetson.GPIO 未安装，跳过 GPIO 报警输出", file=sys.stderr)
             return
 
-        self.alarm_gpio = int(gpio)
+        if isinstance(gpio, list):
+            pins = [int(p) for p in gpio if str(p).strip() != ""]
+        else:
+            pins = [int(gpio)]
+
+        pins = [p for p in pins if p > 0]
+        pins = sorted(list(dict.fromkeys(pins)))
+        if not pins:
+            return
+
+        self.alarm_gpios = pins
         self.alarm_level = 1 if int(cfg.get("output_level", 1)) else 0
         self.alarm_idle_level = 0 if self.alarm_level == 1 else 1
         self.alarm_duration = float(cfg.get("duration", 0))
 
         GPIO.setwarnings(False)
         GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(self.alarm_gpio, GPIO.OUT, initial=self.alarm_idle_level)
+        for p in self.alarm_gpios:
+            GPIO.setup(p, GPIO.OUT, initial=self.alarm_idle_level)
 
         print(
-            f"[alarm_gpio] gpio={self.alarm_gpio}, "
+            f"[alarm_gpio] gpio={self.alarm_gpios}, "
             f"level={self.alarm_level}, duration={self.alarm_duration}s"
         )
 
@@ -217,7 +229,7 @@ class Model:
         duration > 0   ：达到持续时间后自动恢复，但 alarm_flag 不变 False 前不重复触发
         duration = 0   ：报警期间一直亮，直到 alarm_flag=False
         """
-        if self.alarm_gpio is None or GPIO is None:
+        if not self.alarm_gpios or GPIO is None:
             return
 
         now = time.monotonic()
@@ -225,9 +237,10 @@ class Model:
         # 当前无报警：立即恢复 LED，并重置报警状态
         if not alarm_flag:
             if self.alarm_led_on:
-                GPIO.output(self.alarm_gpio, self.alarm_idle_level)
+                for p in self.alarm_gpios:
+                    GPIO.output(p, self.alarm_idle_level)
                 print(
-                    f"[alarm_gpio] 报警结束，GPIO {self.alarm_gpio} "
+                    f"[alarm_gpio] 报警结束，GPIO {self.alarm_gpios} "
                     f"输出 {self.alarm_idle_level}"
                 )
 
@@ -241,7 +254,8 @@ class Model:
             self.alarm_active = True
             self.alarm_led_on = True
 
-            GPIO.output(self.alarm_gpio, self.alarm_level)
+            for p in self.alarm_gpios:
+                GPIO.output(p, self.alarm_level)
 
             if self.alarm_duration > 0:
                 self.alarm_end_time = now + self.alarm_duration
@@ -249,7 +263,7 @@ class Model:
                 self.alarm_end_time = None
 
             print(
-                f"[alarm_gpio] 报警触发，GPIO {self.alarm_gpio} "
+                f"[alarm_gpio] 报警触发，GPIO {self.alarm_gpios} "
                 f"输出 {self.alarm_level}，持续 {self.alarm_duration}s"
             )
 
@@ -263,11 +277,12 @@ class Model:
             and self.alarm_end_time is not None
             and now >= self.alarm_end_time
         ):
-            GPIO.output(self.alarm_gpio, self.alarm_idle_level)
+            for p in self.alarm_gpios:
+                GPIO.output(p, self.alarm_idle_level)
             self.alarm_led_on = False
 
             print(
-                f"[alarm_gpio] 报警持续时间结束，GPIO {self.alarm_gpio} "
+                f"[alarm_gpio] 报警持续时间结束，GPIO {self.alarm_gpios} "
                 f"输出 {self.alarm_idle_level}"
             )
             

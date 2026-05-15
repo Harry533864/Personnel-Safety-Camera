@@ -646,6 +646,30 @@ def normalize_gpio_output_level(value):
     raise ValueError("output_level 只能是 0/1、true/false、high/low")
 
 
+def normalize_gpio_pins(value):
+    """
+    归一化 GPIO 引脚列表。
+    支持前端传：
+    - 单个数字：18
+    - 数组： [7, 11, 18]
+    """
+    pins = value if isinstance(value, list) else [value]
+
+    out = []
+    for p in pins:
+        try:
+            pn = int(p)
+        except Exception:
+            continue
+        if pn > 0:
+            out.append(pn)
+
+    out = sorted(list(dict.fromkeys(out)))
+    if not out:
+        raise ValueError("gpio 必须是大于 0 的整数或整数数组")
+    return out
+
+
 @app.route("/api/detection/exception_output", methods=["POST"])
 def update_exception_output_configuration():
     """
@@ -653,7 +677,7 @@ def update_exception_output_configuration():
 
     前端请求示例：
     {
-        "gpio": 18,
+        "gpio": [7, 11, 18],
         "output_level": 1,
         "duration": 5
     }
@@ -688,9 +712,7 @@ def update_exception_output_configuration():
         }), 400
 
     try:
-        gpio = int(gpio_raw)
-        if gpio < 0:
-            raise ValueError("gpio 必须是大于等于 0 的整数")
+        gpio_pins = normalize_gpio_pins(gpio_raw)
 
         output_level = normalize_gpio_output_level(level_raw)
 
@@ -705,7 +727,7 @@ def update_exception_output_configuration():
         cfg = read_yaml(AI_CONFIG_PATH)
 
         cfg["exception_output"] = {
-            "gpio": gpio,
+            "gpio": gpio_pins,
             "output_level": output_level,
             "duration": duration
         }

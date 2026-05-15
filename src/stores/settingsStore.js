@@ -413,7 +413,7 @@ export const useModelManagementStore = defineStore('modelManagement', {
 
 // ========== 异常输出配置 ==========
 const EXCEPTION_OUTPUT_DEFAULTS = {
-  gpio: 7,
+  gpioPins: [7],
   outputLevel: 1,
   duration: 0,
 }
@@ -425,8 +425,13 @@ export const useExceptionOutputStore = defineStore('exceptionOutput', {
   }),
   actions: {
     async saveSettings(settings) {
+      const gpioPinsRaw = settings?.gpioPins
+      const gpioPins = Array.isArray(gpioPinsRaw)
+        ? gpioPinsRaw.map((p) => Number(p)).filter((p) => Number.isInteger(p) && p > 0)
+        : [Number(gpioPinsRaw)].filter((p) => Number.isInteger(p) && p > 0)
+
       const payload = {
-        gpio: Number(settings.gpio),
+        gpio: gpioPins,
         output_level: Number(settings.outputLevel),
         duration: Number(settings.duration),
       }
@@ -459,7 +464,16 @@ export const useExceptionOutputStore = defineStore('exceptionOutput', {
       }
     },
     getSettings() {
-      return { ...this.settings }
+      const s = { ...this.settings }
+      if (Array.isArray(s.gpioPins)) return s
+      if (Number.isInteger(s.gpio)) {
+        return {
+          gpioPins: [Number(s.gpio)],
+          outputLevel: Number.isFinite(s.outputLevel) ? Number(s.outputLevel) : 1,
+          duration: Number.isFinite(s.duration) ? Number(s.duration) : 0,
+        }
+      }
+      return { ...EXCEPTION_OUTPUT_DEFAULTS }
     },
     getState() {
       return { ...this.lastSaveResult }

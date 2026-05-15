@@ -12,52 +12,86 @@
       </div>
 
       <div class="settings-form" :class="{ 'form-loading': isLoading }">
-        <div class="diagram-box">
-          <div class="diagram-title">40-Pin 排针图（参考）</div>
-          <img class="pinout-image" :src="pinoutImage" alt="40-Pin Expansion Header" />
-        </div>
+        <div class="form-main">
+          <div class="diagram-row">
+            <div class="diagram-box">
+              <div class="diagram-title">40-Pin 排针图（参考）</div>
+              <div class="pinout-wrapper">
+                <img class="pinout-image" :src="pinoutImage" alt="40-Pin Expansion Header" />
+                <div
+                  v-for="m in markerStyles"
+                  :key="m.key"
+                  class="pinout-marker"
+                  :style="m.style"
+                  :title="m.title"
+                ></div>
+              </div>
+            </div>
 
-        <div class="form-item">
-          <label class="form-label">GPIO 口：</label>
-          <div class="form-control-wrapper">
-            <select v-model.number="form.gpio" class="form-select" :disabled="isLoading">
-              <option v-for="opt in gpioOptions" :key="opt.pin" :value="opt.pin">
-                {{ opt.label }}
-              </option>
-            </select>
+            <div class="pin-summary-sidebar">
+              <div class="pin-summary-title">已选</div>
+              <div v-if="selectedPins.length === 0" class="pin-summary-empty">暂无</div>
+              <div v-else class="pin-summary-tags">
+                <div v-for="pin in selectedPins" :key="pin" class="pin-summary-tag" :title="getPinLabel(pin)">
+                  <span class="pin-summary-text">{{ getPinShort(pin) }}</span>
+                  <button class="pin-summary-remove" type="button" @click="removePin(pin)" :disabled="isLoading">×</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-item">
+            <label class="form-label">GPIO 口：</label>
+            <div class="form-control-wrapper">
+              <select v-model.number="draftPin" class="form-select" :disabled="isLoading">
+                <option :value="0">选择新的端口</option>
+                <option
+                  v-for="opt in pinOptionsForSelect"
+                  :key="opt.pin"
+                  :value="opt.pin"
+                  :disabled="opt.disabled"
+                >
+                  {{ opt.label }}
+                </option>
+              </select>
+
+              <button class="mini-btn" type="button" @click="applyDraftPin" :disabled="isLoading || !draftPin">
+                添加
+              </button>
+              <button class="mini-btn danger" type="button" @click="clearAllPins" :disabled="isLoading || selectedPins.length === 0">
+                清空
+              </button>
+            </div>
+          </div>
+
+          <div class="form-item">
+            <label class="form-label">输出电平：</label>
+            <div class="form-control-wrapper">
+              <select v-model.number="form.outputLevel" class="form-select compact" :disabled="isLoading">
+                <option :value="1">高电平</option>
+                <option :value="0">低电平</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-item">
+            <label class="form-label">持续时间：</label>
+            <div class="form-control-wrapper">
+              <input
+                v-model.number="form.duration"
+                type="number"
+                class="form-input number-input compact"
+                min="0"
+                step="1"
+                :disabled="isLoading"
+              />
+              <span class="unit">秒（0 表示一直保持）</span>
+            </div>
           </div>
         </div>
 
-        <div class="form-item">
-          <label class="form-label">输出电平：</label>
-          <div class="form-control-wrapper">
-            <select v-model.number="form.outputLevel" class="form-select" :disabled="isLoading">
-              <option :value="1">高电平</option>
-              <option :value="0">低电平</option>
-            </select>
-            <span class="unit">触发报警时输出</span>
-          </div>
-        </div>
-
-        <div class="form-item">
-          <label class="form-label">持续时间：</label>
-          <div class="form-control-wrapper">
-            <input
-              v-model.number="form.duration"
-              type="number"
-              class="form-input number-input"
-              min="0"
-              step="1"
-              :disabled="isLoading"
-            />
-            <span class="unit">秒（0 表示一直保持）</span>
-          </div>
-        </div>
-
-        <div class="tips-box">
-          <p>注意：这里的 GPIO 口使用物理引脚编号（Header Pin #）。如果你把某些脚拿去做 GPIO，可能会占用 UART/SPI/I2S 的默认功能。</p>
-        </div>
       </div>
+
 
       <div class="settings-footer">
         <button class="confirm-btn" @click="confirmSettings" :disabled="isLoading">
@@ -69,7 +103,7 @@
 </template>
 
 <script setup>
-import { reactive, ref } from "vue";
+import { computed, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useExceptionOutputStore } from "@/stores/settingsStore";
 import pinoutImage from "@/assets/jetson-40pin-pinout.svg";
@@ -80,12 +114,16 @@ const isLoading = ref(false);
 
 const gpioOptions = [
   { pin: 7, label: "Pin 7 / GPIO (Audio MCLK) / 引脚 7 (GPIO09)" },
+  { pin: 8, label: "Pin 8 / GPIO (UART1 TXD) / 引脚 8 (UART1_TXD)" },
+  { pin: 10, label: "Pin 10 / GPIO (UART1 RXD) / 引脚 10 (UART1_RXD)" },
   { pin: 11, label: "Pin 11 / GPIO (UART2 RTS) / 引脚 11 (UART1_RTS*)" },
   { pin: 12, label: "Pin 12 / GPIO (Audio Clock) / 引脚 12 (I2S0_SCLK)" },
   { pin: 13, label: "Pin 13 / GPIO (SPI1 Clock) / 引脚 13 (SPI1_SCK)" },
   { pin: 15, label: "Pin 15 / GPIO (PWM1) / 引脚 15 (GPIO12)" },
   { pin: 16, label: "Pin 16 / GPIO (SPI1 CS1) / 引脚 16 (SPI1_CS1*)" },
   { pin: 18, label: "Pin 18 / GPIO (SPI0 CS0) / 引脚 18 (SPI1_CSI0)" },
+  { pin: 27, label: "Pin 27 / GPIO (I2C0 SDA) / 引脚 27 (I2C0_SDA)" },
+  { pin: 28, label: "Pin 28 / GPIO (I2C0 SCL) / 引脚 28 (I2C0_SCL)" },
   { pin: 29, label: "Pin 29 / GPIO (Clock #0) / 引脚 29 (GPIO01)" },
   { pin: 31, label: "Pin 31 / GPIO (Clock #1) / 引脚 31 (GPIO11)" },
   { pin: 32, label: "Pin 32 / GPIO (PWM7) / 引脚 32 (GPIO07)" },
@@ -96,6 +134,79 @@ const gpioOptions = [
 ];
 
 const form = reactive(exceptionOutputStore.getSettings());
+const selectedPins = ref(Array.isArray(form.gpioPins) ? [...form.gpioPins] : []);
+const draftPin = ref(0);
+
+const pinOptionsForSelect = computed(() => {
+  const selectedSet = new Set(selectedPins.value.map((p) => Number(p)));
+  return gpioOptions.map((opt) => {
+    const disabled = selectedSet.has(opt.pin);
+    return {
+      ...opt,
+      disabled,
+      label: disabled ? `${opt.label}（已选）` : opt.label,
+    };
+  });
+});
+
+const getPinLabel = (pin) => {
+  const found = gpioOptions.find((opt) => opt.pin === Number(pin));
+  return found ? found.label : `Pin ${pin}`;
+};
+
+const applyDraftPin = () => {
+  if (!draftPin.value) return;
+  const pin = Number(draftPin.value);
+  if (!selectedPins.value.includes(pin)) {
+    selectedPins.value.push(pin);
+    selectedPins.value.sort((a, b) => a - b);
+  }
+  form.gpioPins = [...selectedPins.value];
+  draftPin.value = 0;
+};
+
+const removePin = (pin) => {
+  const p = Number(pin);
+  selectedPins.value = selectedPins.value.filter((x) => Number(x) !== p);
+  form.gpioPins = [...selectedPins.value];
+  if (draftPin.value === p) draftPin.value = 0;
+};
+
+const clearAllPins = () => {
+  selectedPins.value = [];
+  form.gpioPins = [];
+  draftPin.value = 0;
+};
+
+const markerStyles = computed(() => {
+  const pins = selectedPins.value.map((p) => Number(p)).filter((p) => Number.isInteger(p) && p > 0);
+  if (pins.length === 0) return [];
+
+  const leftXPct = 350 / 900;
+  const rightXPct = 570 / 900;
+  const y0Pct = 140 / 760;
+  const stepPct = 28 / 760;
+
+  return pins.map((pin, idx) => {
+    const isOdd = pin % 2 === 1;
+    const rowIndex = Math.floor((pin - 1) / 2);
+    const xPct = isOdd ? leftXPct : rightXPct;
+    const yPct = y0Pct + rowIndex * stepPct;
+    return {
+      key: `pin-${pin}`,
+      title: `Pin ${pin}`,
+      style: {
+        left: `${xPct * 100}%`,
+        top: `${yPct * 100}%`,
+        borderColor: `#1677ff`,
+        boxShadow: `0 0 0 4px rgba(22, 119, 255, 0.18)`,
+        background: `rgba(22, 119, 255, 0.18)`,
+      },
+    };
+  });
+});
+
+const getPinShort = (pin) => `pin${Number(pin)}`;
 
 const goBack = () => {
   if (isLoading.value) return;
@@ -103,11 +214,11 @@ const goBack = () => {
 };
 
 const confirmSettings = async () => {
-  const gpio = Number(form.gpio);
+  const gpioPins = selectedPins.value.map((p) => Number(p)).filter((p) => Number.isInteger(p) && p > 0);
   const outputLevel = Number(form.outputLevel);
   const duration = Number(form.duration);
 
-  if (!Number.isInteger(gpio) || gpio <= 0) {
+  if (gpioPins.length === 0) {
     alert("请选择有效 GPIO 口（Pin 编号）");
     return;
   }
@@ -125,7 +236,7 @@ const confirmSettings = async () => {
   isLoading.value = true;
   try {
     const success = await exceptionOutputStore.saveSettings({
-      gpio,
+      gpioPins,
       outputLevel,
       duration: Math.floor(duration),
     });
@@ -202,11 +313,42 @@ const confirmSettings = async () => {
 .settings-form {
   padding: 24px;
   transition: opacity 0.2s;
+  display: flex;
+  gap: 16px;
 }
 
 .settings-form.form-loading {
   opacity: 0.75;
   pointer-events: none;
+}
+
+.form-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.diagram-row {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 20px;
+}
+
+.diagram-box {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.pin-summary-sidebar {
+  width: 180px;
+  flex-shrink: 0;
+  padding-top: 14px;
+}
+
+.pin-summary-empty {
+  color: #9ca3af;
+  font-size: 0.9rem;
+  margin-top: 8px;
 }
 
 .form-item {
@@ -244,19 +386,25 @@ const confirmSettings = async () => {
   transition: border-color 0.2s;
 }
 
+.form-select.compact,
+.form-input.compact {
+  flex: 0 0 auto;
+  width: 180px;
+}
+
 .form-input:focus,
 .form-select:focus {
   border-color: #1677ff;
 }
 
 .number-input {
-  max-width: 160px;
+  max-width: none;
 }
 
 .unit {
   color: #999;
   font-size: 0.85rem;
-  min-width: 140px;
+  white-space: nowrap;
 }
 
 .tips-box {
@@ -306,7 +454,6 @@ const confirmSettings = async () => {
   border-radius: 8px;
   background: #ffffff;
   padding: 14px 16px;
-  margin-bottom: 20px;
 }
 
 .diagram-title {
@@ -316,12 +463,101 @@ const confirmSettings = async () => {
   margin-bottom: 10px;
 }
 
+.pinout-wrapper {
+  position: relative;
+}
+
 .pinout-image {
   width: 100%;
   height: auto;
   border-radius: 8px;
   border: 1px solid #f3f4f6;
   background: #ffffff;
+}
+
+.pinout-marker {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 3px solid #1677ff;
+  background: rgba(22, 119, 255, 0.15);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.pin-summary-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #333;
+  margin-bottom: 8px;
+}
+
+.pin-summary-tags {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pin-summary-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(22, 119, 255, 0.28);
+  background: rgba(22, 119, 255, 0.07);
+}
+
+.pin-summary-text {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: #111827;
+  text-transform: lowercase;
+}
+
+.pin-summary-remove {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: none;
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 20px;
+  padding: 0;
+}
+
+.pin-summary-remove:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mini-btn {
+  padding: 10px 14px;
+  border: 1px solid #d9d9d9;
+  background: #ffffff;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.mini-btn:hover:not(:disabled) {
+  border-color: #1677ff;
+  color: #1677ff;
+}
+
+.mini-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mini-btn.danger:hover:not(:disabled) {
+  border-color: #ef4444;
+  color: #ef4444;
 }
 
 @media (max-width: 768px) {
@@ -342,6 +578,23 @@ const confirmSettings = async () => {
 
   .form-control-wrapper {
     width: 100%;
+  }
+
+  .settings-form {
+    flex-direction: column;
+  }
+
+  .diagram-row {
+    flex-direction: column;
+  }
+
+  .pin-summary-sidebar {
+    width: 100%;
+  }
+
+  .pin-summary-tags {
+    flex-direction: row;
+    flex-wrap: wrap;
   }
 }
 </style>
