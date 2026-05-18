@@ -5,7 +5,7 @@ import threading
 import queue
 from pathlib import Path
 
-from app.Cam.models import Model
+from inference.python_tensorrt.model import Model
 
 
 class CamStream:
@@ -195,7 +195,7 @@ class CamStream:
 
                 if reload_when_enable:
                     model.reload_config()
-                    print(f"[{self.name}] AI 配置已重载，C++ 推理进程已重启")
+                    print(f"[{self.name}] AI 配置已重载，Python TensorRT 推理已重启")
 
                 print(f"[{self.name}] AI 推理已开启")
 
@@ -204,9 +204,9 @@ class CamStream:
 
                 if release_when_disable:
                     self._close_ai_model_locked()
-                    print(f"[{self.name}] AI 推理已关闭, C++ 推理进程已释放")
+                    print(f"[{self.name}] AI 推理已关闭, Python TensorRT 推理已释放")
                 else:
-                    print(f"[{self.name}] AI 推理已关闭，但 C++ 推理进程保留")
+                    print(f"[{self.name}] AI 推理已关闭，但 Python TensorRT 推理保留")
 
             if old_enable != enable:
                 print(f"[{self.name}] AI 推理状态变化: {old_enable} -> {enable}")
@@ -219,7 +219,7 @@ class CamStream:
 
             model = self._ensure_ai_model_locked()
             model.reload_config()
-            print(f"[{self.name}] AI 配置已重载, C++ 推理进程已重启")
+            print(f"[{self.name}] AI 配置已重载, Python TensorRT 推理已重启")
 
     # =========================================================
     # 队列与线程控制
