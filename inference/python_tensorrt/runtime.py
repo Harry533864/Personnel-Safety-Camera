@@ -515,7 +515,7 @@ class CameraTensorRTInfer:
                     name=str(roi.get("name", roi.get("roi_id", f"ROI{idx + 1}"))),
                     roi_type=str(roi.get("roi_type", "forbidden_zone")),
                     polygon=[(float(point[0]), float(point[1])) for point in polygon],
-                    judge_method=str(roi.get("judge_method", "foot_point")),
+                    judge_method=str(roi.get("judge_method", "overlap")),
                     overlap_thres=float(roi.get("overlap_thres", 0.2)),
                     coordinate_mode=str(roi.get("coordinate_mode", "absolute")),
                     enabled=True,

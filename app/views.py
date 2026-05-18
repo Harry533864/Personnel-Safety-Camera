@@ -363,7 +363,9 @@ def update_inference_configuration():
             model_cfg["conf_thres"] = float(data["detectionThreshold"])
 
         if "overlapRate" in data:
-            model_cfg["iou_thres"] = float(data["overlapRate"])
+            overlap_thres = float(data["overlapRate"])
+            for roi in model_cfg.get("rois", []):
+                roi["overlap_thres"] = overlap_thres
 
         write_yaml(cfg, file_path=AI_CONFIG_PATH)
 

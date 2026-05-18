@@ -374,3 +374,67 @@ class Model:
             self.close()
         except Exception:
             pass
+
+
+def main():
+    import time
+    import cv2
+
+    camera_id = 0
+    fps_interval = 30  # 每 30 帧统计一次平均 FPS
+
+    cap = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"无法打开摄像头: /dev/video{camera_id}")
+
+    # 设置摄像头参数
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+
+    print(f"已打开摄像头: /dev/video{camera_id}")
+    print("开始推理，按 Ctrl+C 退出")
+
+    frame_count = 0
+    interval_start = time.perf_counter()
+
+    try:
+        with Model() as model:
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print("读取摄像头图像失败")
+                    continue
+
+                infer_start = time.perf_counter()
+                _ = model.inference(frame)
+                infer_end = time.perf_counter()
+
+                frame_count += 1
+
+                if frame_count % fps_interval == 0:
+                    now = time.perf_counter()
+                    elapsed = now - interval_start
+
+                    fps = fps_interval / elapsed
+                    latency_ms = (infer_end - infer_start) * 1000
+
+                    print(
+                        f"FPS: {fps:.2f}, "
+                        f"last inference latency: {latency_ms:.2f} ms"
+                    )
+
+                    interval_start = now
+
+    except KeyboardInterrupt:
+        print("\n收到 Ctrl+C，退出程序")
+
+    finally:
+        cap.release()
+        print("摄像头已释放")
+
+
+if __name__ == "__main__":
+    main()
