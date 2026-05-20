@@ -39,6 +39,8 @@ class CamStream:
         enable_infer=False,
         enable_record=False, # 默认不保存推流视频
         ai_config_path=None,
+        video_base_dir=None
+
     ):
         self.name = name
         self.url = url
@@ -66,6 +68,8 @@ class CamStream:
         self._need_record_restart = True     # 启动时默认需要初始化录制器
         self._record_cooldown_until = 0.0    # 冷却期截止时间戳
         self._min_free_space_mb = 500        # 最少需要保留 500MB 磁盘空间
+
+        self.video_base_dir = video_base_dir if video_base_dir else Path(__file__).parent.parent.parent.resolve()
 
     # =========================================================
     # GStreamer 推流相关
@@ -110,15 +114,13 @@ class CamStream:
             f"! queue leaky=downstream max-size-buffers=2 "
             f"! videoconvert "
             f"! video/x-raw,format=I420 "
-            # 使用 Jetson 硬件编码器
-            f"! nvv4l2h264enc bitrate={hw_bitrate} preset-level=1 insert-sps-pps=true maxperf-enable=1 "
-            # f"! x264enc "
-            # f"bitrate={bitrate_kbps} "
-            # f"speed-preset=faster "
-            # f"tune=zerolatency "
-            # f"key-int-max={current_fps} "
-            # f"bframes=0 "
-            # f"byte-stream=false "
+            f"! x264enc "
+            f"bitrate={bitrate_kbps} "
+            f"speed-preset=faster "
+            f"tune=zerolatency "
+            f"key-int-max={current_fps} "
+            f"bframes=0 "
+            f"byte-stream=false "
             f"! h264parse config-interval=1 "
             f"! flvmux streamable=true "
             f"! rtmpsink location={self.url} sync=false async=false"
@@ -189,8 +191,7 @@ class CamStream:
         duration_min = read_record_config(self.ai_config_path)
         self._record_duration_limit = duration_min * 60.0
 
-        # 通过 AIConfig.yaml 路径得到视频保存目录 ../video/<CamStream.name>/ 
-        base_dir = Path(self.ai_config_path).resolve().parent.parent
+        base_dir = self.video_base_dir
         video_dir = base_dir / "video" / self.name
         video_dir.mkdir(parents=True, exist_ok=True)
         
@@ -205,30 +206,20 @@ class CamStream:
 
         # 构造 YYYYMMDD_HHMMSS 格式文件名
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-        file_path = video_dir / f"{timestamp_str}.mp4"
-
-        # 采用广泛兼容的 mp4v 编码器生成标准 MP4 容器 —— 无压缩且保存耗时 —— 放弃该方案
-        # fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        # self._record_writer = cv2.VideoWriter(
-        #     str(file_path),
-        #     fourcc,
-        #     float(current_fps),
-        #     (int(current_w), int(current_h)),
-        #     True
-        # )
+        file_path = video_dir / f"{timestamp_str}.mkv"
         
         bitrate = self._suggest_bitrate_kbps(current_w, current_h, current_fps) * 1000
         gst_pipeline = (
-            f"appsrc is-live=true block=false format=time do-timestamp=true" # 自动为每帧添加时间戳 确保Jetson编码器正常工作
+            f"appsrc is-live=true block=false format=time do-timestamp=true " # 自动为每帧添加时间戳 确保Jetson编码器正常工作
             f"! video/x-raw,format=BGR,width={current_w},height={current_h},framerate={current_fps}/1 "
             f"! videorate " # videorate 强制对齐帧率
             f"! video/x-raw,framerate={current_fps}/1 "
             f"! queue leaky=downstream max-size-buffers={current_fps} " # 缓冲 1 秒的数据
             # ---------- 下面是异步操作 GStreamer底层自动开辟线程完成 ----------- #
             f"! videoconvert ! video/x-raw,format=I420 "
-            f"! nvv4l2h264enc bitrate={bitrate} preset-level=1 insert-sps-pps=true " # 硬件压缩为H.264
+            f"! x264enc bitrate={int(bitrate/1000)} speed-preset=veryfast " # 替换为软件编码以解决无 nvv4l2h264enc 问题
             f"! h264parse "
-            f"! qtmux "
+            f"! matroskamux "
             f"! filesink location={file_path} sync=false async=false"
         )
         self._record_writer = cv2.VideoWriter(

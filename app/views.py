@@ -22,6 +22,7 @@ from app.utils import (
 
 AI_CONFIG_PATH = Path("/home/jetson/code/Cam_flaskvue/app/AIConfig.yaml")
 MODEL_FILE_PATH = Path("/home/jetson/code/Cam_flaskvue/inference/models")
+VIDEO_BASE_PATH = Path("/home/jetson/code")
 
 # =========================================================
 # 推流配置
@@ -37,7 +38,7 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 CAMERA_ID = 0
 ORI_WIDTH = 2592
 ORI_HEIGHT = 1944
-ORI_FPS = 60
+ORI_FPS = 30
 
 cam_manager = CamManager(
     camera_id=CAMERA_ID,
@@ -64,7 +65,8 @@ stream_high = CamStream(
         AI_INFER_TARGET
     ),
     ai_config_path=str(AI_CONFIG_PATH),
-    enable_record=True # 高分辨率流默认保存
+    enable_record=True, # 高分辨率流默认保存
+    video_base_dir=VIDEO_BASE_PATH
 )
 
 stream_low = CamStream(

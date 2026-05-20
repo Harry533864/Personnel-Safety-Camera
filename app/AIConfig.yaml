@@ -8,16 +8,16 @@ model:
   camera_id: cam_demo_001
   detect_enable: true
   infer_target: all
-  model_name: Asva_person_v0518
+  model_name: yolo11_person
   imgsz: 640
-  conf_thres: 0.1
+  conf_thres: 0.4
   iou_thres: 0.1
   enter_frames: 3
   exit_frames: 5
   class_name:
-    - person
+  - person
   person_class_ids:
-    - 0
+  - 0
   rois:
   - roi_id: hazard_1
     name: ROI1
@@ -34,7 +34,7 @@ model:
       - 0.3613
     - - 0.1214
       - 0.3613
-    overlap_thres: 0.1
+    overlap_thres: 0.6
     target: all
   - roi_id: hazard_2
     name: ROI2
@@ -51,7 +51,7 @@ model:
       - 0.6914
     - - 0.3975
       - 0.6914
-    overlap_thres: 0.1
+    overlap_thres: 0.6
     target: all
   - roi_id: hazard_3
     name: ROI3
@@ -68,7 +68,7 @@ model:
       - 0.7227
     - - 0.6797
       - 0.7227
-    overlap_thres: 0.1
+    overlap_thres: 0.6
     target: all
 test:
   hot_reload: true
@@ -83,8 +83,8 @@ model_names:
 - Asva_person_v0518
 exception_output:
   gpio:
-    - 32
+  - 32
   output_level: 1
   duration: 0
-record: # 录制视频时长
-  duration_min: 10
+record:
+  duration_min: 1
