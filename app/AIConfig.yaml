@@ -86,3 +86,5 @@ exception_output:
     - 32
   output_level: 1
   duration: 0
+record: # 录制视频时长
+  duration_min: 10

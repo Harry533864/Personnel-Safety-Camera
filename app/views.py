@@ -64,6 +64,7 @@ stream_high = CamStream(
         AI_INFER_TARGET
     ),
     ai_config_path=str(AI_CONFIG_PATH),
+    enable_record=True # 高分辨率流默认保存
 )
 
 stream_low = CamStream(
@@ -78,6 +79,7 @@ stream_low = CamStream(
         AI_INFER_TARGET
     ),
     ai_config_path=str(AI_CONFIG_PATH),
+    enable_record=False # 低分辨率流不默认保存
 )
 
 cam_manager.add_worker(stream_high)
@@ -798,3 +800,70 @@ def page_not_found(error):
     Custom 404 page.
     """
     return render_template("404.html"), 404
+
+
+# =========================================================
+# 本地视频录制配置接口
+# =========================================================
+
+@app.route("/api/record/config", methods=["POST", "GET"])
+def handle_record_config():
+    """
+    前端配置视频保存时间接口。
+    注意：每次修改时间后在下个视频开始才能生效 
+    因为CamStream每次只在开始录制新视频前读取AIConfig.yaml中的录制时间
+    
+    POST 请求示例：
+    {
+        "duration_min": 10
+    }
+    """
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        
+        if "duration_min" not in data:
+            return jsonify({
+                "status": "error",
+                "message": "缺少必要参数：duration_min"
+            }), 400
+            
+        try:
+            duration_min = float(data["duration_min"])
+            if duration_min <= 0:
+                raise ValueError("单个录制分段时长必须大于 0")
+                
+            # 读取并重写 YAML 文件
+            cfg = read_yaml(AI_CONFIG_PATH)
+            record_cfg = cfg.setdefault("record", {})
+            record_cfg["duration_min"] = duration_min
+            
+            write_yaml(cfg, file_path=AI_CONFIG_PATH)
+            
+            return jsonify({
+                "status": "success",
+                "message": f"单个视频保存时限成功更新为: {duration_min} 分钟",
+                "data": {
+                    "duration_min": duration_min
+                }
+            })
+            
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "message": f"更新录制配置失败: {str(e)}"
+            }), 400
+            
+    else:
+        # GET 请求：返回当前配置的时长
+        try:
+            cfg = read_yaml(AI_CONFIG_PATH)
+            duration_min = cfg.get("record", {}).get("duration_min", 10)
+            return jsonify({
+                "status": "success",
+                "duration_min": duration_min
+            })
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "message": f"读取录制配置失败: {str(e)}"
+            }), 500

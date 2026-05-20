@@ -142,3 +142,18 @@ def normalize_roi(roi, index):
         "target": roi.get("target", "all"),
     }
 
+def read_record_config(ai_config_path):
+    """
+    从 AIConfig.yaml 中读取视频单段保存时间（分钟）
+    默认返回 10.0 分钟
+    """
+    try:
+        cfg = read_yaml(ai_config_path)
+        record_cfg = cfg.get("record", {})
+        duration_min = float(record_cfg.get("duration_min", 10))
+        if duration_min <= 0:
+            duration_min = 10.0
+        return duration_min
+    except Exception:
+        print(f"[Record] 读取录制配置失败，使用默认值: 10 分钟")
+        return 10.0
