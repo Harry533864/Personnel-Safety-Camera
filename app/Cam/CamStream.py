@@ -102,6 +102,7 @@ class CamStream:
             current_h,
             current_fps,
         )
+        hw_bitrate = bitrate_kbps * 1000
 
         pipeline = (
             f"appsrc is-live=true block=false format=time do-timestamp=true "
@@ -109,13 +110,15 @@ class CamStream:
             f"! queue leaky=downstream max-size-buffers=2 "
             f"! videoconvert "
             f"! video/x-raw,format=I420 "
-            f"! x264enc "
-            f"bitrate={bitrate_kbps} "
-            f"speed-preset=faster "
-            f"tune=zerolatency "
-            f"key-int-max={current_fps} "
-            f"bframes=0 "
-            f"byte-stream=false "
+            # 使用 Jetson 硬件编码器
+            f"! nvv4l2h264enc bitrate={hw_bitrate} preset-level=1 insert-sps-pps=true maxperf-enable=1 "
+            # f"! x264enc "
+            # f"bitrate={bitrate_kbps} "
+            # f"speed-preset=faster "
+            # f"tune=zerolatency "
+            # f"key-int-max={current_fps} "
+            # f"bframes=0 "
+            # f"byte-stream=false "
             f"! h264parse config-interval=1 "
             f"! flvmux streamable=true "
             f"! rtmpsink location={self.url} sync=false async=false"
@@ -218,6 +221,8 @@ class CamStream:
         gst_pipeline = (
             f"appsrc is-live=true block=false format=time do-timestamp=true" # 自动为每帧添加时间戳 确保Jetson编码器正常工作
             f"! video/x-raw,format=BGR,width={current_w},height={current_h},framerate={current_fps}/1 "
+            f"! videorate " # videorate 强制对齐帧率
+            f"! video/x-raw,framerate={current_fps}/1 "
             f"! queue leaky=downstream max-size-buffers={current_fps} " # 缓冲 1 秒的数据
             # ---------- 下面是异步操作 GStreamer底层自动开辟线程完成 ----------- #
             f"! videoconvert ! video/x-raw,format=I420 "
