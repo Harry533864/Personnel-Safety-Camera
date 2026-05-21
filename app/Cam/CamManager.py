@@ -1,6 +1,7 @@
 import cv2
 import time
 import threading
+import subprocess
 
 class CamManager:
     """
@@ -32,18 +33,44 @@ class CamManager:
         self._exposure_changed = True
         print(f"[CamManager] 硬件曝光模式请求修改为: {'自动' if value == 0 else '手动(' + str(value) + ')'}")
     
-    def _apply_exposure(self, cap): #todo 待实现
-        """
-        通过 v4l2-ctl 直接向内核驱动发送 ioctl 指令以控制硬件曝光。
-        需要系统已安装 v4l-utils (sudo apt-get install v4l-utils)。
-        """
-        pass 
-        # if self._exposure_val == 0:
-        #     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3) # V4L2 自动曝光
-        # else:
-        #     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1) # V4L2 手动曝光
-        #     cap.set(cv2.CAP_PROP_EXPOSURE, self._exposure_val)
-        
+    def _apply_exposure(self):
+        # 解析标准设备节点路径
+        dev_path = self.camera_id
+        if isinstance(dev_path, int) or (isinstance(dev_path, str) and dev_path.isdigit()):
+            dev_path = f"/dev/video{dev_path}"
+
+        try:
+            if self._exposure_val == 0:
+                # 恢复自动曝光
+                subprocess.run(
+                    ["v4l2-ctl", "-d", dev_path, "-c", "auto_exposure=3"],
+                    check=True, 
+                    capture_output=True, text=True
+                )
+                print(f"[CamManager] 已恢复 {dev_path} 自动曝光模式")
+            else:
+                # 1. 强制转换为整数，剔除浮点数带来的非法传参风险
+                exposure_int = int(float(self._exposure_val))
+                
+                # 2. 将模式切换和数值修改合并为一条指令
+                # 让 v4l2-ctl 在一次 ioctl 事务中处理，避免硬件响应时差带来的 inactive 锁冲突
+                command = f"auto_exposure=1,exposure_time_absolute={exposure_int}"
+                
+                subprocess.run(
+                    ["v4l2-ctl", "-d", dev_path, "-c", command],
+                    check=True, 
+                    capture_output=True, text=True
+                )
+                print(f"[CamManager] 已设置 {dev_path} 手动曝光: {exposure_int}")
+
+        except FileNotFoundError:
+            print("[CamManager] 致命异常: 未找到 v4l2-ctl 指令。")
+        except subprocess.CalledProcessError as e:
+            # 捕获并打印底层真实的报错原因，而不是只报错误码 1
+            err_msg = e.stderr.strip()
+            print(f"[CamManager] 硬件曝光设置失败。错误码: {e.returncode}")
+            print(f"[CamManager] 驱动底层反馈: {err_msg}")
+         
     
     def start(self):
         if self._is_running: return
