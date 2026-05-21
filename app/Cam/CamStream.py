@@ -49,7 +49,7 @@ class CamStream:
         self.height = int(height)
         self.fps = max(1, int(fps))
 
-        self.frame_queue = queue.Queue(maxsize=2)
+        self.frame_queue = queue.Queue(maxsize=10)
         self._is_running = False
         self._thread = None
 
@@ -71,6 +71,9 @@ class CamStream:
 
         self.video_base_dir = video_base_dir if video_base_dir else Path(__file__).parent.parent.parent.resolve()
 
+        self._record_frame_count = 0 # 视频保存帧数统计
+        self._write_frame_count = 0 # 推流写入帧数统计
+        self._put_frame_count = 0 # CamManager写入帧数统计
     # =========================================================
     # GStreamer 推流相关
     # =========================================================
@@ -173,9 +176,14 @@ class CamStream:
         if self._record_writer is not None:
             try:
                 self._record_writer.release() # 视频结束时必须调用 release() 进行 “收尾”
+                print(f"[{self.name}] 结束录制分段")
             except Exception as e:
                 print(f"[{self.name}] 释放本地录制 writer 失败: {e}")
             self._record_writer = None
+            
+            self._record_frame_count = 0
+            self._write_frame_count = 0
+            self._put_frame_count = 0
             
     def _open_record_writer(self, current_w, current_h, current_fps):
         """
@@ -331,6 +339,7 @@ class CamStream:
                 self.frame_queue.get_nowait()
 
             self.frame_queue.put_nowait(frame)
+            self._put_frame_count += 1
 
         except queue.Empty:
             pass
@@ -574,6 +583,7 @@ class CamStream:
                     continue
 
                 writer.write(frame)
+                self._write_frame_count += 1
 
             except Exception as e:
                 print(f"[{self.name}] 写入 GStreamer 异常: {e}")
@@ -592,6 +602,7 @@ class CamStream:
                     continue
                 try:
                     self._record_writer.write(frame) # 通过GStreamer pipeline进行异步写入
+                    self._record_frame_count += 1
                 except Exception as e:
                     print(f"[{self.name}] 写入本地视频文件异常: {e}")
                     # 发生异常时，除了请求重启，必须主动释放损坏的句柄并触发冷却
