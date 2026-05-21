@@ -176,7 +176,7 @@ class CamStream:
         if self._record_writer is not None:
             try:
                 self._record_writer.release() # 视频结束时必须调用 release() 进行 “收尾”
-                print(f"[{self.name}] 结束录制分段")
+                print(f"[{self.name}] 结束录制分段 CamManager推送帧数{self._record_frame_count}\n")
             except Exception as e:
                 print(f"[{self.name}] 释放本地录制 writer 失败: {e}")
             self._record_writer = None
@@ -533,13 +533,13 @@ class CamStream:
                 # 1. 前端修改了 fps 或 分辨率
                 # 2. CamStream类首次初始化
                 # 3. 当前分段到期
-                    if need_rec_restart or self._record_writer is None or time_expired:
-                        try:
-                            self._open_record_writer(current_w, current_h, current_fps)
-                        except Exception as e:
-                            print(f"[{self.name}] 维护本地录制写入器异常: {e}")
-                            self._close_record_writer()
-                            self._record_cooldown_until = time.time() + 60.0
+                if need_rec_restart or self._record_writer is None or time_expired:
+                    try:
+                        self._open_record_writer(current_w, current_h, current_fps)
+                    except Exception as e:
+                        print(f"[{self.name}] 维护本地录制写入器异常: {e}")
+                        self._close_record_writer()
+                        self._record_cooldown_until = time.time() + 60.0
 
             # 3. FPS 控制
             now = time.time()

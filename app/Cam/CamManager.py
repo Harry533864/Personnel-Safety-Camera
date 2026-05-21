@@ -1,7 +1,6 @@
 import cv2
 import time
-import threading
-import subprocess
+import threading, subprocess
 
 class CamManager:
     """
@@ -70,7 +69,6 @@ class CamManager:
             err_msg = e.stderr.strip()
             print(f"[CamManager] 硬件曝光设置失败。错误码: {e.returncode}")
             print(f"[CamManager] 驱动底层反馈: {err_msg}")
-         
     
     def start(self):
         if self._is_running: return
@@ -90,22 +88,22 @@ class CamManager:
         print("[Manager] 摄像头采集已停止。")
     
     def _capture_task(self):
-        # 自动兼容整数 0 或 字符串 "/dev/video0"
         dev_path = self.camera_id
         if isinstance(dev_path, int) or (isinstance(dev_path, str) and dev_path.isdigit()):
             dev_path = f"/dev/video{dev_path}"
         
-        gst_pipeline = (
+        gst_pipeline_fallback = (
             f"v4l2src device={dev_path} ! "
             f"image/jpeg, width={self.width}, height={self.height} ! "
-            f"jpegdec ! "  # 利用通用的 jpegdec 独立线程进行高速软解
+            f"jpegdec ! "  
             f"videoconvert ! "
             f"video/x-raw, format=BGR ! "
             f"appsink drop=true max-buffers=1 sync=false"
         )
-        cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+        cap = cv2.VideoCapture(gst_pipeline_fallback, cv2.CAP_GSTREAMER)
+            
         if not cap.isOpened():
-            raise RuntimeError(f"GStreamer 无法打开摄像头")
+            raise RuntimeError(f"摄像头抓帧启动失败")
         
         while self._is_running:
             if self._exposure_changed:
