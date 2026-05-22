@@ -69,20 +69,20 @@ stream_high = CamStream(
     video_base_dir=VIDEO_BASE_PATH
 )
 
-# stream_low = CamStream(
-#     name="cam_low",
-#     url=URL_LOW,
-#     width=640,
-#     height=480,
-#     fps=15,
-#     enable_infer=should_enable_stream_ai(
-#         "cam_low",
-#         AI_INFER_ENABLE,
-#         AI_INFER_TARGET
-#     ),
-#     ai_config_path=str(AI_CONFIG_PATH),
-#     enable_record=False # 低分辨率流不默认保存
-# )
+stream_low = CamStream(
+    name="cam_low",
+    url=URL_LOW,
+    width=640,
+    height=480,
+    fps=15,
+    enable_infer=should_enable_stream_ai(
+        "cam_low",
+        AI_INFER_ENABLE,
+        AI_INFER_TARGET
+    ),
+    ai_config_path=str(AI_CONFIG_PATH),
+    enable_record=False # 低分辨率流不默认保存
+)
 
 cam_manager.add_worker(stream_high)
 # cam_manager.add_worker(stream_low)
@@ -875,3 +875,79 @@ def handle_record_config():
                 "status": "error",
                 "message": f"读取录制配置失败: {str(e)}"
             }), 500
+
+
+# =========================================================
+# 视频回放与下载接口
+# =========================================================
+
+@app.route("/api/record/list", methods=["GET"])
+def get_record_list():
+    """
+    根据日期获取视频列表
+    GET 示例: /api/record/list?date=2026-05-22&target=cam_high
+    """
+    target = request.args.get("target", "cam_high")
+    date_str = request.args.get("date", "")
+    
+    # 支持 2026-05-22 或 20260522 格式，统一去除横杠作为搜索前缀
+    date_prefix = date_str.replace("-", "") if date_str else ""
+    
+    video_dir = VIDEO_BASE_PATH / "video" / target
+    if not video_dir.exists():
+        return jsonify({"status": "success", "data": []})
+        
+    files_info = []
+    # 根据是否提供日期，筛选对应的文件
+    search_pattern = f"{date_prefix}*.mkv" if date_prefix else "*.mkv"
+    
+    for file_path in video_dir.glob(search_pattern):
+        if not file_path.is_file():
+            continue
+            
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        files_info.append({
+            "filename": file_path.name,
+            "size_mb": round(size_mb, 2),
+            "created_at": file_path.stat().st_mtime
+        })
+        
+    # 按时间倒序排序（最新的排最前面）
+    files_info.sort(key=lambda x: x["filename"], reverse=True)
+    
+    return jsonify({
+        "status": "success", 
+        "data": files_info,
+        "target": target,
+        "date_filter": date_str
+    })
+
+
+@app.route("/api/record/download", methods=["GET"])
+def download_record():
+    """
+    下载具体的视频文件
+    GET 示例: /api/record/download?filename=20260522_143000.mkv&target=cam_high
+    """
+    target = request.args.get("target", "cam_high")
+    filename = request.args.get("filename")
+    
+    if not filename:
+        return jsonify({"status": "error", "message": "缺少 filename 参数"}), 400
+        
+    # 安全校验，防止目录遍历攻击 (Path Traversal)
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return jsonify({"status": "error", "message": "非法的文件名"}), 400
+        
+    video_dir = VIDEO_BASE_PATH / "video" / target
+    file_path = video_dir / filename
+    
+    if not file_path.exists():
+        return jsonify({"status": "error", "message": "视频文件不存在"}), 404
+        
+    try:
+        from flask import send_file
+        # as_attachment=True 会触发浏览器默认的下载行为
+        return send_file(str(file_path), as_attachment=True)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"文件下载失败: {str(e)}"}), 500
