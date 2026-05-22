@@ -176,7 +176,9 @@ class CamStream:
         if self._record_writer is not None:
             try:
                 self._record_writer.release() # 视频结束时必须调用 release() 进行 “收尾”
-                print(f"[{self.name}] 结束录制分段 CamManager推送帧数{self._record_frame_count}\n")
+                print(f"[{self.name}] 结束录制分段 录制帧数{self._record_frame_count}\n")
+                print(f"[{self.name}] 结束录制分段 视频流推送帧数{self._write_frame_count}\n")
+                print(f"[{self.name}] 结束录制分段 CamManager视频流写入帧数{self._put_frame_count}\n")
             except Exception as e:
                 print(f"[{self.name}] 释放本地录制 writer 失败: {e}")
             self._record_writer = None
@@ -541,11 +543,12 @@ class CamStream:
                         self._close_record_writer()
                         self._record_cooldown_until = time.time() + 60.0
 
-            # 3. FPS 控制
+            # 3. FPS 控制（增加抖动宽容度，防止误杀硬件采集的正常帧）
             now = time.time()
             frame_duration = 1.0 / current_fps
 
-            if now < next_time:
+            # 允许提前最多 25% 的单帧时间拿到数据，应对线程调度抖动
+            if now < (next_time - frame_duration * 0.25):
                 continue
 
             if now > next_time + frame_duration * 2:

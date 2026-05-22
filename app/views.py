@@ -36,9 +36,9 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 # =========================================================
 
 CAMERA_ID = 0
-ORI_WIDTH = 2592
-ORI_HEIGHT = 1944
-ORI_FPS = 30
+ORI_WIDTH = 1280
+ORI_HEIGHT = 720
+ORI_FPS = 60
 
 cam_manager = CamManager(
     camera_id=CAMERA_ID,
@@ -69,23 +69,23 @@ stream_high = CamStream(
     video_base_dir=VIDEO_BASE_PATH
 )
 
-stream_low = CamStream(
-    name="cam_low",
-    url=URL_LOW,
-    width=640,
-    height=480,
-    fps=15,
-    enable_infer=should_enable_stream_ai(
-        "cam_low",
-        AI_INFER_ENABLE,
-        AI_INFER_TARGET
-    ),
-    ai_config_path=str(AI_CONFIG_PATH),
-    enable_record=False # 低分辨率流不默认保存
-)
+# stream_low = CamStream(
+#     name="cam_low",
+#     url=URL_LOW,
+#     width=640,
+#     height=480,
+#     fps=15,
+#     enable_infer=should_enable_stream_ai(
+#         "cam_low",
+#         AI_INFER_ENABLE,
+#         AI_INFER_TARGET
+#     ),
+#     ai_config_path=str(AI_CONFIG_PATH),
+#     enable_record=False # 低分辨率流不默认保存
+# )
 
 cam_manager.add_worker(stream_high)
-cam_manager.add_worker(stream_low)
+# cam_manager.add_worker(stream_low)
 
 # 全局启动推流
 cam_manager.start()
@@ -276,6 +276,9 @@ def set_resolution():
         height = int(data["height"])
         target = data.get("target", "high")
 
+        # 让硬件管理器修改参数并重启硬件取流
+        cam_manager.set_resolution(width, height)
+
         for stream in get_target_streams(target):
             stream.set_resolution(width, height)
 
@@ -304,6 +307,9 @@ def set_fps():
     try:
         fps = int(data["value"])
         target = data.get("target", "high")
+
+        # 让硬件管理器修改参数并重启硬件取流
+        cam_manager.set_fps(fps)
 
         for stream in get_target_streams(target):
             stream.set_fps(fps)

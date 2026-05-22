@@ -45,7 +45,6 @@
           <div class="form-control-wrapper">
             <select v-model="settings.fps" class="form-select">
               <option value="60">60</option>
-              <option value="45">45</option>
               <option value="30">30</option>
               <option value="15">15</option>
             </select>

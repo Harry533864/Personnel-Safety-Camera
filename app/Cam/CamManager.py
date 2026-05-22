@@ -20,9 +20,21 @@ class CamManager:
         
         self._exposure_val = 0  
         self._exposure_changed = False
+        self._need_reopen = False
 
     def add_worker(self, worker):
         self.workers.append(worker)
+        
+    def set_resolution(self, width, height):
+        self.width = int(width)
+        self.height = int(height)
+        self._need_reopen = True
+        print(f"[CamManager] 硬件分辨率请求修改为: {width}x{height}")
+
+    def set_fps(self, fps):
+        self.fps = int(fps)
+        self._need_reopen = True
+        print(f"[CamManager] 硬件帧率请求修改为: {fps}")
         
     def set_exposure(self, value=0):
         if value < 0:
@@ -46,7 +58,12 @@ class CamManager:
                     check=True, 
                     capture_output=True, text=True
                 )
-                print(f"[CamManager] 已恢复 {dev_path} 自动曝光模式")
+                # 如果 50Hz 依然闪烁，你可以修改为 2 (即 60Hz)，或者是 0 (关闭抗闪烁交由相机ISP自行处理)
+                subprocess.run(
+                    ["v4l2-ctl", "-d", dev_path, "-c", "power_line_frequency=1"],
+                    capture_output=True, text=True
+                )
+                print(f"[CamManager] 已恢复 {dev_path} 自动曝光模式，尝试应用 60Hz 抗闪烁配置")
             else:
                 # 1. 强制转换为整数，剔除浮点数带来的非法传参风险
                 exposure_int = int(float(self._exposure_val))
@@ -87,25 +104,38 @@ class CamManager:
             w.stop()
         print("[Manager] 摄像头采集已停止。")
     
-    def _capture_task(self):
+    def _build_pipeline(self):
         dev_path = self.camera_id
         if isinstance(dev_path, int) or (isinstance(dev_path, str) and dev_path.isdigit()):
             dev_path = f"/dev/video{dev_path}"
         
-        gst_pipeline_fallback = (
+        return (
             f"v4l2src device={dev_path} ! "
-            f"image/jpeg, width={self.width}, height={self.height} ! "
+            f"image/jpeg, width={self.width}, height={self.height}, framerate={self.fps}/1 ! "
             f"jpegdec ! "  
             f"videoconvert ! "
             f"video/x-raw, format=BGR ! "
             f"appsink drop=true max-buffers=1 sync=false"
         )
-        cap = cv2.VideoCapture(gst_pipeline_fallback, cv2.CAP_GSTREAMER)
+
+    def _capture_task(self):
+        cap = cv2.VideoCapture(self._build_pipeline(), cv2.CAP_GSTREAMER)
             
         if not cap.isOpened():
             raise RuntimeError(f"摄像头抓帧启动失败")
         
         while self._is_running:
+            if self._need_reopen:
+                print(f"[CamManager] 正在以 {self.width}x{self.height}@{self.fps}FPS 重启硬件采集流...")
+                cap.release()
+                cap = cv2.VideoCapture(self._build_pipeline(), cv2.CAP_GSTREAMER)
+                self._need_reopen = False
+                self._exposure_changed = True  # 重启后重新应用曝光设置
+                if not cap.isOpened():
+                    print("[Manager] 重启摄像头流失败！将重试...")
+                    time.sleep(1)
+                    continue
+
             if self._exposure_changed:
                 self._apply_exposure()
                 self._exposure_changed = False
