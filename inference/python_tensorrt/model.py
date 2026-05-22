@@ -50,6 +50,7 @@ class Model:
         self.alarm_end_time: float | None = None
         self.alarm_led_on = False
         self.last_alarm_flag = False
+        self.last_detection_flag = False
 
         self._load_config_and_prepare_runtime()
         self._init_alarm_gpio()
@@ -65,6 +66,7 @@ class Model:
             if self.infer_runtime is None:
                 raise RuntimeError("Python TensorRT 推理器未启动")
             infer_result = self.infer_runtime.infer(frame)
+            self.last_detection_flag = bool(infer_result.detections)
             self.last_alarm_flag = bool(infer_result.alarm)
             self._handle_alarm_gpio(self.last_alarm_flag)
             return infer_result.image

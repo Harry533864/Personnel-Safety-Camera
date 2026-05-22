@@ -1,22 +1,37 @@
 <template>
   <div class="monitor-page">
-    <!-- Camera Operation Bar -->
     <div class="operation-bar">
       <div class="operation-bar-left">
-        <button 
+        <div class="page-title-group">
+          <h2 class="page-title">相机页面</h2>
+        </div>
+      </div>
+
+      <div class="operation-bar-right">
+        <div class="operation-actions">
+          <button 
           class="operation-btn" 
           :class="{ active: cameraState.active, inactive: cameraState.inactive, unset: cameraState.unset }"
           @click="goToCameraSettings"
           title="相机设置"
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+            <path d="M3 6h4l2-3h6l2 3h3a2 2 0 0 1 2 2v5"></path>
+            <path d="M1 8v11a2 2 0 0 0 2 2h11"></path>
             <circle cx="12" cy="13" r="4"></circle>
+            <circle cx="18.9" cy="18.9" r="1.55"></circle>
+            <path d="M18.9 16.1v.95"></path>
+            <path d="M18.9 20.75v.95"></path>
+            <path d="M16.1 18.9h.95"></path>
+            <path d="M20.75 18.9h.95"></path>
+            <path d="M16.92 16.92l.67.67"></path>
+            <path d="M20.22 20.22l.67.67"></path>
+            <path d="M20.89 16.92l-.67.67"></path>
+            <path d="M16.92 20.89l.67-.67"></path>
           </svg>
-          <span class="btn-label">相机设置</span>
         </button>
 
-        <button 
+          <button 
           class="operation-btn" 
           :class="{ active: detectionState.active, inactive: detectionState.inactive, unset: detectionState.unset }"
           @click="goToDetectionSettings"
@@ -28,10 +43,9 @@
             <rect x="14" y="14" width="7" height="7"></rect>
             <rect x="3" y="14" width="7" height="7"></rect>
           </svg>
-          <span class="btn-label">检测设置</span>
         </button>
 
-        <button
+          <button
           class="operation-btn"
           :class="{ active: detectionRegionState.active, inactive: detectionRegionState.inactive, unset: detectionRegionState.unset }"
           @click="goToDetectionRegion"
@@ -49,10 +63,9 @@
             <path d="M12 8v8"></path>
             <path d="M8 12h8"></path>
           </svg>
-          <span class="btn-label">检测区域</span>
         </button>
 
-        <button
+          <button
           class="operation-btn"
           :class="{ active: modelManagementState.active, inactive: modelManagementState.inactive, unset: modelManagementState.unset }"
           @click="goToModelManagement"
@@ -63,10 +76,9 @@
             <path d="M7 9l5-5 5 5"></path>
             <path d="M4 20h16"></path>
           </svg>
-          <span class="btn-label">模型管理</span>
         </button>
 
-        <button
+          <button
           class="operation-btn"
           :class="{ active: exceptionOutputState.active, inactive: exceptionOutputState.inactive, unset: exceptionOutputState.unset }"
           @click="goToExceptionOutput"
@@ -77,11 +89,10 @@
             <path d="M12 9v4"></path>
             <path d="M12 17h.01"></path>
           </svg>
-          <span class="btn-label">异常检测配置</span>
         </button>
-      </div>
 
-      <div class="operation-bar-right">
+        </div>
+
         <div class="status-indicator" :class="networkStatus">
           <span class="status-dot"></span>
           <span class="status-text">{{ networkSpeed }} MB/s</span>
@@ -473,27 +484,49 @@ onUnmounted(() => {
 
 .operation-bar-left {
   display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
 }
 
 .operation-bar-right {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.page-title-group {
+  display: flex;
+  align-items: center;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e6edf3;
+}
+
+.operation-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .operation-btn {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
+  justify-content: center;
+  width: 40px;
+  height: 36px;
+  padding: 0;
   background: #21262d;
   border: 1px solid #30363d;
   border-radius: 6px;
   color: #8b949e;
-  font-size: 0.85rem;
   cursor: pointer;
   transition: all 0.2s;
-  white-space: nowrap;
 }
 
 .operation-btn:hover {
@@ -518,10 +551,6 @@ onUnmounted(() => {
   background: #525151ef;
   color: #ffffff;
   border-color: #525151ef;
-}
-
-.btn-label {
-  display: inline;
 }
 
 .status-indicator {
@@ -643,15 +672,12 @@ onUnmounted(() => {
   .operation-bar {
     padding: 6px 10px;
   }
-  
-  .btn-label {
-    display: none;
-  }
-  
+
   .operation-btn {
-    padding: 6px;
+    width: 36px;
+    height: 34px;
   }
-  
+
   .video-info-bar {
     padding: 4px 10px;
     gap: 10px;
@@ -662,9 +688,13 @@ onUnmounted(() => {
   .status-text {
     display: none;
   }
-  
+
+  .operation-bar {
+    gap: 10px;
+  }
+
   .operation-bar-right {
-    display: none;
+    gap: 8px;
   }
 }
 </style>

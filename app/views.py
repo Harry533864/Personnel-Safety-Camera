@@ -1,8 +1,10 @@
+import json
+from datetime import datetime
 from pathlib import Path
 import shutil
 
 from app import app
-from flask import request, jsonify, render_template
+from flask import request, jsonify, render_template, send_file, url_for
 
 from app.Cam.CamStream import CamStream
 from app.Cam.CamManager import CamManager
@@ -36,9 +38,9 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 # =========================================================
 
 CAMERA_ID = 0
-ORI_WIDTH = 1280
-ORI_HEIGHT = 720
-ORI_FPS = 60
+ORI_WIDTH = 2592
+ORI_HEIGHT = 1944
+ORI_FPS = 30
 
 cam_manager = CamManager(
     camera_id=CAMERA_ID,
@@ -85,7 +87,7 @@ stream_low = CamStream(
 )
 
 cam_manager.add_worker(stream_high)
-# cam_manager.add_worker(stream_low)
+cam_manager.add_worker(stream_low)
 
 # 全局启动推流
 cam_manager.start()
@@ -276,9 +278,6 @@ def set_resolution():
         height = int(data["height"])
         target = data.get("target", "high")
 
-        # 让硬件管理器修改参数并重启硬件取流
-        cam_manager.set_resolution(width, height)
-
         for stream in get_target_streams(target):
             stream.set_resolution(width, height)
 
@@ -307,9 +306,6 @@ def set_fps():
     try:
         fps = int(data["value"])
         target = data.get("target", "high")
-
-        # 让硬件管理器修改参数并重启硬件取流
-        cam_manager.set_fps(fps)
 
         for stream in get_target_streams(target):
             stream.set_fps(fps)
@@ -881,73 +877,187 @@ def handle_record_config():
 # 视频回放与下载接口
 # =========================================================
 
+VALID_RECORD_TARGETS = {"cam_high", "cam_low"}
+
+
+def _get_record_target_dir(target):
+    target = str(target or "cam_high")
+    if target not in VALID_RECORD_TARGETS:
+        raise ValueError("target 必须是 cam_high 或 cam_low")
+    return target, VIDEO_BASE_PATH / "video" / target
+
+
+def _parse_record_timestamp(filename):
+    stem = Path(filename).stem
+    try:
+        return datetime.strptime(stem, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def _build_record_item(file_path, target):
+    stat = file_path.stat()
+    start_at = _parse_record_timestamp(file_path.name)
+    metadata_path = file_path.with_suffix(".json")
+    metadata = {}
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            metadata = {}
+
+    return {
+        "filename": file_path.name,
+        "title": file_path.stem,
+        "size_mb": round(stat.st_size / (1024 * 1024), 2),
+        "created_at": stat.st_mtime,
+        "target": target,
+        "date_key": start_at.strftime("%Y-%m-%d") if start_at else "",
+        "start_at": metadata.get("start_at") or (start_at.isoformat() if start_at else None),
+        "duration_sec": metadata.get("duration_sec"),
+        "has_target": metadata.get("has_target"),
+        "download_url": url_for(
+            "download_record",
+            filename=file_path.name,
+            target=target,
+            download=1,
+            _external=False,
+        ),
+        "play_url": url_for(
+            "download_record",
+            filename=file_path.name,
+            target=target,
+            download=0,
+            _external=False,
+        ),
+    }
+
+
 @app.route("/api/record/list", methods=["GET"])
 def get_record_list():
     """
     根据日期获取视频列表
     GET 示例: /api/record/list?date=2026-05-22&target=cam_high
     """
-    target = request.args.get("target", "cam_high")
-    date_str = request.args.get("date", "")
-    
-    # 支持 2026-05-22 或 20260522 格式，统一去除横杠作为搜索前缀
-    date_prefix = date_str.replace("-", "") if date_str else ""
-    
-    video_dir = VIDEO_BASE_PATH / "video" / target
+    try:
+        target, video_dir = _get_record_target_dir(request.args.get("target", "cam_high"))
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    date_str = (request.args.get("date") or "").strip()
+    date_prefix = date_str.replace("-", "")
+    if date_prefix and (len(date_prefix) != 8 or not date_prefix.isdigit()):
+        return jsonify({"status": "error", "message": "date 必须是 YYYY-MM-DD 或 YYYYMMDD"}), 400
+
     if not video_dir.exists():
-        return jsonify({"status": "success", "data": []})
-        
-    files_info = []
-    # 根据是否提供日期，筛选对应的文件
+        return jsonify({"status": "success", "data": [], "target": target, "date_filter": date_str})
+
     search_pattern = f"{date_prefix}*.mkv" if date_prefix else "*.mkv"
-    
-    for file_path in video_dir.glob(search_pattern):
-        if not file_path.is_file():
-            continue
-            
-        size_mb = file_path.stat().st_size / (1024 * 1024)
-        files_info.append({
-            "filename": file_path.name,
-            "size_mb": round(size_mb, 2),
-            "created_at": file_path.stat().st_mtime
-        })
-        
-    # 按时间倒序排序（最新的排最前面）
-    files_info.sort(key=lambda x: x["filename"], reverse=True)
-    
+    files_info = [
+        _build_record_item(file_path, target)
+        for file_path in video_dir.glob(search_pattern)
+        if file_path.is_file()
+    ]
+    files_info.sort(key=lambda item: item["filename"], reverse=True)
+
     return jsonify({
-        "status": "success", 
+        "status": "success",
         "data": files_info,
         "target": target,
-        "date_filter": date_str
+        "date_filter": date_str,
     })
 
 
 @app.route("/api/record/download", methods=["GET"])
 def download_record():
     """
-    下载具体的视频文件
-    GET 示例: /api/record/download?filename=20260522_143000.mkv&target=cam_high
+    获取具体的视频文件。
+    GET 示例:
+      下载: /api/record/download?filename=20260522_143000.mkv&target=cam_high
+      播放: /api/record/download?filename=20260522_143000.mkv&target=cam_high&download=0
     """
-    target = request.args.get("target", "cam_high")
-    filename = request.args.get("filename")
-    
+    try:
+        target, video_dir = _get_record_target_dir(request.args.get("target", "cam_high"))
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    filename = (request.args.get("filename") or "").strip()
     if not filename:
         return jsonify({"status": "error", "message": "缺少 filename 参数"}), 400
-        
-    # 安全校验，防止目录遍历攻击 (Path Traversal)
+
     if "/" in filename or "\\" in filename or ".." in filename:
         return jsonify({"status": "error", "message": "非法的文件名"}), 400
-        
-    video_dir = VIDEO_BASE_PATH / "video" / target
+
     file_path = video_dir / filename
-    
-    if not file_path.exists():
+    if not file_path.exists() or not file_path.is_file():
         return jsonify({"status": "error", "message": "视频文件不存在"}), 404
-        
+
     try:
-        from flask import send_file
-        # as_attachment=True 会触发浏览器默认的下载行为
-        return send_file(str(file_path), as_attachment=True)
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"文件下载失败: {str(e)}"}), 500
+        download_flag = str(request.args.get("download", "1")).lower()
+        as_attachment = download_flag not in {"0", "false", "no"}
+        return send_file(
+            str(file_path),
+            as_attachment=as_attachment,
+            download_name=filename,
+            mimetype="video/x-matroska",
+            conditional=True,
+        )
+    except Exception as error:
+        return jsonify({"status": "error", "message": f"文件获取失败: {str(error)}"}), 500
+
+
+@app.route("/api/record/delete", methods=["POST"])
+def delete_record():
+    """
+    删除后端磁盘中的真实视频文件
+    POST 示例:
+    {
+        "target": "cam_high",
+        "filenames": ["20260522_143000.mkv"]
+    }
+    """
+    data = request.get_json(silent=True) or {}
+
+    try:
+        target, video_dir = _get_record_target_dir(data.get("target", "cam_high"))
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    filenames = data.get("filenames")
+    if not isinstance(filenames, list) or not filenames:
+        return jsonify({"status": "error", "message": "filenames 必须是非空数组"}), 400
+
+    deleted = []
+    not_found = []
+
+    for filename in filenames:
+        filename = str(filename or "").strip()
+        if not filename:
+            continue
+        if "/" in filename or "\\" in filename or ".." in filename:
+            return jsonify({"status": "error", "message": f"非法的文件名: {filename}"}), 400
+
+        file_path = video_dir / filename
+        metadata_path = file_path.with_suffix(".json")
+
+        if not file_path.exists() or not file_path.is_file():
+            not_found.append(filename)
+            continue
+
+        try:
+            file_path.unlink()
+            if metadata_path.exists() and metadata_path.is_file():
+                metadata_path.unlink()
+            deleted.append(filename)
+        except Exception as error:
+            return jsonify({
+                "status": "error",
+                "message": f"删除文件失败: {filename}, {str(error)}",
+            }), 500
+
+    return jsonify({
+        "status": "success",
+        "target": target,
+        "deleted": deleted,
+        "not_found": not_found,
+    })
