@@ -38,8 +38,8 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 # =========================================================
 
 CAMERA_ID = 0
-ORI_WIDTH = 2592
-ORI_HEIGHT = 1944
+ORI_WIDTH = 1280
+ORI_HEIGHT = 720
 ORI_FPS = 30
 
 cam_manager = CamManager(
@@ -87,7 +87,7 @@ stream_low = CamStream(
 )
 
 cam_manager.add_worker(stream_high)
-cam_manager.add_worker(stream_low)
+# cam_manager.add_worker(stream_low)
 
 # 全局启动推流
 cam_manager.start()
@@ -278,6 +278,9 @@ def set_resolution():
         height = int(data["height"])
         target = data.get("target", "high")
 
+        # 让硬件管理器修改参数并重启硬件取流
+        cam_manager.set_resolution(width, height)
+
         for stream in get_target_streams(target):
             stream.set_resolution(width, height)
 
@@ -306,6 +309,9 @@ def set_fps():
     try:
         fps = int(data["value"])
         target = data.get("target", "high")
+
+        # 让硬件管理器修改参数并重启硬件取流
+        cam_manager.set_fps(fps)
 
         for stream in get_target_streams(target):
             stream.set_fps(fps)

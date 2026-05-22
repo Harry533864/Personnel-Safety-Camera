@@ -50,7 +50,7 @@ class CamStream:
         self.height = int(height)
         self.fps = max(1, int(fps))
 
-        self.frame_queue = queue.Queue(maxsize=2)
+        self.frame_queue = queue.Queue(maxsize=10)
         self._is_running = False
         self._thread = None
 
@@ -73,6 +73,10 @@ class CamStream:
         self._record_has_target = False
 
         self.video_base_dir = video_base_dir if video_base_dir else Path(__file__).parent.parent.parent.resolve()
+
+        self._record_frame_count = 0 # 视频保存帧数统计
+        self._write_frame_count = 0 # 推流写入帧数统计
+        self._put_frame_count = 0 # CamManager写入帧数统计
 
     # =========================================================
     # GStreamer 推流相关
@@ -176,9 +180,17 @@ class CamStream:
         if self._record_writer is not None:
             try:
                 self._record_writer.release() # 视频结束时必须调用 release() 进行 “收尾”
+                print(f"[{self.name}] 结束录制分段 录制帧数{self._record_frame_count}\n")
+                print(f"[{self.name}] 结束录制分段 视频流推送帧数{self._write_frame_count}\n")
+                print(f"[{self.name}] 结束录制分段 CamManager视频流写入帧数{self._put_frame_count}\n")
             except Exception as e:
                 print(f"[{self.name}] 释放本地录制 writer 失败: {e}")
             self._record_writer = None
+
+            self._record_frame_count = 0
+            self._write_frame_count = 0
+            self._put_frame_count = 0
+
         self._write_record_metadata()
         self._record_file_path = None
         self._record_has_target = False
@@ -360,6 +372,7 @@ class CamStream:
                 self.frame_queue.get_nowait()
 
             self.frame_queue.put_nowait(frame)
+            self._put_frame_count += 1
 
         except queue.Empty:
             pass
@@ -555,19 +568,20 @@ class CamStream:
                 # 1. 前端修改了 fps 或 分辨率
                 # 2. CamStream类首次初始化
                 # 3. 当前分段到期
-                    if need_rec_restart or self._record_writer is None or time_expired:
-                        try:
-                            self._open_record_writer(current_w, current_h, current_fps)
-                        except Exception as e:
-                            print(f"[{self.name}] 维护本地录制写入器异常: {e}")
-                            self._close_record_writer()
-                            self._record_cooldown_until = time.time() + 60.0
+                if need_rec_restart or self._record_writer is None or time_expired:
+                    try:
+                        self._open_record_writer(current_w, current_h, current_fps)
+                    except Exception as e:
+                        print(f"[{self.name}] 维护本地录制写入器异常: {e}")
+                        self._close_record_writer()
+                        self._record_cooldown_until = time.time() + 60.0
 
             # 3. FPS 控制
             now = time.time()
             frame_duration = 1.0 / current_fps
 
-            if now < next_time:
+            # 允许提前最多 25% 的单帧时间拿到数据，应对线程调度抖动
+            if now < (next_time - frame_duration * 0.25):
                 continue
 
             if now > next_time + frame_duration * 2:
@@ -605,6 +619,7 @@ class CamStream:
                     continue
 
                 writer.write(frame)
+                self._write_frame_count += 1
 
             except Exception as e:
                 print(f"[{self.name}] 写入 GStreamer 异常: {e}")
@@ -623,6 +638,7 @@ class CamStream:
                     continue
                 try:
                     self._record_writer.write(frame) # 通过GStreamer pipeline进行异步写入
+                    self._record_frame_count += 1
                 except Exception as e:
                     print(f"[{self.name}] 写入本地视频文件异常: {e}")
                     # 发生异常时，除了请求重启，必须主动释放损坏的句柄并触发冷却

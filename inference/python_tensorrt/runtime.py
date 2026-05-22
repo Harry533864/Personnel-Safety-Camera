@@ -83,6 +83,7 @@ class CameraInferResult:
     alarm: bool = False
     warning: bool = False
     system_state: SystemState = SystemState.SAFE
+    has_target: bool = False
 
 
 class ROIManager:
@@ -545,6 +546,7 @@ class CameraTensorRTInfer:
             alarm=frame_result.warning or frame_result.alarm,
             warning=frame_result.warning,
             system_state=frame_result.system_state,
+            has_target=len(frame_result.detections) > 0,
         )
 
     def _draw_result(self, frame: np.ndarray, frame_result: FrameResult) -> None:
