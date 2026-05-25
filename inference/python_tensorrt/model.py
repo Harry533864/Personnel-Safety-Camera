@@ -405,7 +405,9 @@ def main():
     try:
         with Model() as model:
             while True:
+                cap_start = time.perf_counter()
                 ret, frame = cap.read()
+                cap_end = time.perf_counter()
                 if not ret or frame is None:
                     print("读取摄像头图像失败")
                     continue
@@ -422,10 +424,12 @@ def main():
 
                     fps = fps_interval / elapsed
                     latency_ms = (infer_end - infer_start) * 1000
+                    cap_latency_ms = (cap_end - cap_start) * 1000
 
                     print(
                         f"FPS: {fps:.2f}, "
-                        f"last inference latency: {latency_ms:.2f} ms"
+                        f"last inference latency: {latency_ms:.2f} ms",
+                        f"last capture latency: {cap_latency_ms:.2f} ms",
                     )
 
                     interval_start = now

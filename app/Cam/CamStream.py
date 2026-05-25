@@ -4,30 +4,21 @@ import json
 import time
 import threading
 import shutil
-import queue
 from pathlib import Path
 from app.utils import read_record_config
 
 from inference.python_tensorrt.model import Model
 
-#todo 解决潜在错误隐患 切片标志位的竞态条件 - 磁盘已满
 
 class CamStream:
     """
-    流处理工作线程（消费者）。
-
-    1. 接收 CamManager 送来的原始帧
-    2. 控制当前推流 FPS
-    3. resize 到目标推流分辨率
-    4. 根据 enable_infer 决定是否调用 model.inference(frame)
-    5. 本地定时分段录制 MP4 视频（与推流尺寸、帧率一致）
-    - 只会保存推流成功的视频帧 推流失败直接跳过
-    - 修改分辨率和帧率都会重新保存新视频（曝光不会）
-    - 如果保存失败（硬件原因or磁盘已满）触发60s冷却期 到期后尝试重启开始保存新视频
-    - 采用jetson硬件支持的异步保存方式并压缩为H.264 不会阻塞CamStream的循环逻辑
-    - 每次保存新视频前读取AIConfig.yaml的record.duration_min作为当前视频最大时长
-    6. 使用 GStreamer + x264enc 软件编码推 RTMP
-
+    最小改动版：
+    1. CamManager 仍然负责采集。
+    2. CamStream 内部分成两个线程：
+       - _infer_task：尽可能快地处理最新帧，只做 AI 推理。
+       - _worker_task：按推流 FPS 取最新推理结果，负责推流和录制。
+    3. 只保留最新帧，不处理积压旧帧。
+    4. 软件编码 x264 仍保留，但不会直接卡住 AI 推理线程。
     """
 
     def __init__(
@@ -38,10 +29,9 @@ class CamStream:
         height=720,
         fps=15,
         enable_infer=False,
-        enable_record=False, # 默认不保存推流视频
+        enable_record=False,
         ai_config_path=None,
-        video_base_dir=None
-
+        video_base_dir=None,
     ):
         self.name = name
         self.url = url
@@ -50,9 +40,9 @@ class CamStream:
         self.height = int(height)
         self.fps = max(1, int(fps))
 
-        self.frame_queue = queue.Queue(maxsize=10)
         self._is_running = False
-        self._thread = None
+        self._thread = None          # 推流/录制线程
+        self._infer_thread = None    # AI 推理线程
 
         self._need_writer_restart = True
         self.set_lock = threading.Lock()
@@ -61,31 +51,42 @@ class CamStream:
         self.ai_config_path = ai_config_path
         self.ai_model = None
         self.ai_lock = threading.RLock()
-        
-        self._enable_record = enable_record  # 默认启动推流时同步开启录制
+
+        # 只保存最新帧，避免旧帧积压
+        self.frame_lock = threading.Lock()
+        self.latest_raw_frame = None
+        self.latest_infer_frame = None
+        self.latest_infer_time = 0.0
+
+        # 统计 AI 推理 FPS
+        self._infer_frame_count = 0
+        self._infer_stat_start = time.perf_counter()
+
+        self._enable_record = bool(enable_record)
         self._record_writer = None
         self._record_start_time = 0.0
-        self._record_duration_limit = 600.0  # 单位：秒
-        self._need_record_restart = True     # 启动时默认需要初始化录制器
-        self._record_cooldown_until = 0.0    # 冷却期截止时间戳
-        self._min_free_space_mb = 500        # 最少需要保留 500MB 磁盘空间
+        self._record_duration_limit = 600.0
+        self._need_record_restart = True
+        self._record_cooldown_until = 0.0
+        self._min_free_space_mb = 500
         self._record_file_path = None
         self._record_has_target = False
 
-        self.video_base_dir = video_base_dir if video_base_dir else Path(__file__).parent.parent.parent.resolve()
+        self.video_base_dir = (
+            video_base_dir
+            if video_base_dir
+            else Path(__file__).parent.parent.parent.resolve()
+        )
 
-        self._record_frame_count = 0 # 视频保存帧数统计
-        self._write_frame_count = 0 # 推流写入帧数统计
-        self._put_frame_count = 0 # CamManager写入帧数统计
+        self._record_frame_count = 0
+        self._write_frame_count = 0
+        self._put_frame_count = 0
 
     # =========================================================
     # GStreamer 推流相关
     # =========================================================
 
     def _suggest_bitrate_kbps(self, w, h, fps):
-        """
-        x264enc 的 bitrate 单位是 kbps。
-        """
         pixels = int(w) * int(h)
 
         if pixels >= 2560 * 1440:
@@ -99,10 +100,8 @@ class CamStream:
 
     def _build_gst_pipeline(self, current_w, current_h, current_fps):
         """
-        OpenCV VideoWriter 使用的 GStreamer pipeline。
-
-        输入是 OpenCV BGR frame。
-        编码器使用 x264enc 软件编码。
+        仍然使用 x264 软件编码。
+        为降低 CPU 压力，建议使用 ultrafast。
         """
         current_w = int(current_w)
         current_h = int(current_h)
@@ -113,7 +112,6 @@ class CamStream:
             current_h,
             current_fps,
         )
-        hw_bitrate = bitrate_kbps * 1000
 
         pipeline = (
             f"appsrc is-live=true block=false format=time do-timestamp=true "
@@ -123,10 +121,12 @@ class CamStream:
             f"! video/x-raw,format=I420 "
             f"! x264enc "
             f"bitrate={bitrate_kbps} "
-            f"speed-preset=faster "
+            f"speed-preset=ultrafast "
             f"tune=zerolatency "
             f"key-int-max={current_fps} "
             f"bframes=0 "
+            f"threads=2 "
+            f"sliced-threads=true "
             f"byte-stream=false "
             f"! h264parse config-interval=1 "
             f"! flvmux streamable=true "
@@ -175,18 +175,22 @@ class CamStream:
             writer.release()
         except Exception as e:
             print(f"[{self.name}] 释放 GStreamer writer 失败: {e}")
-            
+
+    # =========================================================
+    # 本地录制相关
+    # =========================================================
+
     def _close_record_writer(self):
         if self._record_writer is not None:
             try:
-                self._record_writer.release() # 视频结束时必须调用 release() 进行 “收尾”
-                print(f"[{self.name}] 结束录制分段 录制帧数{self._record_frame_count}\n")
-                print(f"[{self.name}] 结束录制分段 视频流推送帧数{self._write_frame_count}\n")
-                print(f"[{self.name}] 结束录制分段 CamManager视频流写入帧数{self._put_frame_count}\n")
+                self._record_writer.release()
+                print(f"[{self.name}] 结束录制分段 录制帧数 {self._record_frame_count}")
+                print(f"[{self.name}] 结束录制分段 视频流推送帧数 {self._write_frame_count}")
+                print(f"[{self.name}] 结束录制分段 CamManager视频流写入帧数 {self._put_frame_count}")
             except Exception as e:
                 print(f"[{self.name}] 释放本地录制 writer 失败: {e}")
-            self._record_writer = None
 
+            self._record_writer = None
             self._record_frame_count = 0
             self._write_frame_count = 0
             self._put_frame_count = 0
@@ -205,7 +209,10 @@ class CamStream:
                 "filename": self._record_file_path.name,
                 "title": self._record_file_path.stem,
                 "target": self.name,
-                "start_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(self._record_start_time)),
+                "start_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S",
+                    time.localtime(self._record_start_time),
+                ),
                 "duration_sec": max(0, int(round(time.time() - self._record_start_time))),
                 "has_target": bool(self._record_has_target),
             }
@@ -215,63 +222,64 @@ class CamStream:
             )
         except Exception as e:
             print(f"[{self.name}] 写入视频元数据失败: {e}")
-            
+
     def _open_record_writer(self, current_w, current_h, current_fps):
-        """
-        根据当前最新的配置，初始化本地视频录制对象
-        """
-        # 1. 检查是否在冷却期内
         if time.time() < self._record_cooldown_until:
             return
-        
+
         self._close_record_writer()
-        
-        # 从 YAML 文件中实时动态加载录制截止时长
+
         duration_min = read_record_config(self.ai_config_path)
         self._record_duration_limit = duration_min * 60.0
 
         base_dir = self.video_base_dir
         video_dir = base_dir / "video" / self.name
         video_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 磁盘余量检测
+
         total, used, free = shutil.disk_usage(str(video_dir))
         free_mb = free / (1024 * 1024)
+
         if free_mb < self._min_free_space_mb:
-            print(f"[{self.name}] 警告：磁盘空间不足 (剩余 {free_mb:.2f}MB)。暂停录制 60 秒。")
+            print(f"[{self.name}] 警告：磁盘空间不足，剩余 {free_mb:.2f}MB。暂停录制 60 秒。")
             self._record_cooldown_until = time.time() + 60.0
             self._record_writer = None
             return
 
-        # 构造 YYYYMMDD_HHMMSS 格式文件名
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
         file_path = video_dir / f"{timestamp_str}.mkv"
-        
+
         bitrate = self._suggest_bitrate_kbps(current_w, current_h, current_fps) * 1000
+
+        # 软件编码场景下尽量使用 ultrafast，降低对 AI 推理线程的 CPU 争抢
         gst_pipeline = (
-            f"appsrc is-live=true block=false format=time do-timestamp=true " # 自动为每帧添加时间戳 确保Jetson编码器正常工作
+            f"appsrc is-live=true block=false format=time do-timestamp=true "
             f"! video/x-raw,format=BGR,width={current_w},height={current_h},framerate={current_fps}/1 "
-            f"! videorate " # videorate 强制对齐帧率
-            f"! video/x-raw,framerate={current_fps}/1 "
-            f"! queue leaky=downstream max-size-buffers={current_fps} " # 缓冲 1 秒的数据
-            # ---------- 下面是异步操作 GStreamer底层自动开辟线程完成 ----------- #
-            f"! videoconvert ! video/x-raw,format=I420 "
-            f"! x264enc bitrate={int(bitrate/1000)} speed-preset=veryfast " # 替换为软件编码以解决无 nvv4l2h264enc 问题
+            f"! queue leaky=downstream max-size-buffers={current_fps} "
+            f"! videoconvert "
+            f"! video/x-raw,format=I420 "
+            f"! x264enc "
+            f"bitrate={int(bitrate / 1000)} "
+            f"speed-preset=ultrafast "
+            f"tune=zerolatency "
+            f"bframes=0 "
+            f"threads=2 "
+            f"sliced-threads=true "
             f"! h264parse "
             f"! matroskamux "
             f"! filesink location={file_path} sync=false async=false"
         )
+
         self._record_writer = cv2.VideoWriter(
             gst_pipeline,
             cv2.CAP_GSTREAMER,
             0,
             float(current_fps),
             (int(current_w), int(current_h)),
-            True
+            True,
         )
 
         if not self._record_writer.isOpened():
-            print(f"[{self.name}] 警告：无法打开本地视频录制 Writer: {file_path} 60 秒冷却中")
+            print(f"[{self.name}] 警告：无法打开本地视频录制 Writer: {file_path}，60 秒冷却中")
             self._record_writer = None
             self._record_cooldown_until = time.time() + 60.0
             return
@@ -279,7 +287,7 @@ class CamStream:
         self._record_start_time = time.time()
         self._record_file_path = file_path
         self._record_has_target = False
-        # self._need_record_restart = False # 在 lock 中已经置为 False 这里不用再重置
+
         print(f"[{self.name}] 启动新分段本地录制: {file_path}, 分段时长: {duration_min} 分钟")
 
     # =========================================================
@@ -300,7 +308,7 @@ class CamStream:
             self.width = width
             self.height = height
             self._need_writer_restart = True
-            self._need_record_restart = True  # 修改尺寸后本地录制必须立刻切片保存
+            self._need_record_restart = True
 
         print(f"[{self.name}] 目标分辨率变更为: {self.width}x{self.height}")
 
@@ -310,7 +318,7 @@ class CamStream:
         with self.set_lock:
             self.fps = fps
             self._need_writer_restart = True
-            self._need_record_restart = True  # 修改帧率后本地录制必须立刻切片保存
+            self._need_record_restart = True
 
         print(f"[{self.name}] 目标推流帧率变更为: {self.fps}")
 
@@ -364,33 +372,53 @@ class CamStream:
     # =========================================================
 
     def put_frame(self, frame):
+        """
+        最小改动关键点：
+        不再使用 maxsize=10 的队列，只保留最新帧。
+        这样 AI 推理永远处理最新画面，不会处理历史积压帧。
+        """
         if not self._is_running:
             return
 
-        try:
-            if self.frame_queue.full():
-                self.frame_queue.get_nowait()
+        if frame is None:
+            return
 
-            self.frame_queue.put_nowait(frame)
-            self._put_frame_count += 1
+        with self.frame_lock:
+            self.latest_raw_frame = frame
 
-        except queue.Empty:
-            pass
-        except queue.Full:
-            pass
+        self._put_frame_count += 1
 
     def start(self):
         if self._is_running:
             return
 
         self._is_running = True
-        self._thread = threading.Thread(target=self._worker_task, daemon=True)
+
+        # AI 推理线程
+        self._infer_thread = threading.Thread(
+            target=self._infer_task,
+            daemon=True,
+            name=f"CamStreamInfer-{self.name}",
+        )
+        self._infer_thread.start()
+
+        # 推流/录制线程
+        self._thread = threading.Thread(
+            target=self._worker_task,
+            daemon=True,
+            name=f"CamStreamWriter-{self.name}",
+        )
         self._thread.start()
 
-        print(f"[CamStream[{self.name}]] GStreamer 推流消费者已启动: {self.url}")
+        print(f"[CamStream[{self.name}]] 推理线程 + GStreamer 推流线程已启动: {self.url}")
 
     def stop(self):
         self._is_running = False
+
+        if self._infer_thread:
+            self._infer_thread.join()
+            self._infer_thread = None
+            print(f"[{self.name}] AI 推理线程已停止")
 
         if self._thread:
             self._thread.join()
@@ -440,32 +468,70 @@ class CamStream:
         with self.ai_lock:
             self._close_ai_model_locked()
 
-    def _run_inference_if_enabled(self, frame):
-        with self.ai_lock:
-            enable_infer = self.enable_infer
+    def _infer_task(self):
+        """
+        独立 AI 推理线程。
+        只做：
+        1. 取最新 raw_frame
+        2. model.inference()
+        3. 写入 latest_infer_frame
 
-        if not enable_infer:
-            return frame
+        这样 writer.write() 和 record_writer.write() 不会阻塞 AI 推理。
+        """
+        while self._is_running:
+            with self.frame_lock:
+                frame = self.latest_raw_frame
+                self.latest_raw_frame = None
 
-        try:
+            if frame is None:
+                time.sleep(0.001)
+                continue
+
+            # 只在取模型对象时加锁，不把整段推理包在 ai_lock 里
             with self.ai_lock:
-                model = self._ensure_ai_model_locked()
-                result = model.inference(frame)
-                if self._enable_record and getattr(model, "last_detection_flag", False):
-                    self._record_has_target = True
+                enable_infer = self.enable_infer
+                model = None
+                if enable_infer:
+                    model = self._ensure_ai_model_locked()
 
-            if result is None:
-                print(f"[{self.name}] AI 推理返回 None，使用原始帧")
-                return frame
+            if not enable_infer or model is None:
+                result = frame
+            else:
+                try:
+                    infer_start = time.perf_counter()
+                    result = model.inference(frame)
+                    infer_end = time.perf_counter()
 
-            if result.shape[:2] != frame.shape[:2]:
-                result = cv2.resize(result, (frame.shape[1], frame.shape[0]))
+                    if result is None:
+                        result = frame
 
-            return result
+                    if self._enable_record and getattr(model, "last_detection_flag", False):
+                        self._record_has_target = True
 
-        except Exception as e:
-            print(f"[{self.name}] AI 推理失败，使用原始帧继续推流: {e}")
-            return frame
+                    self._infer_frame_count += 1
+
+                    # 打印推理时间和 FPS 统计，每 30 帧打印一次
+                    # if self._infer_frame_count % 30 == 0:
+                    #     now = time.perf_counter()
+                    #     elapsed = now - self._infer_stat_start
+                    #     if elapsed > 0:
+                    #         infer_fps = 30 / elapsed
+                    #         infer_latency_ms = (infer_end - infer_start) * 1000
+                    #         print(
+                    #             f"[{self.name}] AI inference FPS: {infer_fps:.2f}, "
+                    #             f"last inference latency: {infer_latency_ms:.2f} ms"
+                    #         )
+                    #     self._infer_stat_start = now
+
+                except Exception as e:
+                    print(f"[{self.name}] AI 推理失败，使用原始帧继续推流: {e}")
+                    result = frame
+
+            with self.frame_lock:
+                self.latest_infer_frame = result
+                self.latest_infer_time = time.time()
+
+        print(f"[{self.name}] AI 推理线程退出")
 
     # =========================================================
     # 图像格式整理
@@ -486,10 +552,6 @@ class CamStream:
             return None
 
         if frame.shape[:2] != (current_h, current_w):
-            print(
-                f"[{self.name}] 推理后尺寸不一致: "
-                f"{frame.shape[1]}x{frame.shape[0]} -> {current_w}x{current_h}"
-            )
             frame = cv2.resize(frame, (current_w, current_h))
 
         if frame.dtype != np.uint8:
@@ -501,7 +563,7 @@ class CamStream:
         return frame
 
     # =========================================================
-    # 主工作线程
+    # 主推流/录制线程
     # =========================================================
 
     def _worker_task(self):
@@ -509,21 +571,15 @@ class CamStream:
         next_time = time.time()
 
         while self._is_running:
-            try:
-                raw_frame = self.frame_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
             with self.set_lock:
                 current_w = int(self.width)
                 current_h = int(self.height)
                 current_fps = max(1, int(self.fps))
                 need_restart = self._need_writer_restart
                 need_rec_restart = self._need_record_restart
-                # 在锁内直接重置，防止执行 _open_record_writer 期间的新指令被覆盖
-                # 导致写入视频前后两帧的尺寸不一致 程序崩溃
+
                 if need_rec_restart:
-                    self._need_record_restart = False 
+                    self._need_record_restart = False
 
             # 1. 分辨率/FPS 变化时，先重启 GStreamer writer
             if need_restart or writer is None or not writer.isOpened():
@@ -555,19 +611,17 @@ class CamStream:
 
                     time.sleep(1.0)
                     continue
-                
-            # 2. 检查、切换或创建 本地录制 VideoWriter
+
+            # 2. 检查、切换或创建本地录制 VideoWriter
             now = time.time()
             time_expired = False
+
             if self._record_writer is not None:
-                # 判断当前分段录制时长是否到期
-                time_expired = (now - self._record_start_time) >= self._record_duration_limit
+                time_expired = (
+                    now - self._record_start_time
+                ) >= self._record_duration_limit
 
             if self._enable_record and time.time() >= self._record_cooldown_until:
-                # 需要写入新视频的条件
-                # 1. 前端修改了 fps 或 分辨率
-                # 2. CamStream类首次初始化
-                # 3. 当前分段到期
                 if need_rec_restart or self._record_writer is None or time_expired:
                     try:
                         self._open_record_writer(current_w, current_h, current_fps)
@@ -576,12 +630,12 @@ class CamStream:
                         self._close_record_writer()
                         self._record_cooldown_until = time.time() + 60.0
 
-            # 3. FPS 控制
+            # 3. 推流 FPS 控制
             now = time.time()
             frame_duration = 1.0 / current_fps
 
-            # 允许提前最多 25% 的单帧时间拿到数据，应对线程调度抖动
             if now < (next_time - frame_duration * 0.25):
+                time.sleep(0.001)
                 continue
 
             if now > next_time + frame_duration * 2:
@@ -589,18 +643,15 @@ class CamStream:
             else:
                 next_time += frame_duration
 
-            # 4. resize 到当前推流目标尺寸
-            raw_h, raw_w = raw_frame.shape[:2]
+            # 4. 取最新 AI 推理结果
+            with self.frame_lock:
+                frame = self.latest_infer_frame
 
-            if current_w != raw_w or current_h != raw_h:
-                frame = cv2.resize(raw_frame, (current_w, current_h))
-            else:
-                frame = raw_frame
+            if frame is None:
+                time.sleep(0.001)
+                continue
 
-            # 5. AI 推理
-            frame = self._run_inference_if_enabled(frame)
-
-            # 6. 写入前格式检查
+            # 5. 写入前格式检查、resize 到推流尺寸
             frame = self._prepare_frame_for_writer(
                 frame,
                 current_w=current_w,
@@ -610,7 +661,7 @@ class CamStream:
             if frame is None:
                 continue
 
-            # 7. 写入 GStreamer
+            # 6. 写入 GStreamer 推流
             try:
                 if writer is None or not writer.isOpened():
                     print(f"[{self.name}] GStreamer writer 已关闭，准备重启")
@@ -629,19 +680,18 @@ class CamStream:
 
                 self._close_writer(writer)
                 writer = None
-                continue # 当前frame推流失败直接进入下一次循环 不再写入视频文件
-                
-            # 8. 写入本地录制文件 (每推流一帧，保存一帧)
+                continue
+
+            # 7. 写入本地录制文件
             if self._enable_record and self._record_writer is not None:
-                # 如果当前由于磁盘已满或record_writer打开失败而在60s冷却期内直接跳过
-                if time.time() < self._record_cooldown_until: 
+                if time.time() < self._record_cooldown_until:
                     continue
+
                 try:
-                    self._record_writer.write(frame) # 通过GStreamer pipeline进行异步写入
+                    self._record_writer.write(frame)
                     self._record_frame_count += 1
                 except Exception as e:
                     print(f"[{self.name}] 写入本地视频文件异常: {e}")
-                    # 发生异常时，除了请求重启，必须主动释放损坏的句柄并触发冷却
                     self._close_record_writer()
                     self._record_cooldown_until = time.time() + 60.0
                     with self.set_lock:

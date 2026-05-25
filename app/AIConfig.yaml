@@ -8,9 +8,9 @@ model:
   camera_id: cam_demo_001
   detect_enable: true
   infer_target: all
-  model_name: yolo11_person
+  model_name: Asva_person_v0518
   imgsz: 640
-  conf_thres: 0.4
+  conf_thres: 0.5
   iou_thres: 0.1
   enter_frames: 3
   exit_frames: 5
@@ -26,49 +26,15 @@ model:
     judge_method: overlap
     coordinate_mode: normalized
     polygon:
-    - - 0.1214
-      - 0.1517
-    - - 0.4062
-      - 0.1517
-    - - 0.4062
-      - 0.3613
-    - - 0.1214
-      - 0.3613
-    overlap_thres: 0.6
-    target: all
-  - roi_id: hazard_2
-    name: ROI2
-    enabled: true
-    roi_type: forbidden_zone
-    judge_method: foot_point
-    coordinate_mode: normalized
-    polygon:
-    - - 0.3975
-      - 0.2543
-    - - 0.6183
-      - 0.2543
-    - - 0.6183
-      - 0.6914
-    - - 0.3975
-      - 0.6914
-    overlap_thres: 0.6
-    target: all
-  - roi_id: hazard_3
-    name: ROI3
-    enabled: true
-    roi_type: forbidden_zone
-    judge_method: foot_point
-    coordinate_mode: normalized
-    polygon:
-    - - 0.6797
-      - 0.2587
-    - - 0.952
-      - 0.2587
-    - - 0.952
-      - 0.7227
-    - - 0.6797
-      - 0.7227
-    overlap_thres: 0.6
+    - - 0.3071
+      - 0.3524
+    - - 0.7048
+      - 0.3524
+    - - 0.7048
+      - 0.9769
+    - - 0.3071
+      - 0.9769
+    overlap_thres: 0.5
     target: all
 test:
   hot_reload: true
@@ -83,8 +49,8 @@ model_names:
 - Asva_person_v0518
 exception_output:
   gpio:
-  - 32
+  - 29
   output_level: 1
-  duration: 0
+  duration: 2
 record:
   duration_min: 1
