@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Sequence, Tuple
 import cv2
 import numpy as np
 
+from .vision_tasks import VisionTaskManager
+
 
 class SystemState(str, Enum):
     SAFE = "safe"
@@ -70,11 +72,23 @@ class InferenceConfig:
     topk: int = 100
     num_labels: int = 0
     class_names: List[str] = field(default_factory=list)
+    person_class_ids: List[int] = field(default_factory=lambda: [0])
+    person_class_names: List[str] = field(default_factory=lambda: ["person"])
 
     def get_class_name(self, class_id: int) -> str:
         if 0 <= class_id < len(self.class_names):
             return self.class_names[class_id]
         return f"class_{class_id}"
+
+    def is_person_detection(self, detection: Detection) -> bool:
+        if detection.class_id in self.person_class_ids:
+            return True
+
+        class_name = str(detection.class_name or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return class_name in {
+            str(name).strip().lower().replace("-", "_").replace(" ", "_")
+            for name in self.person_class_names
+        }
 
 
 @dataclass
@@ -84,6 +98,8 @@ class CameraInferResult:
     warning: bool = False
     system_state: SystemState = SystemState.SAFE
     has_target: bool = False
+    frame_result: FrameResult | None = None
+    task_results: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class ROIManager:
@@ -474,8 +490,6 @@ class CameraTensorRTInfer:
         self.settle_single_frame = bool(settle_single_frame)
         self.inference_config = self._build_inference_config(runtime_config)
         self.roi_rules = self._build_roi_rules(runtime_config.get("rois", []))
-        if not self.roi_rules:
-            raise ValueError("没有找到可用 ROI 配置")
         self.detector = TensorRTDetector(Path(engine_path), self.inference_config)
         self.roi_manager = ROIManager(self.roi_rules)
         self.alarm_logic = AlarmLogic(
@@ -483,6 +497,7 @@ class CameraTensorRTInfer:
             enter_frames=int(runtime_config.get("enter_frames", 3)),
             exit_frames=int(runtime_config.get("exit_frames", 5)),
         )
+        self.task_manager = VisionTaskManager(runtime_config.get("vision_pipeline", {}))
 
     @staticmethod
     def _build_inference_config(config: Dict[str, Any]) -> InferenceConfig:
@@ -492,6 +507,17 @@ class CameraTensorRTInfer:
         if isinstance(class_names, str):
             class_names = [class_names]
         num_labels = int(config.get("num_labels", len(class_names) if class_names else 0))
+        person_class_ids = []
+        for item in config.get("person_class_ids", [0]):
+            try:
+                person_class_ids.append(int(item))
+            except Exception:
+                continue
+
+        person_class_names = config.get("person_class_names", ["person"])
+        if isinstance(person_class_names, str):
+            person_class_names = [person_class_names]
+
         return InferenceConfig(
             input_size=(imgsz, imgsz),
             score_threshold=float(config.get("conf_thres", thresholds.get("conf_thres", 0.35))),
@@ -499,6 +525,8 @@ class CameraTensorRTInfer:
             topk=int(config.get("topk", 100)),
             num_labels=num_labels,
             class_names=[str(name) for name in class_names],
+            person_class_ids=person_class_ids or [0],
+            person_class_names=[str(name) for name in person_class_names],
         )
 
     @staticmethod
@@ -531,6 +559,11 @@ class CameraTensorRTInfer:
         frame = input_img.copy()
         detections = self.detector.infer(frame)
         detections = self.roi_manager.apply(detections, frame.shape)
+        person_detections = [
+            detection
+            for detection in detections
+            if self.inference_config.is_person_detection(detection)
+        ]
 
         eval_times = 1
         if self.settle_single_frame:
@@ -538,16 +571,36 @@ class CameraTensorRTInfer:
 
         frame_result = FrameResult(detections=[], zone_summary=[])
         for _ in range(eval_times):
-            frame_result = self.alarm_logic.evaluate(detections, self.prestart_mode)
+            frame_result = self.alarm_logic.evaluate(person_detections, self.prestart_mode)
+
+        task_results = self.task_manager.evaluate(detections, frame_result)
+        task_alarm = self.task_manager.has_alarm(task_results)
+        task_warning = self.task_manager.has_warning(task_results)
+        system_state = frame_result.system_state
+
+        if task_alarm and system_state == SystemState.SAFE:
+            system_state = SystemState.ALARM
+        elif task_warning and system_state == SystemState.SAFE:
+            system_state = SystemState.WARNING
 
         self._draw_result(frame, frame_result)
         return CameraInferResult(
             image=frame,
-            alarm=frame_result.warning or frame_result.alarm,
-            warning=frame_result.warning,
-            system_state=frame_result.system_state,
+            alarm=frame_result.warning or frame_result.alarm or task_alarm,
+            warning=frame_result.warning or task_warning,
+            system_state=system_state,
             has_target=len(frame_result.detections) > 0,
+            frame_result=frame_result,
+            task_results=task_results,
         )
+
+    def render_result(self, input_img: np.ndarray, frame_result: FrameResult) -> np.ndarray:
+        if input_img is None or input_img.size == 0:
+            raise ValueError("Input image is empty")
+
+        frame = input_img.copy()
+        self._draw_result(frame, frame_result)
+        return frame
 
     def _draw_result(self, frame: np.ndarray, frame_result: FrameResult) -> None:
         self.roi_manager.draw_rois(frame)

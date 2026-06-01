@@ -4,6 +4,33 @@
       <div class="operation-bar-left">
         <div class="page-title-group">
           <h2 class="page-title">相机页面</h2>
+          <div class="jetson-discovery">
+            <button
+              class="jetson-scan-btn"
+              type="button"
+              :disabled="isScanningJetson"
+              @click="scanJetsons"
+              title="扫描在线设备"
+            >
+              <span class="scan-dot" :class="{ scanning: isScanningJetson }"></span>
+              {{ isScanningJetson ? '扫描中' : '扫描设备' }}
+            </button>
+            <span class="jetson-current" :class="{ online: activeJetsonOnline }">
+              {{ activeJetsonLabel }}
+            </span>
+            <div class="jetson-results" v-if="showJetsonResults && discoveredJetsons.length">
+              <button
+                v-for="device in discoveredJetsons"
+                :key="device.api"
+                class="jetson-result"
+                type="button"
+                @click="selectJetson(device)"
+              >
+                <span>{{ device.label }}</span>
+                <strong>{{ device.host }}</strong>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -93,6 +120,11 @@
 
         </div>
 
+        <div class="status-indicator fps-indicator" :class="currentFpsClass">
+          <span class="status-dot"></span>
+          <span class="status-text">{{ currentFps || '-- fps' }}</span>
+        </div>
+
         <div class="status-indicator" :class="networkStatus">
           <span class="status-dot"></span>
           <span class="status-text">{{ networkSpeed }} MB/s</span>
@@ -163,14 +195,53 @@ const router = useRouter();
 const videoPlayer = ref(null);
 const videoLoaded = ref(false);
 const videoResolution = ref("");
+const currentFps = ref("");
+const currentFpsValue = ref(0);
 const currentTime = ref("");
 const networkSpeed = ref("0.0");
 const networkStatus = ref("normal");
 const errorMessage = ref("");
 
-// WebRTC 相关
-const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL
-const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;   // 推流电脑 IP，使用时修改
+const JETSON_ENDPOINT_STORAGE_KEY = "jetson_runtime_endpoint";
+
+const getStoredJetsonEndpoint = () => {
+  try {
+    return JSON.parse(localStorage.getItem(JETSON_ENDPOINT_STORAGE_KEY) || "null");
+  } catch {
+    return null;
+  }
+};
+
+const normalizeBaseUrl = (url, fallbackPort) => {
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.hostname}:${parsed.port || fallbackPort}`;
+  } catch {
+    return "";
+  }
+};
+
+const makeEndpoint = (host) => ({
+  host,
+  label: host === "192.168.55.1" ? "USB TCP" : "LAN TCP",
+  api: `http://${host}:5000`,
+  stream: `http://${host}:8889`,
+});
+
+const storedEndpoint = getStoredJetsonEndpoint();
+const storedLanEndpoint = storedEndpoint?.host === "10.10.10.2" ? storedEndpoint : null;
+const apiBaseUrl = ref(
+  storedLanEndpoint?.api || normalizeBaseUrl(import.meta.env.VITE_FLASK_BACKEND_URL, "5000")
+);
+const streamBaseUrl = ref(
+  storedLanEndpoint?.stream || normalizeBaseUrl(import.meta.env.VITE_VIDEO_STREAM_URL, "8889")
+);
+const discoveredJetsons = ref([]);
+const isScanningJetson = ref(false);
+const showJetsonResults = ref(false);
+const activeJetsonOnline = ref(false);
+
 let pc = null;
 
 // 监听`设置相机`的返回结果
@@ -194,14 +265,28 @@ const exceptionOutputState = ref({"active": false, "inactive": false, "unset": t
 
 let timeInterval = null;
 let speedInterval = null;
+let runtimeStatusInterval = null;
+let videoFrameCallbackId = null;
+let fpsFallbackInterval = null;
+let firstFrameTimer = null;
+let fpsSample = { frames: 0, time: 0 };
 
 // 重连机制
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let isConnecting = false;
 let manualReconnectVisiable = false;
-const MAX_RECONNECT_ATTEMPTS = 5;
+const MAX_RECONNECT_ATTEMPTS = 60;
 const BASE_RECONNECT_DELAY = 1000;
+const MAX_RECONNECT_DELAY = 5000;
+
+const activeJetsonLabel = computed(() => {
+  try {
+    return new URL(apiBaseUrl.value).host;
+  } catch {
+    return "未连接";
+  }
+});
 
 const goToCameraSettings = () => {
   router.push("/camera-settings");
@@ -258,8 +343,292 @@ const loadFromSaveState = (saveState, curState) => {
   }
 };
 
+const formatFps = (value) => {
+  const fps = Number(value);
+  if (!Number.isFinite(fps) || fps <= 0) return "";
+  return `${Math.round(fps)} fps`;
+};
+
+const setCurrentFps = (value) => {
+  const fps = Number(value);
+  if (!Number.isFinite(fps) || fps <= 0) return;
+  currentFpsValue.value = fps;
+  currentFps.value = formatFps(fps);
+};
+
+const currentFpsClass = computed(() => ({
+  danger: currentFpsValue.value > 0 && currentFpsValue.value < 10,
+}));
+
+const getHostFromUrl = (url) => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+};
+
+const buildJetsonCandidates = () => {
+  const hosts = new Set();
+  const addHost = (host) => {
+    if (/^(\d{1,3}\.){3}\d{1,3}$/.test(host)) hosts.add(host);
+  };
+
+  addHost(getHostFromUrl(apiBaseUrl.value));
+  addHost(getHostFromUrl(import.meta.env.VITE_FLASK_BACKEND_URL));
+  addHost("10.10.10.2");
+
+  const pageHost = window.location.hostname;
+  if (pageHost.startsWith("10.10.10.")) addHost(pageHost);
+
+  const subnetPrefixes = new Set(["10.10.10"]);
+  const pageMatch = pageHost.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/);
+  if (pageMatch) subnetPrefixes.add(pageMatch[1]);
+
+  for (const prefix of subnetPrefixes) {
+    for (let i = 1; i <= 254; i += 1) {
+      hosts.add(`${prefix}.${i}`);
+    }
+  }
+
+  return Array.from(hosts).map(makeEndpoint);
+};
+
+const probeJetson = async (endpoint, timeoutMs = 700) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${endpoint.api}/api/runtime/status`, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+
+    const payload = await response.json();
+    if (payload.status !== "success") return null;
+
+    return {
+      ...endpoint,
+      camera: payload.data?.camera,
+      streamStatus: (payload.data?.streams || []).find((item) => item.name === "cam_high"),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const applyJetsonEndpoint = async (device, reconnectNow = true) => {
+  apiBaseUrl.value = device.api;
+  streamBaseUrl.value = device.stream;
+  activeJetsonOnline.value = true;
+  showJetsonResults.value = false;
+
+  localStorage.setItem(
+    JETSON_ENDPOINT_STORAGE_KEY,
+    JSON.stringify({
+      api: device.api,
+      stream: device.stream,
+      host: device.host,
+      label: device.label,
+    })
+  );
+
+  const source = device.streamStatus || device.camera;
+  if (source?.width && source?.height) {
+    videoResolution.value = `${source.width}x${source.height}`;
+  }
+
+  if (reconnectNow) {
+    reconnectAttempts = 0;
+    manualReconnectVisiable = false;
+    await reconnect();
+  }
+};
+
+const scanJetsons = async () => {
+  if (isScanningJetson.value) return;
+
+  isScanningJetson.value = true;
+  showJetsonResults.value = false;
+  discoveredJetsons.value = [];
+
+  const candidates = buildJetsonCandidates();
+  const found = [];
+  const batchSize = 24;
+
+  for (let i = 0; i < candidates.length; i += batchSize) {
+    const batch = candidates.slice(i, i + batchSize);
+    const results = await Promise.all(batch.map((endpoint) => probeJetson(endpoint)));
+
+    for (const result of results) {
+      if (result && !found.some((item) => item.host === result.host)) {
+        found.push(result);
+        discoveredJetsons.value = [...found];
+      }
+    }
+  }
+
+  isScanningJetson.value = false;
+  showJetsonResults.value = true;
+
+  if (found.length) {
+    const preferred =
+      found.find((item) => item.host === "10.10.10.2") ||
+      found.find((item) => item.host === getHostFromUrl(apiBaseUrl.value)) ||
+      found[0];
+    await applyJetsonEndpoint(preferred, !videoLoaded.value);
+  }
+};
+
+const selectJetson = async (device) => {
+  await applyJetsonEndpoint(device, true);
+};
+
+const connectPreferredDevice = async () => {
+  const candidates = [];
+  const addCandidate = (endpoint) => {
+    if (!endpoint?.host) return;
+    if (!candidates.some((item) => item.host === endpoint.host)) {
+      candidates.push(endpoint);
+    }
+  };
+
+  addCandidate(makeEndpoint("10.10.10.2"));
+  addCandidate(makeEndpoint(getHostFromUrl(import.meta.env.VITE_FLASK_BACKEND_URL)));
+  addCandidate(makeEndpoint(getHostFromUrl(apiBaseUrl.value)));
+
+  for (const candidate of candidates) {
+    const device = await probeJetson(candidate, 1000);
+    if (device) {
+      await applyJetsonEndpoint(device, false);
+      return true;
+    }
+  }
+
+  return false;
+};
+
+const syncRuntimeStreamStatus = async () => {
+  if (!apiBaseUrl.value) return;
+
+  try {
+    const response = await fetch(`${apiBaseUrl.value}/api/runtime/status`, {
+      method: "GET",
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.status !== "success") {
+      activeJetsonOnline.value = false;
+      return;
+    }
+
+    activeJetsonOnline.value = true;
+
+    const highStream = (payload.data?.streams || []).find((stream) => stream.name === "cam_high");
+    const camera = payload.data?.camera;
+    const source = highStream || camera;
+    if (!source) return;
+
+    if (source.width && source.height) {
+      videoResolution.value = `${source.width}x${source.height}`;
+    }
+
+    if (!videoLoaded.value && !isConnecting && !reconnectTimer) {
+      reconnectAttempts = Math.min(reconnectAttempts, 3);
+      scheduleReconnect();
+    }
+
+  } catch {
+    activeJetsonOnline.value = false;
+    // Keep the last known display value when runtime status is temporarily unavailable.
+  }
+};
+
+const startFpsMonitor = () => {
+  const video = videoPlayer.value;
+  if (!video) return;
+
+  stopFpsMonitor();
+
+  fpsSample = { frames: 0, time: 0 };
+
+  if (typeof video.requestVideoFrameCallback !== "function") {
+    fpsFallbackInterval = setInterval(() => {
+      if (typeof video.getVideoPlaybackQuality !== "function") return;
+
+      const quality = video.getVideoPlaybackQuality();
+      const frames = Number(quality.totalVideoFrames || 0);
+      const time = performance.now();
+
+      if (fpsSample.frames > 0 && time > fpsSample.time) {
+        const deltaFrames = frames - fpsSample.frames;
+        const deltaTime = (time - fpsSample.time) / 1000;
+        if (deltaFrames >= 0 && deltaTime > 0) {
+          setCurrentFps(deltaFrames / deltaTime);
+        }
+      }
+
+      fpsSample = { frames, time };
+    }, 1000);
+    return;
+  }
+
+  const update = (_now, metadata) => {
+    const frames = Number(metadata.presentedFrames || 0);
+    const time = performance.now();
+
+    if (fpsSample.frames && time > fpsSample.time) {
+      const deltaFrames = frames - fpsSample.frames;
+      const deltaTime = (time - fpsSample.time) / 1000;
+      if (deltaTime >= 0.8 && deltaFrames > 0) {
+        setCurrentFps(deltaFrames / deltaTime);
+        fpsSample = { frames, time };
+      }
+    } else {
+      fpsSample = { frames, time };
+    }
+
+    videoFrameCallbackId = video.requestVideoFrameCallback(update);
+  };
+
+  videoFrameCallbackId = video.requestVideoFrameCallback(update);
+};
+
+const stopFpsMonitor = () => {
+  const video = videoPlayer.value;
+  if (
+    video &&
+    videoFrameCallbackId !== null &&
+    typeof video.cancelVideoFrameCallback === "function"
+  ) {
+    video.cancelVideoFrameCallback(videoFrameCallbackId);
+  }
+  videoFrameCallbackId = null;
+  if (fpsFallbackInterval) {
+    clearInterval(fpsFallbackInterval);
+    fpsFallbackInterval = null;
+  }
+  fpsSample = { frames: 0, time: 0 };
+};
+
 // 关闭现有连接
 const closeWebRTC = () => {
+  stopFpsMonitor();
+  if (firstFrameTimer) {
+    clearTimeout(firstFrameTimer);
+    firstFrameTimer = null;
+  }
+  const video = videoPlayer.value;
+  if (video) {
+    video.onloadedmetadata = null;
+    video.onplaying = null;
+    video.pause();
+    video.srcObject = null;
+  }
   if (pc) {
     pc.ontrack = null;
     pc.onconnectionstatechange = null;
@@ -278,7 +647,7 @@ const scheduleReconnect = () => {
     manualReconnectVisiable = true;
     return;
   }
-  const delay = BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts);
+  const delay = Math.min(BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY);
   reconnectTimer = setTimeout(() => {
     reconnect();
   }, delay);
@@ -294,7 +663,6 @@ const reconnect = async () => {
 
     // 连接成功
     reconnectAttempts = 0;
-    errorMessage.value = '';
     manualReconnectVisiable = false;
   } catch (err) {
     reconnectAttempts++;
@@ -326,7 +694,7 @@ const initWebRTC = async () => {
   try {
     // 创建 RTCPeerConnection
     pc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]  // 可加 TURN
+      iceServers: []
     });
 
     // 添加只接收视频的 Transceiver
@@ -336,9 +704,38 @@ const initWebRTC = async () => {
     pc.ontrack = (event) => {
       if (event.track.kind === "video") {
         const stream = new MediaStream([event.track]);
-        videoPlayer.value.srcObject = stream;
-        videoLoaded.value = true;
-        errorMessage.value = "";
+        const video = videoPlayer.value;
+        video.srcObject = stream;
+        errorMessage.value = "等待视频画面...";
+        currentFps.value = "";
+        currentFpsValue.value = 0;
+
+        const markVideoReady = () => {
+          if (firstFrameTimer) {
+            clearTimeout(firstFrameTimer);
+            firstFrameTimer = null;
+          }
+          videoLoaded.value = true;
+          errorMessage.value = "";
+          startFpsMonitor();
+        };
+
+        video.onloadedmetadata = () => {
+          if (video.videoWidth && video.videoHeight) {
+            videoResolution.value = `${video.videoWidth}x${video.videoHeight}`;
+          }
+          video.play().catch(() => {});
+        };
+        video.onplaying = markVideoReady;
+
+        firstFrameTimer = setTimeout(() => {
+          if (!videoLoaded.value) {
+            errorMessage.value = "视频画面未返回，正在重连...";
+            handleConnectionFailed();
+          }
+        }, 10000);
+
+        video.play().catch(() => {});
 
         // 监听分辨率变化（当视频元数据加载后）
         event.track.onunmute = () => {
@@ -368,7 +765,7 @@ const initWebRTC = async () => {
     });
 
     // 发送 Offer SDP 到 WHEP 端点
-    const response = await fetch(MEDIAMTX_WHEP_URL, {
+    const response = await fetch(`${streamBaseUrl.value}/cam_high/whep`, {
       method: "POST",
       headers: { "Content-Type": "application/sdp" },
       body: pc.localDescription.sdp
@@ -408,7 +805,8 @@ const initWebRTC = async () => {
     errorMessage.value = "WebRTC 连接失败";
 
     // 尝试重连
-    handleConnectionFailed();
+    closeWebRTC();
+    throw err;
   }
 };
 
@@ -441,7 +839,10 @@ onMounted(async () => {
   loadFromSaveState(saveModelManagementState, modelManagementState);
   loadFromSaveState(saveExceptionOutputState, exceptionOutputState);
 
-  initWebRTC();
+  await connectPreferredDevice();
+  reconnect();
+  syncRuntimeStreamStatus();
+  runtimeStatusInterval = setInterval(syncRuntimeStreamStatus, 3000);
 
   // 尝试获取设置的分辨率值
   const saveCameraSettings = cameraSettingStore.getSettings();
@@ -453,6 +854,7 @@ onMounted(async () => {
 onUnmounted(() => {
   clearInterval(timeInterval);
   clearInterval(speedInterval);
+  if (runtimeStatusInterval) clearInterval(runtimeStatusInterval);
   if (reconnectTimer) clearTimeout(reconnectTimer);
   closeWebRTC();
 });
@@ -461,128 +863,283 @@ onUnmounted(() => {
 <style scoped>
 .monitor-page {
   width: 100%;
-  height: calc(100vh - 56px);
-  min-height: 0;
+  height: calc(100vh - var(--topbar-height));
+  min-height: 620px;
   display: flex;
   flex-direction: column;
-  background: #0d1117;
+  gap: 16px;
+  padding: 16px;
   overflow: hidden;
-  margin: 0;
-  padding: 0;
+  background: transparent;
 }
 
 .operation-bar {
+  position: relative;
+  min-height: 58px;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 16px;
-  background: #161b22;
-  border-bottom: 1px solid #30363d;
-  flex-shrink: 0;
   gap: 16px;
+  padding: 10px 14px 10px 18px;
+  background: var(--industrial-surface);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius);
+  box-shadow: var(--industrial-shadow);
+  flex-shrink: 0;
+}
+
+.operation-bar::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 0 999px 999px 0;
+  background: var(--industrial-red);
+}
+
+.operation-bar-left,
+.operation-bar-right,
+.page-title-group,
+.operation-actions,
+.status-indicator,
+.info-item {
+  display: flex;
+  align-items: center;
 }
 
 .operation-bar-left {
-  display: flex;
-  align-items: center;
   min-width: 0;
 }
 
 .operation-bar-right {
   flex-shrink: 0;
-  display: flex;
-  align-items: center;
   gap: 12px;
-}
-
-.page-title-group {
-  display: flex;
-  align-items: center;
 }
 
 .page-title {
   margin: 0;
-  font-size: 1rem;
+  color: var(--industrial-text);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0;
+  flex-shrink: 0;
+}
+
+.page-title::after {
+  content: "实时视觉检测";
+  display: block;
+  margin-top: 2px;
+  color: var(--industrial-faint);
+  font-size: 12px;
   font-weight: 600;
-  color: #e6edf3;
+}
+
+.page-title-group {
+  position: relative;
+  gap: 12px;
+  min-width: 0;
+}
+
+.jetson-discovery {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.jetson-scan-btn {
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  color: var(--industrial-success);
+  background: var(--industrial-success-soft);
+  border: 1px solid rgba(47, 133, 90, 0.24);
+  border-radius: var(--industrial-radius-sm);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: var(--industrial-shadow);
+}
+
+.jetson-scan-btn:disabled {
+  cursor: wait;
+  opacity: 0.78;
+}
+
+.scan-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--industrial-success);
+}
+
+.scan-dot.scanning {
+  animation: scan-pulse 0.8s ease-in-out infinite;
+}
+
+.jetson-current {
+  max-width: 170px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--industrial-muted);
+  font-family: "Roboto Mono", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.jetson-current.online {
+  color: var(--industrial-success);
+}
+
+.jetson-results {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  min-width: 220px;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  background: #ffffff;
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+  box-shadow: var(--industrial-shadow-hover);
+}
+
+.jetson-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 30px;
+  padding: 0 8px;
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid transparent;
+  border-radius: var(--industrial-radius-sm);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.jetson-result:hover {
+  color: var(--industrial-success);
+  background: var(--industrial-success-soft);
+  border-color: rgba(47, 133, 90, 0.18);
+}
+
+.jetson-result strong {
+  color: inherit;
+  font-family: "Roboto Mono", Consolas, monospace;
+}
+
+@keyframes scan-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  50% {
+    transform: scale(1.45);
+    opacity: 1;
+  }
 }
 
 .operation-actions {
-  display: flex;
-  align-items: center;
   gap: 8px;
   flex-wrap: wrap;
 }
 
 .operation-btn {
-  display: flex;
+  width: 38px;
+  height: 34px;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 36px;
   padding: 0;
-  background: #21262d;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  color: #8b949e;
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
   cursor: pointer;
-  transition: all 0.2s;
+  box-shadow: var(--industrial-shadow);
 }
 
 .operation-btn:hover {
-  background: #30363d;
-  color: #c9d1d9;
-  border-color: #8b949e;
+  color: var(--industrial-red-dark);
+  background: var(--industrial-red-soft);
+  border-color: rgba(185, 28, 28, 0.25);
+  box-shadow: var(--industrial-shadow-hover);
 }
 
 .operation-btn.active {
-  background: #238636;
-  color: #ffffff;
-  border-color: #238636;
+  color: var(--industrial-success);
+  background: var(--industrial-success-soft);
+  border-color: rgba(47, 133, 90, 0.28);
 }
 
 .operation-btn.inactive {
-  background: #f5030f;
-  color: #ffffff;
-  border-color: #f5030f;
+  color: var(--industrial-danger);
+  background: var(--industrial-danger-soft);
+  border-color: rgba(197, 48, 48, 0.3);
 }
 
 .operation-btn.unset {
-  background: #525151ef;
-  color: #ffffff;
-  border-color: #525151ef;
+  color: var(--industrial-muted);
+  background: #f3f5f7;
 }
 
 .status-indicator {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border-radius: 4px;
-  font-size: 0.8rem;
-  color: #8b949e;
-  background: #21262d;
+  gap: 7px;
+  min-height: 32px;
+  padding: 0 10px;
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .status-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #3fb950;
-  animation: pulse 2s infinite;
+  background: var(--industrial-success);
 }
 
 .status-indicator.poor .status-dot {
-  background: #f85149;
+  background: var(--industrial-danger);
 }
 
 .status-indicator.normal .status-dot {
-  background: #d29922;
+  background: var(--industrial-warning);
 }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+.fps-indicator {
+  color: var(--industrial-success);
+  background: var(--industrial-success-soft);
+  border-color: rgba(47, 133, 90, 0.22);
+}
+
+.fps-indicator .status-dot {
+  background: var(--industrial-success);
+}
+
+.fps-indicator.danger {
+  color: var(--industrial-danger);
+  background: var(--industrial-danger-soft);
+  border-color: rgba(197, 48, 48, 0.24);
+}
+
+.fps-indicator.danger .status-dot {
+  background: var(--industrial-danger);
 }
 
 .camera-view-area {
@@ -590,111 +1147,121 @@ onUnmounted(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  position: relative;
   overflow: hidden;
-  background: #000;
+  background: var(--industrial-surface);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius);
+  box-shadow: var(--industrial-shadow-hover);
 }
 
 .video-container {
+  position: relative;
   flex: 1;
   min-height: 0;
-  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: auto;
+  background:
+    linear-gradient(90deg, rgba(143, 17, 23, 0.055) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(31, 41, 51, 0.045) 1px, transparent 1px),
+    #ffffff;
+  background-size: 32px 32px;
 }
 
 .video-player {
   display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: transparent;
 }
 
 .video-placeholder {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  color: #8b949e;
   gap: 12px;
+  padding: 24px;
+  color: var(--industrial-muted);
   text-align: center;
-  padding: 20px;
-  background: #0d1117;
+  background: #ffffff;
 }
 
 .video-placeholder p {
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .video-info-bar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 6px 16px;
-  background: #161b22;
-  border-top: 1px solid #30363d;
-  font-size: 0.8rem;
-  color: #8b949e;
+  gap: 14px;
+  padding: 9px 14px;
+  color: var(--industrial-muted);
+  background: #ffffff;
+  border-top: 1px solid var(--industrial-border);
+  font-size: 12px;
   flex-shrink: 0;
   flex-wrap: wrap;
 }
 
 .info-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+  gap: 5px;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--industrial-success-soft);
+  color: var(--industrial-success);
 }
 
 .resolution-info {
-  color: #58a6ff;
-  font-weight: 500;
+  color: var(--industrial-success);
+  font-family: "Roboto Mono", Consolas, monospace;
+  font-weight: 700;
 }
 
 .reconnect-btn {
-  margin-top: 12px;
-  padding: 6px 12px;
-  background: #238636;
-  border: none;
-  border-radius: 6px;
-  color: white;
+  margin-top: 8px;
+  min-height: 34px;
+  padding: 0 14px;
+  color: #ffffff;
+  background: var(--industrial-red);
+  border: 1px solid var(--industrial-red);
+  border-radius: var(--industrial-radius-sm);
   cursor: pointer;
 }
+
 .reconnect-btn:hover {
-  background: #2ea043;
+  background: var(--industrial-red-dark);
+  border-color: var(--industrial-red-dark);
 }
 
 @media (max-width: 768px) {
+  .monitor-page {
+    padding: 12px;
+    gap: 12px;
+  }
+
   .operation-bar {
-    padding: 6px 10px;
+    align-items: flex-start;
+    flex-direction: column;
   }
 
-  .operation-btn {
-    width: 36px;
-    height: 34px;
-  }
-
-  .video-info-bar {
-    padding: 4px 10px;
-    gap: 10px;
+  .operation-bar-right {
+    width: 100%;
+    justify-content: space-between;
+    flex-wrap: wrap;
   }
 }
 
 @media (max-width: 480px) {
   .status-text {
     display: none;
-  }
-
-  .operation-bar {
-    gap: 10px;
-  }
-
-  .operation-bar-right {
-    gap: 8px;
   }
 }
 </style>

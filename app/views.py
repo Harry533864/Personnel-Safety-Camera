@@ -1,13 +1,18 @@
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 import shutil
+import logging
+from collections.abc import Mapping, Sequence
 
 from app import app
 from flask import request, jsonify, render_template, send_file, url_for
 
 from app.Cam.CamStream import CamStream
 from app.Cam.CamManager import CamManager
+from app.config_schema import validate_ai_config, validate_model_name, resolve_model_dir
+from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
 
 from app.utils import (
     read_yaml,
@@ -22,9 +27,15 @@ from app.utils import (
 # 配置路径
 # =========================================================
 
-AI_CONFIG_PATH = Path("/home/jetson/code/Cam_flaskvue/app/AIConfig.yaml")
-MODEL_FILE_PATH = Path("/home/jetson/code/Cam_flaskvue/inference/models")
-VIDEO_BASE_PATH = Path("/home/jetson/code")
+logger = logging.getLogger(__name__)
+logger.info("AI config path: %s", AI_CONFIG_PATH)
+logger.info("Model directory: %s", MODEL_FILE_PATH)
+logger.info("Video base directory: %s", VIDEO_BASE_PATH)
+
+
+def write_ai_config(cfg):
+    validate_ai_config(cfg)
+    write_yaml(cfg, file_path=AI_CONFIG_PATH)
 
 # =========================================================
 # 推流配置
@@ -38,9 +49,9 @@ URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
 # =========================================================
 
 CAMERA_ID = 0
-ORI_WIDTH = 1280
-ORI_HEIGHT = 720
-ORI_FPS = 30
+ORI_WIDTH = 1920
+ORI_HEIGHT = 1080
+ORI_FPS = 60
 
 cam_manager = CamManager(
     camera_id=CAMERA_ID,
@@ -58,9 +69,9 @@ AI_INFER_ENABLE, AI_INFER_TARGET = read_ai_startup_state(AI_CONFIG_PATH)
 stream_high = CamStream(
     name="cam_high",
     url=URL_HIGH,
-    width=1280,
-    height=720,
-    fps=30,
+    width=1920,
+    height=1080,
+    fps=60,
     enable_infer=should_enable_stream_ai(
         "cam_high",
         AI_INFER_ENABLE,
@@ -83,7 +94,8 @@ stream_low = CamStream(
         AI_INFER_TARGET
     ),
     ai_config_path=str(AI_CONFIG_PATH),
-    enable_record=False # 低分辨率流不默认保存
+    enable_record=False, # 低分辨率流不默认保存
+    video_base_dir=VIDEO_BASE_PATH
 )
 
 cam_manager.add_worker(stream_high)
@@ -201,6 +213,67 @@ def index():
     return jsonify({
         "status": "success",
         "message": "API is running"
+    })
+
+
+def _json_safe(value):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_json_safe(item) for item in value]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe(item())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _safe_status(label, status_fn, fallback=None):
+    try:
+        return _json_safe(status_fn()), None
+    except Exception as error:
+        logger.exception("Failed to build runtime status for %s", label)
+        return fallback or {}, {"target": label, "message": str(error)}
+
+
+def _build_runtime_status():
+    camera_status, camera_error = _safe_status("camera", cam_manager.get_status)
+    high_status, high_error = _safe_status("cam_high", stream_high.get_status)
+    low_status, low_error = _safe_status("cam_low", stream_low.get_status)
+
+    status_errors = [
+        error for error in (camera_error, high_error, low_error) if error is not None
+    ]
+
+    return {
+        "paths": {
+            "ai_config": str(AI_CONFIG_PATH),
+            "model_dir": str(MODEL_FILE_PATH),
+            "video_base_dir": str(VIDEO_BASE_PATH),
+        },
+        "camera": camera_status,
+        "streams": [
+            high_status,
+            low_status,
+        ],
+        "status_errors": status_errors,
+    }
+
+
+@app.route("/api/runtime/status", methods=["GET"])
+@app.route("/api/system/status", methods=["GET"])
+def get_runtime_status():
+    return jsonify({
+        "status": "success",
+        "data": _build_runtime_status(),
     })
 
 # =========================================================
@@ -369,7 +442,7 @@ def update_inference_configuration():
             detect_enable = to_bool(model_cfg.get("detect_enable", False))
 
         if "detectionModel" in data:
-            model_cfg["model_name"] = data["detectionModel"]
+            model_cfg["model_name"] = validate_model_name(data["detectionModel"])
 
         if "detectionThreshold" in data:
             model_cfg["conf_thres"] = float(data["detectionThreshold"])
@@ -379,7 +452,7 @@ def update_inference_configuration():
             for roi in model_cfg.get("rois", []):
                 roi["overlap_thres"] = overlap_thres
 
-        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+        write_ai_config(cfg)
 
         changed_streams = sync_infer_enable_from_config(cfg)
 
@@ -458,7 +531,7 @@ def update_detection_regions():
             for index, roi in enumerate(raw_rois)
         ]
 
-        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+        write_ai_config(cfg)
 
         reloaded = sync_infer_enable_from_config(cfg)
 
@@ -501,12 +574,17 @@ def upload_model():
             "message": "缺少必要参数：需要 model_name, engine_file, txt_file"
         }), 400
 
+    try:
+        model_name = validate_model_name(model_name)
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
     # 检查是否有以 .engine 后缀的文件
-    if not engine_file.filename.endswith('.engine'):
+    if not str(engine_file.filename or "").lower().endswith(".engine"):
         return jsonify({"status": "error", "message": "engine_file 必须是 .engine 文件"}), 400
-        
+
     # 检查是否有以 .txt 后缀的文件
-    if not txt_file.filename.endswith('.txt'):
+    if not str(txt_file.filename or "").lower().endswith(".txt"):
         return jsonify({"status": "error", "message": "txt_file 必须是 .txt 文件"}), 400
 
     try:
@@ -526,7 +604,7 @@ def upload_model():
 
         # 3. 确定保存路径并创建文件夹
         # /inference/models/<model_name>/
-        save_dir = MODEL_FILE_PATH / model_name
+        model_name, save_dir = resolve_model_dir(MODEL_FILE_PATH, model_name)
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # 4. 保存并重命名文件
@@ -540,7 +618,7 @@ def upload_model():
         # 5. 更新 AIConfig.yaml 中的 model_names 列表字段
         model_names.append(model_name)
         cfg["model_names"] = model_names
-        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+        write_ai_config(cfg)
 
         return jsonify({
             "status": "success",
@@ -590,9 +668,14 @@ def delete_model():
     """
     data = request.get_json(silent=True) or {}
     model_name = data.get("model_name")
-    
+
     if not model_name:
         return jsonify({"status": "error", "message": "缺少 model_name 参数"}), 400
+
+    try:
+        model_name = validate_model_name(model_name)
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
         
     try:
         cfg = read_yaml(AI_CONFIG_PATH)
@@ -606,10 +689,10 @@ def delete_model():
         # 1. 移除模型配置
         model_names.remove(model_name)
         cfg["model_names"] = model_names
-        write_yaml(cfg, file_path=AI_CONFIG_PATH)
-        
+        write_ai_config(cfg)
+
         # 2. 删除对应的模型文件夹
-        model_dir = MODEL_FILE_PATH / model_name
+        model_name, model_dir = resolve_model_dir(MODEL_FILE_PATH, model_name)
         if model_dir.exists() and model_dir.is_dir():
             shutil.rmtree(str(model_dir))
             
@@ -746,7 +829,7 @@ def update_exception_output_configuration():
             "duration": duration
         }
 
-        write_yaml(cfg, file_path=AI_CONFIG_PATH)
+        write_ai_config(cfg)
 
         # 如果推理流运行中，让它重新读取配置
         reloaded = reload_enabled_streams()
@@ -847,7 +930,7 @@ def handle_record_config():
             record_cfg = cfg.setdefault("record", {})
             record_cfg["duration_min"] = duration_min
             
-            write_yaml(cfg, file_path=AI_CONFIG_PATH)
+            write_ai_config(cfg)
             
             return jsonify({
                 "status": "success",

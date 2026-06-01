@@ -2,6 +2,7 @@ import cv2
 import time
 import threading
 import subprocess
+import logging
 
 
 class CamManager:
@@ -33,38 +34,85 @@ class CamManager:
         self.workers = []
         self._is_running = False
         self._thread = None
+        self._state_lock = threading.RLock()
+        self._workers_lock = threading.RLock()
+        self.logger = logging.getLogger(__name__)
 
         self._exposure_val = 0
         self._exposure_changed = False
         self._need_reopen = False
+        self._reconnect_interval = 1.0
+        self._camera_opened = False
+        self._last_frame_at = 0.0
+        self._last_error = None
+        self._open_fail_count = 0
+        self._read_fail_count = 0
+        self._last_pipeline = None
+
+    def _format_time(self, timestamp):
+        if not timestamp:
+            return None
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(timestamp))
+
+    def _set_status(self, **kwargs):
+        with self._state_lock:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    def get_status(self):
+        with self._workers_lock:
+            worker_count = len(self.workers)
+
+        with self._state_lock:
+            return {
+                "camera_id": self.camera_id,
+                "width": self.width,
+                "height": self.height,
+                "fps": self.fps,
+                "fourcc": self.fourcc,
+                "running": self._is_running,
+                "thread_alive": bool(self._thread and self._thread.is_alive()),
+                "camera_opened": self._camera_opened,
+                "last_frame_at": self._format_time(self._last_frame_at),
+                "last_error": self._last_error,
+                "open_fail_count": self._open_fail_count,
+                "read_fail_count": self._read_fail_count,
+                "need_reopen": self._need_reopen,
+                "exposure_pending": self._exposure_changed,
+                "worker_count": worker_count,
+                "last_pipeline": self._last_pipeline,
+            }
 
     def add_worker(self, worker):
-        self.workers.append(worker)
+        with self._workers_lock:
+            self.workers.append(worker)
 
     def set_resolution(self, width, height):
-        self.width = int(width)
-        self.height = int(height)
-        self._need_reopen = True
-        print(f"[CamManager] 硬件分辨率请求修改为: {width}x{height}")
+        with self._state_lock:
+            self.width = int(width)
+            self.height = int(height)
+            self._need_reopen = True
+        self.logger.info("Camera resolution requested: %sx%s", width, height)
 
     def set_fps(self, fps):
-        self.fps = int(fps)
-        self._need_reopen = True
-        print(f"[CamManager] 硬件帧率请求修改为: {fps}")
+        with self._state_lock:
+            self.fps = int(fps)
+            self._need_reopen = True
+        self.logger.info("Camera FPS requested: %s", fps)
 
     def set_exposure(self, value=0):
         if value < 0:
             return
 
-        self._exposure_val = value
-        self._exposure_changed = True
-        print(
-            f"[CamManager] 硬件曝光模式请求修改为: "
-            f"{'自动' if value == 0 else '手动(' + str(value) + ')'}"
-        )
+        with self._state_lock:
+            self._exposure_val = value
+            self._exposure_changed = True
+        self.logger.info("Camera exposure requested: %s", value)
 
     def _apply_exposure(self):
         dev_path = self.camera_id
+        with self._state_lock:
+            exposure_val = self._exposure_val
 
         if isinstance(dev_path, int) or (
             isinstance(dev_path, str) and dev_path.isdigit()
@@ -72,7 +120,7 @@ class CamManager:
             dev_path = f"/dev/video{dev_path}"
 
         try:
-            if self._exposure_val == 0:
+            if exposure_val == 0:
                 subprocess.run(
                     ["v4l2-ctl", "-d", dev_path, "-c", "auto_exposure=3"],
                     check=True,
@@ -86,10 +134,12 @@ class CamManager:
                     text=True,
                 )
 
-                print(f"[CamManager] 已恢复 {dev_path} 自动曝光模式，尝试应用抗闪烁配置")
+                self.logger.info(
+                    "Camera auto exposure restored for %s", dev_path
+                )
 
             else:
-                exposure_int = int(float(self._exposure_val))
+                exposure_int = int(float(exposure_val))
                 command = f"auto_exposure=1,exposure_time_absolute={exposure_int}"
 
                 subprocess.run(
@@ -99,24 +149,34 @@ class CamManager:
                     text=True,
                 )
 
-                print(f"[CamManager] 已设置 {dev_path} 手动曝光: {exposure_int}")
+                self.logger.info(
+                    "Camera manual exposure set for %s: %s",
+                    dev_path,
+                    exposure_int,
+                )
 
         except FileNotFoundError:
-            print("[CamManager] 致命异常: 未找到 v4l2-ctl 指令。")
+            self.logger.error("v4l2-ctl command not found")
 
         except subprocess.CalledProcessError as e:
             err_msg = e.stderr.strip()
-            print(f"[CamManager] 硬件曝光设置失败。错误码: {e.returncode}")
-            print(f"[CamManager] 驱动底层反馈: {err_msg}")
+            self.logger.error(
+                "Camera exposure command failed: returncode=%s stderr=%s",
+                e.returncode,
+                err_msg,
+            )
 
     def start(self):
-        if self._is_running:
+        if self._is_running and self._thread and self._thread.is_alive():
             return
 
         self._is_running = True
 
         # 先启动 worker，再启动采集线程，避免前几帧直接丢掉
-        for worker in self.workers:
+        with self._workers_lock:
+            workers = list(self.workers)
+
+        for worker in workers:
             worker.start()
 
         self._thread = threading.Thread(
@@ -126,7 +186,7 @@ class CamManager:
         )
         self._thread.start()
 
-        print("[CamManager] 摄像头采集线程已启动...")
+        self.logger.info("Camera capture thread started")
 
     def stop(self):
         self._is_running = False
@@ -135,10 +195,13 @@ class CamManager:
             self._thread.join()
             self._thread = None
 
-        for worker in self.workers:
+        with self._workers_lock:
+            workers = list(self.workers)
+
+        for worker in workers:
             worker.stop()
 
-        print("[Manager] 摄像头采集已停止。")
+        self.logger.info("Camera capture stopped")
 
     def _build_pipeline(self):
         dev_path = self.camera_id
@@ -148,52 +211,106 @@ class CamManager:
         ):
             dev_path = f"/dev/video{dev_path}"
 
+        with self._state_lock:
+            width = self.width
+            height = self.height
+            fps = self.fps
+
         return (
             f"v4l2src device={dev_path} ! "
-            f"image/jpeg, width={self.width}, height={self.height}, framerate={self.fps}/1 ! "
+            f"image/jpeg, width={width}, height={height}, framerate={fps}/1 ! "
             f"jpegdec ! "
             f"videoconvert ! "
             f"video/x-raw, format=BGR ! "
             f"appsink drop=true max-buffers=1 sync=false"
         )
 
-    def _capture_task(self):
-        cap = cv2.VideoCapture(self._build_pipeline(), cv2.CAP_GSTREAMER)
+    def _open_capture(self):
+        pipeline = self._build_pipeline()
+        self._set_status(_last_pipeline=pipeline)
 
-        if not cap.isOpened():
-            raise RuntimeError("[CamManager] 摄像头抓帧启动失败")
-
-        while self._is_running:
-            if self._need_reopen:
-                print(
-                    f"[CamManager] 正在以 "
-                    f"{self.width}x{self.height}@{self.fps}FPS "
-                    f"重启硬件采集流..."
-                )
-
-                cap.release()
-                cap = cv2.VideoCapture(self._build_pipeline(), cv2.CAP_GSTREAMER)
-                self._need_reopen = False
-                self._exposure_changed = True
-
-                if not cap.isOpened():
-                    print("[Manager] 重启摄像头流失败！将重试...")
-                    time.sleep(1.0)
-                    continue
-
-            if self._exposure_changed:
-                self._apply_exposure()
-                self._exposure_changed = False
-
-            ret, frame = cap.read()
-
-            if not ret or frame is None:
-                print("[Manager] 无法从 GStreamer 管道读取画面！")
-                time.sleep(1.0)
-                continue
-
-            for worker in self.workers:
-                worker.put_frame(frame)
+        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            self._set_status(_camera_opened=True, _last_error=None)
+            self.logger.info("Camera capture opened")
+            return cap
 
         cap.release()
-        print("[CamManager] 采集线程安全退出")
+        with self._state_lock:
+            self._camera_opened = False
+            self._open_fail_count += 1
+            self._last_error = "camera open failed"
+
+        self.logger.warning("Camera open failed; will retry")
+        return None
+
+    def _consume_reopen_flag(self):
+        with self._state_lock:
+            need_reopen = self._need_reopen
+            if need_reopen:
+                self._need_reopen = False
+                self._exposure_changed = True
+            return need_reopen
+
+    def _consume_exposure_flag(self):
+        with self._state_lock:
+            exposure_changed = self._exposure_changed
+            if exposure_changed:
+                self._exposure_changed = False
+            return exposure_changed
+
+    def _capture_task(self):
+        cap = None
+
+        try:
+            while self._is_running:
+                if cap is None or not cap.isOpened():
+                    cap = self._open_capture()
+                    if cap is None:
+                        time.sleep(self._reconnect_interval)
+                        continue
+
+                if self._consume_reopen_flag():
+                    self.logger.info(
+                        "Restarting camera capture: %sx%s@%s",
+                        self.width,
+                        self.height,
+                        self.fps,
+                    )
+                    cap.release()
+                    cap = None
+                    continue
+
+                if self._consume_exposure_flag():
+                    self._apply_exposure()
+
+                ret, frame = cap.read()
+
+                if not ret or frame is None:
+                    with self._state_lock:
+                        self._camera_opened = False
+                        self._read_fail_count += 1
+                        self._last_error = "camera read failed"
+                    self.logger.warning("Camera read failed; reopening")
+                    cap.release()
+                    cap = None
+                    time.sleep(self._reconnect_interval)
+                    continue
+
+                self._set_status(
+                    _camera_opened=True,
+                    _last_frame_at=time.time(),
+                    _last_error=None,
+                )
+
+                with self._workers_lock:
+                    workers = list(self.workers)
+
+                for worker in workers:
+                    worker.put_frame(frame)
+
+        finally:
+            if cap is not None:
+                cap.release()
+            self._set_status(_camera_opened=False)
+            self.logger.info("Camera capture thread exited")

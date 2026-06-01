@@ -13,7 +13,8 @@ import cv2
 import numpy as np
 import yaml
 
-from .runtime import CameraTensorRTInfer
+from .runtime import CameraTensorRTInfer, FrameResult
+from .vision_tasks import normalize_vision_pipeline
 
 try:
     import Jetson.GPIO as GPIO
@@ -41,6 +42,8 @@ class Model:
         self.jpeg_quality = 95
         self.infer_runtime: CameraTensorRTInfer | None = None
         self.lock = threading.RLock()
+        self.result_lock = threading.RLock()
+        self.render_lock = threading.Lock()
 
         self.alarm_gpios: List[int] = []
         self.alarm_level = 1
@@ -51,6 +54,9 @@ class Model:
         self.alarm_led_on = False
         self.last_alarm_flag = False
         self.last_detection_flag = False
+        self.last_frame_result = None
+        self.last_frame_result_at = 0.0
+        self.last_task_results: List[Dict[str, Any]] = []
 
         self._load_config_and_prepare_runtime()
         self._init_alarm_gpio()
@@ -68,8 +74,27 @@ class Model:
             infer_result = self.infer_runtime.infer(frame)
             self.last_alarm_flag = bool(infer_result.alarm)
             self.last_detection_flag = getattr(infer_result, "has_target", self.last_alarm_flag)
+            with self.result_lock:
+                self.last_frame_result = getattr(infer_result, "frame_result", None)
+                self.last_frame_result_at = time.time()
+            self.last_task_results = getattr(infer_result, "task_results", [])
             self._handle_alarm_gpio(self.last_alarm_flag)
             return infer_result.image
+
+    def try_render_latest(self, frame: np.ndarray, max_age_sec: float = 1.0) -> np.ndarray | None:
+        with self.result_lock:
+            runtime = self.infer_runtime
+            frame_result = self.last_frame_result
+            result_age = time.time() - self.last_frame_result_at if self.last_frame_result_at else None
+
+        if runtime is None:
+            return None
+
+        if frame_result is None or (max_age_sec > 0 and result_age is not None and result_age > max_age_sec):
+            frame_result = FrameResult(detections=[], zone_summary=[])
+
+        with self.render_lock:
+            return runtime.render_result(frame, frame_result)
 
     def reload_config(self) -> None:
         with self.lock:
@@ -167,6 +192,9 @@ class Model:
         enter_frames = int(model_cfg.get("enter_frames", alarm_cfg.get("enter_frames", 3)))
         exit_frames = int(model_cfg.get("exit_frames", alarm_cfg.get("exit_frames", 5)))
         rois = self._get_rois_from_config(model_cfg)
+        vision_pipeline = normalize_vision_pipeline(
+            model_cfg.get("vision_pipeline", self.cfg.get("vision_pipeline", {}))
+        )
 
         return {
             "version": str(model_cfg.get("version", "1.0")),
@@ -179,6 +207,7 @@ class Model:
             "imgsz": imgsz,
             "device": model_cfg.get("device", "cuda"),
             "person_class_ids": model_cfg.get("person_class_ids", [0]),
+            "person_class_names": model_cfg.get("person_class_names", ["person"]),
             "thresholds": {"conf_thres": conf_thres, "iou_thres": iou_thres},
             "conf_thres": conf_thres,
             "iou_thres": iou_thres,
@@ -186,11 +215,12 @@ class Model:
             "enter_frames": enter_frames,
             "exit_frames": exit_frames,
             "rois": rois,
+            "vision_pipeline": vision_pipeline,
         }
 
     def _get_rois_from_config(self, model_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         rois = model_cfg.get("rois", self.cfg.get("rois"))
-        if rois:
+        if rois is not None:
             self._validate_rois(rois)
             return rois
 
@@ -204,14 +234,12 @@ class Model:
                     self._validate_rois(rois)
                     return rois
 
-        raise ValueError("没有找到 ROI 配置。请在 AIConfig.yaml 中配置 model.rois，或者提供旧版 roi_config_path。")
+        return []
 
     @staticmethod
     def _validate_rois(rois: Any) -> None:
         if not isinstance(rois, list):
             raise TypeError("rois 必须是 list")
-        if not rois:
-            raise ValueError("rois 不能为空")
         required_keys = ["roi_id", "name", "enabled", "roi_type", "judge_method", "coordinate_mode", "polygon"]
         for idx, roi in enumerate(rois):
             if not isinstance(roi, dict):

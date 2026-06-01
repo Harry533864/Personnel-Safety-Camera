@@ -279,10 +279,11 @@ function toBackendRoi(region) {
     name: `ROI${region.id}`,
     enabled: true,
     roi_type: "forbidden_zone",
-    judge_method: "foot_point",
+    judge_method: "overlap",
     coordinate_mode: "normalized",
     polygon: rectToPolygon(region.rect),
     overlap_thres: getOverlapThreshold(),
+    target: selectedTarget.value,
   };
 }
 
@@ -325,6 +326,9 @@ function openAlert(message) {
 
 function openConfirmClear() {
   if (!committedRegions.value.length || isSaving.value) {
+    if (!isSaving.value) {
+      openAlert("当前没有可清除的正式检测区域");
+    }
     return;
   }
 
@@ -440,13 +444,10 @@ function drawBackground(ctx) {
     return;
   }
 
-  const gradient = ctx.createLinearGradient(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-  gradient.addColorStop(0, "#0f172a");
-  gradient.addColorStop(1, "#1e293b");
-  ctx.fillStyle = gradient;
+  ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-  ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
+  ctx.strokeStyle = "rgba(143, 17, 23, 0.12)";
   ctx.lineWidth = 1;
   for (let x = 0; x <= CANVAS_WIDTH; x += 48) {
     ctx.beginPath();
@@ -461,16 +462,16 @@ function drawBackground(ctx) {
     ctx.stroke();
   }
 
-  ctx.fillStyle = "rgba(255, 255, 255, 0.06)";
+  ctx.fillStyle = "rgba(193, 18, 31, 0.035)";
   ctx.fillRect(80, 60, 180, 96);
   ctx.fillRect(690, 110, 140, 120);
   ctx.fillRect(320, 320, 220, 110);
 
-  ctx.fillStyle = "#e2e8f0";
+  ctx.fillStyle = "#1f2933";
   ctx.font = "600 20px Arial";
   ctx.fillText("Current Video Frame", 28, 36);
   ctx.font = "14px Arial";
-  ctx.fillStyle = "rgba(226, 232, 240, 0.8)";
+  ctx.fillStyle = "#6b7280";
   ctx.fillText(frameError.value || "当前视频帧加载中，拖拽鼠标绘制检测区域", 28, 62);
 }
 
@@ -607,6 +608,11 @@ function finishDraw(event) {
 function cancelCurrentBoxes() {
   if (isSaving.value) return;
 
+  if (!candidateRegions.value.length && !draftRect.value) {
+    openAlert("当前没有正在绘制或暂存的候选区域");
+    return;
+  }
+
   candidateRegions.value = [];
   draftRect.value = null;
   isDrawing.value = false;
@@ -615,6 +621,9 @@ function cancelCurrentBoxes() {
 
 async function addDetectionRegions() {
   if (!candidateRegions.value.length || isSaving.value) {
+    if (!isSaving.value) {
+      openAlert("请先在画面上拖出一个新的候选区域");
+    }
     return;
   }
 
@@ -659,6 +668,7 @@ async function addDetectionRegions() {
 async function confirmClearAll() {
   if (isSaving.value) return;
 
+  closeModal();
   isSaving.value = true;
   try {
     const success = await detectionRegionStore.clearRegions({
@@ -676,7 +686,6 @@ async function confirmClearAll() {
     candidateRegions.value = [];
     draftRect.value = null;
     successFeedback.value = "已清除所有检测区域";
-    closeModal();
     redrawCanvas();
   } finally {
     isSaving.value = false;
@@ -828,7 +837,9 @@ onUnmounted(() => {
   position: relative;
   overflow: hidden;
   border-radius: 12px;
-  background: #0f172a;
+  background: #ffffff;
+  border: 1px solid var(--industrial-border);
+  box-shadow: var(--industrial-shadow);
 }
 
 .frame-video {
@@ -1054,6 +1065,278 @@ button:disabled {
   .secondary-btn,
   .danger-btn {
     width: 100%;
+  }
+}
+</style>
+
+<style scoped>
+.settings-page {
+  min-height: calc(100vh - var(--topbar-height));
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 18px;
+  background: transparent;
+}
+
+.detection-region-container,
+.settings-container {
+  width: min(1220px, 100%);
+  overflow: hidden;
+  background: var(--industrial-surface);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius);
+  box-shadow: var(--industrial-shadow);
+}
+
+.settings-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px 16px 24px;
+  border-bottom: 1px solid var(--industrial-border);
+}
+
+.settings-header::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 3px;
+  border-radius: 0 999px 999px 0;
+  background: var(--industrial-red);
+}
+
+.settings-title {
+  margin: 0;
+  color: var(--industrial-text);
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.settings-subtitle {
+  margin: 6px 0 0;
+  color: var(--industrial-muted);
+  font-size: 12px;
+}
+
+.close-btn {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+}
+
+.close-btn:hover:not(:disabled) {
+  color: var(--industrial-red-dark);
+  background: var(--industrial-red-soft);
+  border-color: rgba(185, 28, 28, 0.24);
+}
+
+.detection-region-layout,
+.settings-form {
+  padding: 18px;
+  gap: 16px;
+  background: #fbfcfd;
+}
+
+.canvas-panel,
+.region-side-panel,
+.panel-card,
+.region-list-panel,
+.info-card,
+.region-card,
+.roi-card,
+.empty-panel,
+.panel-toolbar,
+.tips-box {
+  background: var(--industrial-surface);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius);
+  box-shadow: var(--industrial-shadow);
+}
+
+.canvas-panel {
+  overflow: hidden;
+}
+
+.panel-toolbar {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  color: var(--industrial-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbar-label {
+  color: var(--industrial-faint);
+  font-size: 12px;
+}
+
+.target-select,
+.form-select,
+.form-input,
+.number-input {
+  min-height: 34px;
+  padding: 0 10px;
+  color: var(--industrial-text);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+}
+
+.canvas-wrapper,
+.video-wrapper,
+.draw-area {
+  background:
+    linear-gradient(90deg, rgba(143, 17, 23, 0.055) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(31, 41, 51, 0.045) 1px, transparent 1px),
+    #ffffff;
+  background-size: 32px 32px;
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius);
+  overflow: hidden;
+}
+
+.video-placeholder,
+.canvas-placeholder {
+  color: var(--industrial-muted);
+  background: #ffffff;
+}
+
+.region-side-panel {
+  padding: 14px;
+}
+
+.panel-title,
+.region-list-title,
+.roi-title,
+.card-title {
+  color: var(--industrial-text);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.panel-title::before,
+.region-list-title::before,
+.card-title::before {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 14px;
+  margin-right: 8px;
+  border-radius: 999px;
+  vertical-align: -2px;
+  background: var(--industrial-red);
+}
+
+.roi-card {
+  padding: 12px;
+  transition:
+    border-color var(--motion-normal),
+    background-color var(--motion-normal),
+    box-shadow var(--motion-normal);
+}
+
+.roi-card:hover {
+  border-color: rgba(185, 28, 28, 0.24);
+  box-shadow: var(--industrial-shadow-hover);
+}
+
+.roi-card.active,
+.selected,
+.active {
+  border-color: rgba(185, 28, 28, 0.36);
+  background: var(--industrial-red-soft);
+}
+
+.action-btn,
+.mini-btn,
+.toolbar-btn,
+.clear-btn,
+.confirm-btn,
+.secondary-btn {
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: var(--industrial-radius-sm);
+  border: 1px solid var(--industrial-border);
+  background: var(--industrial-surface-subtle);
+  color: var(--industrial-muted);
+}
+
+.action-btn:hover:not(:disabled),
+.mini-btn:hover:not(:disabled),
+.toolbar-btn:hover:not(:disabled),
+.secondary-btn:hover:not(:disabled) {
+  color: var(--industrial-red-dark);
+  background: var(--industrial-red-soft);
+  border-color: rgba(185, 28, 28, 0.24);
+}
+
+.confirm-btn,
+.primary-btn {
+  color: #ffffff;
+  background: var(--industrial-red);
+  border-color: var(--industrial-red);
+  font-weight: 800;
+}
+
+.confirm-btn:hover:not(:disabled),
+.primary-btn:hover:not(:disabled) {
+  background: var(--industrial-red-dark);
+  border-color: var(--industrial-red-dark);
+}
+
+.clear-btn,
+.danger,
+.danger-btn {
+  color: var(--industrial-danger);
+  background: var(--industrial-danger-soft);
+  border-color: rgba(197, 48, 48, 0.28);
+}
+
+.settings-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 20px 22px;
+  border-top: 1px solid var(--industrial-border);
+  background: #fbfcfd;
+}
+
+.tips-box,
+.empty-panel {
+  color: var(--industrial-muted);
+}
+
+@media (max-width: 980px) {
+  .settings-page {
+    padding: 12px;
+  }
+
+  .detection-region-layout,
+  .settings-form {
+    flex-direction: column;
   }
 }
 </style>

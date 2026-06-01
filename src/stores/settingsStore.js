@@ -1,11 +1,24 @@
 import { defineStore } from 'pinia'
 
 // 从环境变量中获取后端路由ip
-const API_URL = import.meta.env.VITE_FLASK_BACKEND_URL;
+const JETSON_ENDPOINT_STORAGE_KEY = 'jetson_runtime_endpoint'
+
+const getApiUrl = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(JETSON_ENDPOINT_STORAGE_KEY) || 'null')
+    if (saved?.api && new URL(saved.api).hostname === '10.10.10.2') return saved.api
+  } catch {
+    // Ignore malformed localStorage data and use the configured fallback.
+  }
+
+  return import.meta.env.VITE_FLASK_BACKEND_URL
+}
 
 export function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+const formatApiError = (err) => err?.message || '请求失败'
 
 // ========== 持久化工具函数 ==========
 const STORAGE_KEY_CAMERA = 'camera_settings'
@@ -82,7 +95,7 @@ const clearStorage = () => {
 const CAMERA_DEFAULTS = {
   resolution: '1920x1080',
   exposure: '0',
-  fps: '15',
+  fps: '60',
   target: 'high',
 }
 
@@ -104,7 +117,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
         if (settings.exposure !== this.settings.exposure) {
           console.log("设置曝光...")
           try {
-            const response = await fetch(`${API_URL}/api/stream/exposure`, {
+            const response = await fetch(`${getApiUrl()}/api/stream/exposure`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -131,7 +144,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
           console.log("设置分辨率...")
           try {
             const [width, height] = settings.resolution.split('x').map(Number)
-            const response = await fetch(`${API_URL}/api/stream/resolution`, {
+            const response = await fetch(`${getApiUrl()}/api/stream/resolution`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -158,7 +171,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
         if (settings.fps !== this.settings.fps) {
           console.log("设置帧率...")
           try {
-            const response = await fetch(`${API_URL}/api/stream/fps`, {
+            const response = await fetch(`${getApiUrl()}/api/stream/fps`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -236,7 +249,7 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
   actions: {
     async saveSettings(settings) {
       try {
-        const response = await fetch(`${API_URL}/api/detection/detect`, {
+        const response = await fetch(`${getApiUrl()}/api/detection/detect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -245,11 +258,11 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
           }),
         })
 
+        const data = await response.json()
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
+          throw new Error(data.message || `HTTP ${response.status}`)
         }
 
-        const data = await response.json()
         if (data.status === 'success') {
           this.settings = { ...settings }
           saveToStorage(STORAGE_KEY_DETECTION, this.settings)
@@ -292,7 +305,7 @@ export const useModelManagementStore = defineStore('modelManagement', {
   actions: {
     async fetchModels() {
       try {
-        const response = await fetch(`${API_URL}/api/models/list`, {
+        const response = await fetch(`${getApiUrl()}/api/models/list`, {
           method: 'GET',
           headers: { Accept: 'application/json' },
         })
@@ -355,7 +368,7 @@ export const useModelManagementStore = defineStore('modelManagement', {
             reject(new Error('上传已取消'))
           })
 
-          xhr.open('POST', `${API_URL}/api/models/upload`)
+          xhr.open('POST', `${getApiUrl()}/api/models/upload`)
           xhr.send(formData)
         })
 
@@ -376,7 +389,7 @@ export const useModelManagementStore = defineStore('modelManagement', {
       if (!confirm(`确定要删除模型 ${modelName} 吗？`)) return { success: false, message: '已取消删除' };
       
       try {
-        const response = await fetch(`${API_URL}/api/models/delete`, {
+        const response = await fetch(`${getApiUrl()}/api/models/delete`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ model_name: modelName }),
@@ -437,17 +450,17 @@ export const useExceptionOutputStore = defineStore('exceptionOutput', {
       }
 
       try {
-        const response = await fetch(`${API_URL}/api/detection/exception_output`, {
+        const response = await fetch(`${getApiUrl()}/api/detection/exception_output`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         })
 
+        const data = await response.json()
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
+          throw new Error(data.message || `HTTP ${response.status}`)
         }
 
-        const data = await response.json()
         if (data.status === 'success') {
           this.settings = { ...settings }
           saveToStorage(STORAGE_KEY_EXCEPTION_OUTPUT, this.settings)
@@ -505,7 +518,7 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
   actions: {
     async fetchRegions() {
       try {
-        const response = await fetch(`${API_URL}/api/detection/fetch_regions`, {
+        const response = await fetch(`${getApiUrl()}/api/detection/fetch_regions`, {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
         })
@@ -547,7 +560,7 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
       const clear = Boolean(options.clear)
 
       try {
-        const response = await fetch(`${API_URL}/api/detection/save_regions`, {
+        const response = await fetch(`${getApiUrl()}/api/detection/save_regions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -557,11 +570,11 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
           }),
         })
 
+        const data = await response.json()
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
+          throw new Error(data.message || `HTTP ${response.status}`)
         }
 
-        const data = await response.json()
         if (data.status === 'success') {
           this.data.currentTarget = target
           this.data.byTarget[target] = clear ? [] : cloneValue(rois)
@@ -596,6 +609,72 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
     },
     clearResult() {
       this.lastSaveResult = { unset: true }
+    },
+  },
+})
+
+export const useRuntimeStatusStore = defineStore('runtimeStatus', {
+  state: () => ({
+    data: null,
+    loading: false,
+    error: '',
+    lastUpdated: null,
+  }),
+  getters: {
+    backendOnline: (state) => Boolean(state.data && !state.error),
+    cameraOnline: (state) => Boolean(state.data?.camera?.camera_opened),
+    streamList: (state) => Array.isArray(state.data?.streams) ? state.data.streams : [],
+    modelLoaded() {
+      return this.streamList.some((stream) => stream.model_loaded)
+    },
+    writerOnline() {
+      return this.streamList.some((stream) => stream.writer_opened)
+    },
+    statusClass() {
+      if (this.error) return 'danger'
+      if (!this.data) return 'warning'
+      if (!this.cameraOnline) return 'warning'
+      return 'success'
+    },
+    statusText() {
+      if (this.error) return '后端离线'
+      if (!this.data) return this.loading ? '连接中' : '未连接'
+      if (!this.cameraOnline) return '等待相机'
+      if (!this.writerOnline) return '推流待恢复'
+      return '后端已连接'
+    },
+    backendHost() {
+      try {
+        return new URL(getApiUrl()).host
+      } catch {
+        return getApiUrl() || '未配置'
+      }
+    },
+  },
+  actions: {
+    async fetchStatus() {
+      this.loading = true
+      try {
+        const response = await fetch(`${getApiUrl()}/api/runtime/status`, {
+          method: 'GET',
+          cache: 'no-store',
+        })
+
+        const payload = await response.json().catch(() => ({}))
+        if (!response.ok || payload.status !== 'success') {
+          throw new Error(payload.message || `HTTP ${response.status}`)
+        }
+
+        this.data = payload.data || null
+        this.error = ''
+        this.lastUpdated = new Date().toISOString()
+        return this.data
+      } catch (error) {
+        this.error = formatApiError(error)
+        return null
+      } finally {
+        this.loading = false
+      }
     },
   },
 })

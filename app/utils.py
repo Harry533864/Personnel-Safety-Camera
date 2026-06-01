@@ -1,6 +1,10 @@
 import os
+import logging
 from pathlib import Path
 from ruamel.yaml import YAML
+
+
+logger = logging.getLogger(__name__)
 
 
 def read_yaml(file_path=None):
@@ -52,7 +56,10 @@ def read_ai_startup_state(ai_config_path):
     try:
         cfg = read_yaml(ai_config_path)
     except FileNotFoundError:
-        print(f"[Startup] 配置文件不存在: {ai_config_path}, 默认关闭 AI 推理")
+        logger.warning(
+            "AI config missing at %s; startup inference disabled",
+            ai_config_path,
+        )
         return False, "high"
 
     model_cfg = cfg.get("model", {})
@@ -61,10 +68,10 @@ def read_ai_startup_state(ai_config_path):
     target = str(model_cfg.get("infer_target", "high")).lower()
 
     if target not in ["high", "low", "all"]:
-        print(f"[Startup] infer_target={target} 非法，默认使用 high")
+        logger.warning("Invalid infer_target=%s; using high", target)
         target = "high"
 
-    print(f"[Startup] AI 推理配置: detect_enable={enable}, infer_target={target}")
+    logger.info("AI startup config: detect_enable=%s infer_target=%s", enable, target)
 
     return enable, target
 
@@ -155,5 +162,5 @@ def read_record_config(ai_config_path):
             duration_min = 10.0
         return duration_min
     except Exception:
-        print(f"[Record] 读取录制配置失败，使用默认值: 10 分钟")
+        logger.exception("Failed to read record config; using 10 minutes")
         return 10.0

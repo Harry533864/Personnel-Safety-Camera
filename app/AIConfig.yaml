@@ -26,15 +26,15 @@ model:
     judge_method: overlap
     coordinate_mode: normalized
     polygon:
-    - - 0.3071
-      - 0.3524
-    - - 0.7048
-      - 0.3524
-    - - 0.7048
-      - 0.9769
-    - - 0.3071
-      - 0.9769
-    overlap_thres: 0.5
+    - - 0.5661
+      - 0.2039
+    - - 0.9438
+      - 0.2039
+    - - 0.9438
+      - 0.8198
+    - - 0.5661
+      - 0.8198
+    overlap_thres: 0.01
     target: all
 test:
   hot_reload: true
@@ -43,14 +43,11 @@ test:
   show: false
   save_path: ../outputs/python_tensorrt_result.jpg
 model_names:
-- yolo11
-- yolo11_test
-- yolo11_person
 - Asva_person_v0518
 exception_output:
   gpio:
-  - 29
+  - 7
   output_level: 1
-  duration: 2
+  duration: 0
 record:
-  duration_min: 1
+  duration_min: 1.0

@@ -1,35 +1,46 @@
 <script setup>
-import { RouterView } from 'vue-router'
+import { RouterView } from "vue-router";
 import AppHeader from "@/components/AppHeader.vue";
-import AppFooter from "@/components/AppFooter.vue";
 </script>
 
 <template>
-  <div class="app-wrapper">
+  <div class="app-shell">
     <AppHeader />
 
     <main class="main-content">
       <RouterView />
     </main>
-    
-    <!-- <AppFooter /> -->
   </div>
 </template>
 
 <style>
-.app-wrapper {
+.app-shell {
   min-height: 100vh;
-  display: flex;
-  flex-direction: column;
+  background: var(--industrial-bg);
 }
 
 .main-content {
-  flex: 1;
-  padding-top: 56px; /* Height of navbar */
+  position: relative;
+  z-index: 1;
+  width: auto;
+  max-width: none;
+  min-height: 100vh;
+  min-width: 0;
+  margin-left: var(--sidebar-width, 216px);
+  padding: calc(var(--topbar-height, 56px) + 16px) 16px 32px;
+  overflow-x: hidden;
 }
 
-/* Override footer margin for monitor page */
-:deep(footer) {
-  margin-top: 0 !important;
+@media (max-width: 900px) {
+  .main-content {
+    margin-left: 72px;
+  }
+}
+
+@media (max-width: 640px) {
+  .main-content {
+    margin-left: 0;
+    padding: 120px 10px 24px;
+  }
 }
 </style>

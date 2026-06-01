@@ -38,6 +38,15 @@
         </div>
 
         <div class="toolbar-actions">
+          <label class="checkbox-pill select-all-pill" :class="{ mixed: isPartiallyVisibleSelected }">
+            <input
+              :checked="areAllVisibleVideosSelected"
+              :disabled="filteredVideos.length === 0"
+              type="checkbox"
+              @change="toggleVisibleSelection"
+            />
+            <span>{{ areAllVisibleVideosSelected ? "取消全选" : "全选" }}</span>
+          </label>
           <label class="checkbox-pill">
             <input v-model="showAllVideos" type="checkbox" />
             <span>全部视频</span>
@@ -258,11 +267,11 @@ function createDateOptions() {
   });
 }
 
-const dateOptions = createDateOptions();
-const activeDate = ref(dateOptions[0].key);
-const selectedDate = ref(dateOptions[0].key);
+const dateOptions = ref(createDateOptions());
+const activeDate = ref(dateOptions.value[0].key);
+const selectedDate = ref(dateOptions.value[0].key);
 const searchKeyword = ref("");
-const showAllVideos = ref(false);
+const showAllVideos = ref(true);
 const selectedIds = ref([]);
 const activeVideo = ref(null);
 const showDetectionResult = ref(true);
@@ -291,6 +300,45 @@ function formatDurationLabel(totalSeconds) {
 
 function formatDateKey(date) {
   return `${date.getFullYear()}-${padNumber(date.getMonth() + 1)}-${padNumber(date.getDate())}`;
+}
+
+function buildDateOption(dateKey) {
+  const date = new Date(`${dateKey}T00:00:00`);
+  if (Number.isNaN(date.getTime())) {
+    return {
+      key: dateKey,
+      label: dateKey,
+      displayDate: dateKey,
+    };
+  }
+
+  const displayDate = `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
+  return {
+    key: dateKey,
+    label: displayDate,
+    displayDate,
+  };
+}
+
+function syncDateOptionsFromVideos(nextVideos) {
+  const recordDateKeys = [...new Set(
+    nextVideos
+      .map((video) => video.dateKey)
+      .filter(Boolean)
+  )].sort((a, b) => b.localeCompare(a));
+
+  if (!recordDateKeys.length) {
+    dateOptions.value = createDateOptions();
+    return;
+  }
+
+  dateOptions.value = recordDateKeys.map(buildDateOption);
+
+  const activeHasRecords = nextVideos.some((video) => video.dateKey === activeDate.value);
+  if (!activeHasRecords) {
+    activeDate.value = recordDateKeys[0];
+    selectedDate.value = recordDateKeys[0];
+  }
 }
 
 function buildAbsoluteApiUrl(path) {
@@ -390,7 +438,7 @@ function createMockVideos() {
   ];
 
   let id = 1;
-  return dateOptions.flatMap((option, index) =>
+  return dateOptions.value.flatMap((option, index) =>
     (slicePlan[index] || []).map(([startTimeText, hasTarget]) =>
       createSliceVideo(id++, option, startTimeText, hasTarget)
     )
@@ -412,9 +460,30 @@ const filteredVideos = computed(() => {
   });
 });
 
+const visibleVideoIds = computed(() => filteredVideos.value.map((video) => video.id));
+
+const areAllVisibleVideosSelected = computed(() => {
+  return visibleVideoIds.value.length > 0
+    && visibleVideoIds.value.every((id) => selectedIds.value.includes(id));
+});
+
+const isPartiallyVisibleSelected = computed(() => {
+  return !areAllVisibleVideosSelected.value
+    && visibleVideoIds.value.some((id) => selectedIds.value.includes(id));
+});
+
 const emptyStateMessage = computed(() => {
   if (recordListLoading.value) return "视频列表加载中...";
   if (recordListError.value) return recordListError.value;
+  if (videos.value.length) {
+    const availableDates = dateOptions.value
+      .slice(0, 4)
+      .map((item) => item.label)
+      .join("、");
+    return availableDates
+      ? `当前筛选条件下暂无视频。已有录像日期：${availableDates}`
+      : "当前筛选条件下暂无视频";
+  }
   return "当前筛选条件下暂无视频";
 });
 
@@ -516,13 +585,12 @@ const saveRecordSettings = async () => {
   }
 };
 
-const fetchRecordList = async (dateKey = activeDate.value) => {
+const fetchRecordList = async () => {
   recordListLoading.value = true;
   recordListError.value = "";
 
   try {
     const params = new URLSearchParams({
-      date: dateKey,
       target: currentRecordTarget.value,
     });
     const response = await fetch(`${API_URL}/api/record/list?${params.toString()}`, {
@@ -535,10 +603,18 @@ const fetchRecordList = async (dateKey = activeDate.value) => {
       throw new Error(data.message || `HTTP ${response.status}`);
     }
 
-    videos.value = Array.isArray(data.data) ? data.data.map(mapRecordItem) : [];
+    const nextVideos = Array.isArray(data.data)
+      ? data.data
+          .map(mapRecordItem)
+          .filter((video) => Number.parseFloat(video.sizeText) > 0)
+      : [];
+
+    videos.value = nextVideos;
+    syncDateOptionsFromVideos(nextVideos);
     selectedIds.value = selectedIds.value.filter((id) => videos.value.some((video) => video.id === id));
   } catch (error) {
     videos.value = createMockVideos();
+    syncDateOptionsFromVideos(videos.value);
     recordListError.value = `读取后端视频列表失败，当前展示本地模拟数据：${error.message}`;
   } finally {
     recordListLoading.value = false;
@@ -551,6 +627,19 @@ const toggleSelection = (id) => {
   } else {
     selectedIds.value = [...selectedIds.value, id];
   }
+};
+
+const toggleVisibleSelection = () => {
+  const visibleIds = visibleVideoIds.value;
+  if (!visibleIds.length) return;
+
+  if (areAllVisibleVideosSelected.value) {
+    const visibleIdSet = new Set(visibleIds);
+    selectedIds.value = selectedIds.value.filter((id) => !visibleIdSet.has(id));
+    return;
+  }
+
+  selectedIds.value = [...new Set([...selectedIds.value, ...visibleIds])];
 };
 
 const deleteSelectedVideos = () => {
@@ -626,12 +715,20 @@ const handleVideoError = () => {
   videoPlaybackError.value = true;
 };
 
-watch(activeDate, async (dateKey) => {
-  await fetchRecordList(dateKey);
+watch(activeDate, () => {
+  selectedIds.value = selectedIds.value.filter((id) =>
+    filteredVideos.value.some((video) => video.id === id)
+  );
+});
+
+watch(filteredVideos, () => {
+  selectedIds.value = selectedIds.value.filter((id) =>
+    filteredVideos.value.some((video) => video.id === id)
+  );
 });
 
 onMounted(async () => {
-  await Promise.allSettled([fetchRecordConfig(), fetchRecordList(activeDate.value)]);
+  await Promise.allSettled([fetchRecordConfig(), fetchRecordList()]);
 });
 </script>
 
@@ -803,6 +900,19 @@ onMounted(async () => {
 
 .checkbox-pill span {
   white-space: nowrap;
+}
+
+.select-all-pill {
+  min-width: 116px;
+}
+
+.select-all-pill.mixed {
+  border-color: rgba(47, 129, 247, 0.48);
+  color: #79c0ff;
+}
+
+.checkbox-pill input:disabled + span {
+  color: #6e7681;
 }
 
 .toolbar-btn {
@@ -1315,6 +1425,273 @@ onMounted(async () => {
 
   .video-modal-panel {
     padding: 16px;
+  }
+}
+</style>
+
+<style scoped>
+.video-page {
+  min-height: calc(100vh - var(--topbar-height));
+  padding: 16px 16px 24px;
+  color: var(--industrial-text);
+  background: transparent;
+}
+
+.operation-bar,
+.video-toolbar,
+.video-card,
+.empty-state,
+.video-modal-panel,
+.settings-panel {
+  background: var(--industrial-surface);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius);
+  box-shadow: var(--industrial-shadow);
+}
+
+.operation-bar {
+  position: relative;
+  min-height: 58px;
+  padding: 10px 14px 10px 18px;
+  margin-bottom: 14px;
+}
+
+.operation-bar::before,
+.video-toolbar::before,
+.settings-panel-header::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 12px;
+  bottom: 12px;
+  width: 3px;
+  border-radius: 0 999px 999px 0;
+  background: var(--industrial-red);
+}
+
+.page-title {
+  color: var(--industrial-text);
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.page-title::after {
+  content: "录像检索与回放";
+  display: block;
+  margin-top: 2px;
+  color: var(--industrial-faint);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.video-page-intro {
+  padding: 0;
+}
+
+.video-page-subtitle {
+  margin: 0 0 14px;
+  color: var(--industrial-muted);
+  font-size: 13px;
+}
+
+.operation-btn,
+.date-tab,
+.toolbar-btn,
+.calendar-btn,
+.modal-close,
+.settings-close,
+.settings-btn,
+.result-toggle {
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+  box-shadow: var(--industrial-shadow);
+}
+
+.operation-btn:hover,
+.date-tab:hover,
+.toolbar-btn:hover,
+.calendar-btn:hover,
+.modal-close:hover,
+.settings-close:hover,
+.settings-btn.secondary:hover,
+.result-toggle:hover {
+  color: var(--industrial-red-dark);
+  background: var(--industrial-red-soft);
+  border-color: rgba(185, 28, 28, 0.24);
+  box-shadow: var(--industrial-shadow-hover);
+}
+
+.date-tab.active,
+.settings-btn.primary,
+.result-toggle.on {
+  color: #ffffff;
+  background: var(--industrial-red);
+  border-color: var(--industrial-red);
+}
+
+.toolbar-btn.danger {
+  color: var(--industrial-danger);
+  background: var(--industrial-danger-soft);
+  border-color: rgba(197, 48, 48, 0.26);
+}
+
+.video-toolbar {
+  position: relative;
+  margin: 0 0 18px;
+  padding: 16px;
+}
+
+.search-box,
+.settings-input {
+  height: 36px;
+  color: var(--industrial-text);
+  background: var(--industrial-surface);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+}
+
+.search-box input,
+.settings-input {
+  color: var(--industrial-text);
+}
+
+.search-box input::placeholder {
+  color: var(--industrial-faint);
+}
+
+.checkbox-pill {
+  height: 36px;
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border: 1px solid var(--industrial-border);
+  border-radius: var(--industrial-radius-sm);
+}
+
+.toolbar-summary {
+  color: var(--industrial-muted);
+  font-size: 12px;
+}
+
+.video-grid {
+  padding: 0;
+  gap: 14px;
+}
+
+.video-card {
+  overflow: hidden;
+  color: var(--industrial-text);
+  transition:
+    border-color var(--motion-normal),
+    box-shadow var(--motion-normal),
+    transform var(--motion-fast);
+}
+
+.video-card:hover {
+  border-color: rgba(185, 28, 28, 0.24);
+  box-shadow: var(--industrial-shadow-hover);
+  transform: translateY(-1px);
+}
+
+.video-thumb,
+.video-thumb.target,
+.player-screen {
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.08), rgba(15, 23, 42, 0.72)),
+    linear-gradient(135deg, #4b5563 0%, #111827 56%, #2f1115 100%);
+}
+
+.video-thumb {
+  height: 142px;
+}
+
+.duration-badge,
+.target-badge,
+.player-tags span {
+  color: #ffffff;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.video-meta h3,
+.player-info h3,
+.settings-panel-header h3 {
+  color: var(--industrial-text);
+  font-weight: 800;
+}
+
+.video-meta p,
+.player-info p,
+.settings-label,
+.settings-tip,
+.settings-message {
+  color: var(--industrial-muted);
+}
+
+.card-checkbox span {
+  border-color: rgba(255, 255, 255, 0.65);
+  background: rgba(15, 23, 42, 0.48);
+}
+
+.card-checkbox input:checked + span {
+  background: var(--industrial-red);
+  border-color: var(--industrial-red);
+}
+
+.empty-state {
+  min-height: 280px;
+  margin: 0;
+  color: var(--industrial-muted);
+  border-style: dashed;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.video-modal,
+.settings-modal {
+  background: rgba(31, 41, 51, 0.62);
+}
+
+.video-modal-panel,
+.settings-panel {
+  border-radius: 10px;
+}
+
+.player-screen {
+  border: 1px solid #273244;
+  border-radius: var(--industrial-radius);
+}
+
+.player-screen-video {
+  background: #0b1018;
+}
+
+.player-video {
+  border-radius: var(--industrial-radius);
+}
+
+.result-toggle.off {
+  color: var(--industrial-danger);
+  background: var(--industrial-danger-soft);
+  border-color: rgba(197, 48, 48, 0.26);
+}
+
+.settings-panel-header,
+.settings-panel-footer {
+  border-color: var(--industrial-border);
+}
+
+.settings-panel-header {
+  position: relative;
+}
+
+.settings-panel-body {
+  background: var(--industrial-surface);
+}
+
+@media (max-width: 900px) {
+  .video-page {
+    padding: 12px;
   }
 }
 </style>
