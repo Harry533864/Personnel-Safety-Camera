@@ -3,9 +3,11 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import logging
+import time
 
 from app import app
-from flask import request, jsonify, render_template, send_file, url_for
+import cv2
+from flask import Response, request, jsonify, render_template, send_file, url_for
 
 from app.config_schema import validate_model_name, resolve_model_dir
 from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
@@ -61,6 +63,46 @@ def get_runtime_status():
         "status": "success",
         "data": build_runtime_status(),
     })
+
+
+@app.route("/api/stream/mjpeg", methods=["GET"])
+def stream_mjpeg_preview():
+    """Lightweight preview fallback for devices without OpenCV GStreamer."""
+    target = request.args.get("target", "high")
+    streams = get_target_streams(target)
+    stream = streams[0] if streams else None
+
+    if stream is None:
+        return jsonify({
+            "status": "error",
+            "message": "No stream is available for MJPEG preview",
+        }), 404
+
+    def generate():
+        while True:
+            frame = stream.inference.get_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+            )
+            if not ok:
+                time.sleep(0.02)
+                continue
+
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n"
+                + encoded.tobytes()
+                + b"\r\n"
+            )
+            time.sleep(0.03)
+
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 # =========================================================
 # 推流接口

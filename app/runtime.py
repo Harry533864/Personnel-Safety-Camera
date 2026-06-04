@@ -57,6 +57,7 @@ cam_manager = CamManager(
     width=ORI_WIDTH,
     height=ORI_HEIGHT,
     fps=ORI_FPS,
+    capture_backend=os.environ.get("CAM_CAPTURE_BACKEND", "v4l2"),
 )
 
 AI_INFER_ENABLE, AI_INFER_TARGET = _read_ai_startup_state()
@@ -220,4 +221,3 @@ def build_runtime_status() -> dict[str, Any]:
         "streams": [high_status, low_status],
         "status_errors": status_errors,
     }
-

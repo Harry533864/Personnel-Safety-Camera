@@ -136,13 +136,22 @@
     <div class="camera-view-area">
       <div class="video-container" ref="videoContainer">
         <video
-          v-show="videoLoaded"
+          v-show="videoLoaded && !mjpegMode"
           ref="videoPlayer"
           class="video-player"
           autoplay
           muted
           playsinline
         ></video>
+        <img
+          v-show="videoLoaded && mjpegMode"
+          ref="mjpegPlayer"
+          class="video-player mjpeg-player"
+          :src="mjpegMode ? mjpegPreviewUrl : ''"
+          alt=""
+          @load="handleMjpegLoaded"
+          @error="handleMjpegError"
+        />
 
         <!-- 视频加载失败的显示层 -->
         <div class="video-placeholder" v-if="!videoLoaded">
@@ -193,7 +202,10 @@ import {
 
 const router = useRouter();
 const videoPlayer = ref(null);
+const mjpegPlayer = ref(null);
 const videoLoaded = ref(false);
+const mjpegMode = ref(false);
+const mjpegToken = ref(Date.now());
 const videoResolution = ref("");
 const currentFps = ref("");
 const currentFpsValue = ref(0);
@@ -237,6 +249,10 @@ const apiBaseUrl = ref(
 const streamBaseUrl = ref(
   storedLanEndpoint?.stream || normalizeBaseUrl(import.meta.env.VITE_VIDEO_STREAM_URL, "8889")
 );
+const mjpegPreviewUrl = computed(() => {
+  if (!apiBaseUrl.value) return "";
+  return `${apiBaseUrl.value}/api/stream/mjpeg?target=high&t=${mjpegToken.value}`;
+});
 const discoveredJetsons = ref([]);
 const isScanningJetson = ref(false);
 const showJetsonResults = ref(false);
@@ -537,7 +553,24 @@ const syncRuntimeStreamStatus = async () => {
       videoResolution.value = `${source.width}x${source.height}`;
     }
 
-    if (!videoLoaded.value && !isConnecting && !reconnectTimer) {
+    if (highStream?.writer_opened === false && highStream?.has_stream_frame) {
+      if (!mjpegMode.value) {
+        startMjpegPreview(source);
+      } else if (source?.fps) {
+        setCurrentFps(source.fps);
+      }
+      videoLoaded.value = true;
+      errorMessage.value = "";
+      return;
+    }
+
+    if (mjpegMode.value && highStream?.writer_opened) {
+      stopMjpegPreview();
+      reconnect();
+      return;
+    }
+
+    if (!videoLoaded.value && !mjpegMode.value && !isConnecting && !reconnectTimer) {
       reconnectAttempts = Math.min(reconnectAttempts, 3);
       scheduleReconnect();
     }
@@ -639,6 +672,43 @@ const closeWebRTC = () => {
 };
 
 // 触发重连（带退避）
+const stopMjpegPreview = () => {
+  mjpegMode.value = false;
+  mjpegToken.value = Date.now();
+};
+
+const startMjpegPreview = (source = null) => {
+  if (!apiBaseUrl.value) return;
+
+  closeWebRTC();
+  mjpegMode.value = true;
+  mjpegToken.value = Date.now();
+  videoLoaded.value = true;
+  errorMessage.value = "";
+
+  if (source?.fps) {
+    setCurrentFps(source.fps);
+  }
+};
+
+const handleMjpegLoaded = () => {
+  if (!mjpegMode.value) return;
+  videoLoaded.value = true;
+  errorMessage.value = "";
+};
+
+const handleMjpegError = () => {
+  if (!mjpegMode.value) return;
+
+  videoLoaded.value = false;
+  errorMessage.value = "MJPEG 预览连接失败，正在重连...";
+  setTimeout(() => {
+    if (!mjpegMode.value) return;
+    mjpegToken.value = Date.now();
+    videoLoaded.value = true;
+  }, 1200);
+};
+
 const scheduleReconnect = () => {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -665,6 +735,11 @@ const reconnect = async () => {
     reconnectAttempts = 0;
     manualReconnectVisiable = false;
   } catch (err) {
+    if (mjpegMode.value) {
+      videoLoaded.value = true;
+      errorMessage.value = "";
+      return;
+    }
     reconnectAttempts++;
     scheduleReconnect();
   } finally {
@@ -688,6 +763,7 @@ const handleConnectionFailed = () => {
 // ---------- WebRTC 初始化 ----------
 const initWebRTC = async () => {
   if (!videoPlayer.value) return;
+  stopMjpegPreview();
   // 先关闭可能存在的旧连接
   closeWebRTC();
 
@@ -801,6 +877,11 @@ const initWebRTC = async () => {
 
   } catch (err) {
     console.error("WebRTC 初始化失败:", err);
+    if (mjpegMode.value) {
+      videoLoaded.value = true;
+      errorMessage.value = "";
+      return;
+    }
     videoLoaded.value = false;
     errorMessage.value = "WebRTC 连接失败";
 
@@ -815,6 +896,7 @@ const manualReconnect = () => {
   if (isConnecting) return;
 
   // 重置重试计数，立即重连
+  stopMjpegPreview();
   reconnectAttempts = 0;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnect();
@@ -857,6 +939,7 @@ onUnmounted(() => {
   if (runtimeStatusInterval) clearInterval(runtimeStatusInterval);
   if (reconnectTimer) clearTimeout(reconnectTimer);
   closeWebRTC();
+  stopMjpegPreview();
 });
 </script>
 
@@ -1175,6 +1258,10 @@ onUnmounted(() => {
   height: 100%;
   object-fit: contain;
   background: transparent;
+}
+
+.mjpeg-player {
+  user-select: none;
 }
 
 .video-placeholder {

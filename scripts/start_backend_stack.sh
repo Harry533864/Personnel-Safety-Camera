@@ -34,7 +34,8 @@ start_mediamtx() {
 
   nohup "$MEDIAMTX_BIN" "$MEDIAMTX_CONFIG" \
     >> "$LOG_DIR/mediamtx.out.log" \
-    2>> "$LOG_DIR/mediamtx.err.log" &
+    2>> "$LOG_DIR/mediamtx.err.log" \
+    9>&- &
 
   echo "$(date '+%F %T') mediamtx started pid=$!" >> "$LOG_DIR/autostart.log"
 }
@@ -47,7 +48,8 @@ start_flask() {
 
   nohup python3 -m flask --app app run --host="$FLASK_HOST" --port="$FLASK_PORT" \
     >> "$LOG_DIR/flask.out.log" \
-    2>> "$LOG_DIR/flask.err.log" &
+    2>> "$LOG_DIR/flask.err.log" \
+    9>&- &
 
   echo "$(date '+%F %T') flask backend started pid=$!" >> "$LOG_DIR/autostart.log"
 }

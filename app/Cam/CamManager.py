@@ -1,8 +1,11 @@
 import cv2
+import os
 import time
 import threading
 import subprocess
 import logging
+
+from app.Cam.capture_backends import BaumerNeoApiCapture
 
 
 class CamManager:
@@ -24,12 +27,19 @@ class CamManager:
         height=720,
         fps=15,
         fourcc="MJPG",
+        capture_backend=None,
     ):
         self.camera_id = camera_id
         self.width = width
         self.height = height
         self.fps = fps
         self.fourcc = fourcc
+        self.capture_backend = (
+            capture_backend
+            or os.environ.get("CAM_CAPTURE_BACKEND")
+            or os.environ.get("CAPTURE_BACKEND")
+            or "v4l2"
+        ).strip().lower()
 
         self.workers = []
         self._is_running = False
@@ -70,6 +80,7 @@ class CamManager:
                 "height": self.height,
                 "fps": self.fps,
                 "fourcc": self.fourcc,
+                "capture_backend": self.capture_backend,
                 "running": self._is_running,
                 "thread_alive": bool(self._thread and self._thread.is_alive()),
                 "camera_opened": self._camera_opened,
@@ -110,6 +121,12 @@ class CamManager:
         self.logger.info("Camera exposure requested: %s", value)
 
     def _apply_exposure(self):
+        if self.capture_backend in {"baumer", "baumer_neoapi", "neoapi"}:
+            self.logger.info(
+                "Baumer exposure will be applied when capture is opened/reopened"
+            )
+            return
+
         dev_path = self.camera_id
         with self._state_lock:
             exposure_val = self._exposure_val
@@ -226,6 +243,29 @@ class CamManager:
         )
 
     def _open_capture(self):
+        if self.capture_backend in {"baumer", "baumer_neoapi", "neoapi"}:
+            with self._state_lock:
+                capture = BaumerNeoApiCapture(
+                    width=self.width,
+                    height=self.height,
+                    fps=self.fps,
+                    exposure_us=self._exposure_val,
+                    pixel_format=os.environ.get("BAUMER_PIXEL_FORMAT", "BGR8"),
+                    connect_retries=int(os.environ.get("BAUMER_CONNECT_RETRIES", "3")),
+                )
+            self._set_status(_last_pipeline=capture.describe())
+            if capture.open():
+                self._set_status(_camera_opened=True, _last_error=None)
+                self.logger.info("Baumer neoAPI capture opened")
+                return capture
+
+            with self._state_lock:
+                self._camera_opened = False
+                self._open_fail_count += 1
+                self._last_error = capture.last_error or "baumer camera open failed"
+            self.logger.warning("Baumer camera open failed; will retry")
+            return None
+
         pipeline = self._build_pipeline()
         self._set_status(_last_pipeline=pipeline)
 
