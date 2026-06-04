@@ -21,6 +21,8 @@ coverage
 .vscode/*
 !.vscode/extensions.json
 .idea
+~$*.doc
+~$*.docx
 *.suo
 *.ntvs*
 *.njsproj
@@ -30,6 +32,7 @@ coverage
 # Python
 __pycache__
 venv
+.venv/
 
 # Environment Variables
 .env

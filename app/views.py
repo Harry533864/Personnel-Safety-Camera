@@ -1,26 +1,28 @@
 import json
-import math
 from datetime import datetime
 from pathlib import Path
 import shutil
 import logging
-from collections.abc import Mapping, Sequence
 
 from app import app
 from flask import request, jsonify, render_template, send_file, url_for
 
-from app.Cam.CamStream import CamStream
-from app.Cam.CamManager import CamManager
-from app.config_schema import validate_ai_config, validate_model_name, resolve_model_dir
+from app.config_schema import validate_model_name, resolve_model_dir
 from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
+from app.runtime import (
+    build_runtime_status,
+    cam_manager,
+    get_target_streams,
+    reload_enabled_streams,
+    start_runtime,
+    stop_runtime,
+    sync_infer_enable_from_config,
+)
+from app.services.config_service import ai_config_service
 
 from app.utils import (
-    read_yaml,
-    write_yaml,
     to_bool,
     normalize_roi,
-    read_ai_startup_state,
-    should_enable_stream_ai
     )
 
 # =========================================================
@@ -33,177 +35,13 @@ logger.info("Model directory: %s", MODEL_FILE_PATH)
 logger.info("Video base directory: %s", VIDEO_BASE_PATH)
 
 
-def write_ai_config(cfg):
-    validate_ai_config(cfg)
-    write_yaml(cfg, file_path=AI_CONFIG_PATH)
-
-# =========================================================
-# 推流配置
-# =========================================================
-
-URL_LOW = "rtmp://127.0.0.1:1935/cam_low"
-URL_HIGH = "rtmp://127.0.0.1:1935/cam_high"
-
-# =========================================================
-# 摄像头硬件参数
-# =========================================================
-
-CAMERA_ID = 0
-ORI_WIDTH = 1920
-ORI_HEIGHT = 1080
-ORI_FPS = 60
-
-cam_manager = CamManager(
-    camera_id=CAMERA_ID,
-    width=ORI_WIDTH,
-    height=ORI_HEIGHT,
-    fps=ORI_FPS,
-)
-
-AI_INFER_ENABLE, AI_INFER_TARGET = read_ai_startup_state(AI_CONFIG_PATH)
-
-# =========================================================
-# 两路推流
-# =========================================================
-
-stream_high = CamStream(
-    name="cam_high",
-    url=URL_HIGH,
-    width=1920,
-    height=1080,
-    fps=60,
-    enable_infer=should_enable_stream_ai(
-        "cam_high",
-        AI_INFER_ENABLE,
-        AI_INFER_TARGET
-    ),
-    ai_config_path=str(AI_CONFIG_PATH),
-    enable_record=True, # 高分辨率流默认保存
-    video_base_dir=VIDEO_BASE_PATH
-)
-
-stream_low = CamStream(
-    name="cam_low",
-    url=URL_LOW,
-    width=640,
-    height=480,
-    fps=15,
-    enable_infer=should_enable_stream_ai(
-        "cam_low",
-        AI_INFER_ENABLE,
-        AI_INFER_TARGET
-    ),
-    ai_config_path=str(AI_CONFIG_PATH),
-    enable_record=False, # 低分辨率流不默认保存
-    video_base_dir=VIDEO_BASE_PATH
-)
-
-cam_manager.add_worker(stream_high)
-# cam_manager.add_worker(stream_low)
-
-# 全局启动推流
-cam_manager.start()
+def read_ai_config():
+    return ai_config_service.read()
 
 
-def get_target_streams(target="high"):
-    target = str(target or "high").lower()
+def update_ai_config(mutator):
+    return ai_config_service.update(mutator)
 
-    if target == "high":
-        return [stream_high]
-
-    if target == "low":
-        return [stream_low]
-
-    if target == "all":
-        return [stream_high, stream_low]
-
-    raise ValueError("target 必须是 high、low 或 all")
-
-
-def set_infer_enable(enable, target="high"):
-    changed = []
-
-    for stream in get_target_streams(target):
-        stream.set_infer_enable(
-            enable=enable,
-            reload_when_enable=True,
-            release_when_disable=True,
-        )
-        changed.append(stream.name)
-
-    return changed
-
-def sync_infer_enable_from_config(cfg=None):
-    """
-    根据 AIConfig.yaml 中的 model.detect_enable 和 model.infer_target
-    同步当前运行中的 AI 推理状态。
-
-    规则：
-    1. detect_enable=false：关闭所有流的 AI 推理
-    2. detect_enable=true 且 infer_target=high：只开启 high，关闭 low
-    3. detect_enable=true 且 infer_target=low：只开启 low，关闭 high
-    4. detect_enable=true 且 infer_target=all：两路都开启
-    """
-    if cfg is None:
-        cfg = read_yaml(AI_CONFIG_PATH)
-
-    model_cfg = cfg.get("model", {})
-    detect_enable = to_bool(model_cfg.get("detect_enable", False))
-    target = str(model_cfg.get("infer_target", "high")).lower()
-
-    if target not in ["high", "low", "all"]:
-        raise ValueError("infer_target 必须是 high、low 或 all")
-
-    if detect_enable:
-        enabled_stream_names = {
-            stream.name for stream in get_target_streams(target)
-        }
-    else:
-        enabled_stream_names = set()
-
-    changed = []
-
-    for stream in [stream_high, stream_low]:
-        old_enable = bool(getattr(stream, "enable_infer", False))
-        new_enable = stream.name in enabled_stream_names
-
-        if old_enable != new_enable:
-            stream.set_infer_enable(
-                enable=new_enable,
-                reload_when_enable=True,
-                release_when_disable=True,
-            )
-
-            changed.append({
-                "name": stream.name,
-                "old_enable": old_enable,
-                "new_enable": new_enable,
-                "action": "enable" if new_enable else "disable"
-            })
-
-        elif new_enable:
-            # 开关没变，但配置参数可能变了，比如阈值、ROI、模型名变了
-            stream.reload_ai_config()
-
-            changed.append({
-                "name": stream.name,
-                "old_enable": old_enable,
-                "new_enable": new_enable,
-                "action": "reload"
-            })
-
-    return changed
-
-
-def reload_enabled_streams():
-    reloaded = []
-
-    for stream in [stream_high, stream_low]:
-        if getattr(stream, "enable_infer", False):
-            stream.reload_ai_config()
-            reloaded.append(stream.name)
-
-    return reloaded
 # =========================================================
 # 基础接口
 # =========================================================
@@ -216,64 +54,12 @@ def index():
     })
 
 
-def _json_safe(value):
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_json_safe(item) for item in value]
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return _json_safe(item())
-        except Exception:
-            pass
-    return str(value)
-
-
-def _safe_status(label, status_fn, fallback=None):
-    try:
-        return _json_safe(status_fn()), None
-    except Exception as error:
-        logger.exception("Failed to build runtime status for %s", label)
-        return fallback or {}, {"target": label, "message": str(error)}
-
-
-def _build_runtime_status():
-    camera_status, camera_error = _safe_status("camera", cam_manager.get_status)
-    high_status, high_error = _safe_status("cam_high", stream_high.get_status)
-    low_status, low_error = _safe_status("cam_low", stream_low.get_status)
-
-    status_errors = [
-        error for error in (camera_error, high_error, low_error) if error is not None
-    ]
-
-    return {
-        "paths": {
-            "ai_config": str(AI_CONFIG_PATH),
-            "model_dir": str(MODEL_FILE_PATH),
-            "video_base_dir": str(VIDEO_BASE_PATH),
-        },
-        "camera": camera_status,
-        "streams": [
-            high_status,
-            low_status,
-        ],
-        "status_errors": status_errors,
-    }
-
-
 @app.route("/api/runtime/status", methods=["GET"])
 @app.route("/api/system/status", methods=["GET"])
 def get_runtime_status():
     return jsonify({
         "status": "success",
-        "data": _build_runtime_status(),
+        "data": build_runtime_status(),
     })
 
 # =========================================================
@@ -283,7 +69,7 @@ def get_runtime_status():
 @app.route("/api/stream/start", methods=["POST", "GET"])
 def start_streams():
     try:
-        cam_manager.start()
+        start_runtime()
         return jsonify({
             "status": "success",
             "message": "双路推流已启动"
@@ -298,7 +84,7 @@ def start_streams():
 @app.route("/api/stream/stop", methods=["POST", "GET"])
 def stop_streams():
     try:
-        cam_manager.stop()
+        stop_runtime()
         return jsonify({
             "status": "success",
             "message": "双路推流已停止"
@@ -422,37 +208,39 @@ def update_inference_configuration():
     data = request.get_json(silent=True) or {}
 
     try:
-        cfg = read_yaml(AI_CONFIG_PATH)
-        model_cfg = cfg.setdefault("model", {})
+        def mutate(cfg):
+            model_cfg = cfg.setdefault("model", {})
 
-        target = str(data.get(
-            "target",
-            model_cfg.get("infer_target", "high")
-        )).lower()
+            target = str(data.get(
+                "target",
+                model_cfg.get("infer_target", "high")
+            )).lower()
 
-        if target not in ["high", "low", "all"]:
-            raise ValueError("target 必须是 high、low 或 all")
+            if target not in ["high", "low", "all"]:
+                raise ValueError("target 必须是 high、low 或 all")
 
-        model_cfg["infer_target"] = target
+            model_cfg["infer_target"] = target
 
-        if "detectionEnabled" in data:
-            detect_enable = to_bool(data["detectionEnabled"])
-            model_cfg["detect_enable"] = detect_enable
-        else:
-            detect_enable = to_bool(model_cfg.get("detect_enable", False))
+            if "detectionEnabled" in data:
+                detect_enable = to_bool(data["detectionEnabled"])
+                model_cfg["detect_enable"] = detect_enable
+            else:
+                detect_enable = to_bool(model_cfg.get("detect_enable", False))
 
-        if "detectionModel" in data:
-            model_cfg["model_name"] = validate_model_name(data["detectionModel"])
+            if "detectionModel" in data:
+                model_cfg["model_name"] = validate_model_name(data["detectionModel"])
 
-        if "detectionThreshold" in data:
-            model_cfg["conf_thres"] = float(data["detectionThreshold"])
+            if "detectionThreshold" in data:
+                model_cfg["conf_thres"] = float(data["detectionThreshold"])
 
-        if "overlapRate" in data:
-            overlap_thres = float(data["overlapRate"])
-            for roi in model_cfg.get("rois", []):
-                roi["overlap_thres"] = overlap_thres
+            if "overlapRate" in data:
+                overlap_thres = float(data["overlapRate"])
+                for roi in model_cfg.get("rois", []):
+                    roi["overlap_thres"] = overlap_thres
 
-        write_ai_config(cfg)
+            return {"detect_enable": detect_enable, "target": target}
+
+        cfg, result = update_ai_config(mutate)
 
         changed_streams = sync_infer_enable_from_config(cfg)
 
@@ -465,8 +253,8 @@ def update_inference_configuration():
             "status": "success",
             "message": "检测设置已更新",
             "data": {
-                "detect_enable": detect_enable,
-                "target": target,
+                "detect_enable": result["detect_enable"],
+                "target": result["target"],
                 "changed_streams": changed_streams
             }
         })
@@ -484,7 +272,7 @@ def get_detection_regions():
     获取检测区域。
     """
     try:
-        cfg = read_yaml(AI_CONFIG_PATH)
+        cfg = read_ai_config()
         rois = cfg.get("model", {}).get("rois", [])
 
         return jsonify({
@@ -524,14 +312,15 @@ def update_detection_regions():
         if not isinstance(raw_rois, list):
             raise ValueError("rois 必须是数组")
 
-        cfg = read_yaml(AI_CONFIG_PATH)
-        model_cfg = cfg.setdefault("model", {})
-        model_cfg["rois"] = [
-            normalize_roi(roi, index)
-            for index, roi in enumerate(raw_rois)
-        ]
+        def mutate(cfg):
+            model_cfg = cfg.setdefault("model", {})
+            model_cfg["rois"] = [
+                normalize_roi(roi, index)
+                for index, roi in enumerate(raw_rois)
+            ]
+            return len(model_cfg["rois"])
 
-        write_ai_config(cfg)
+        cfg, roi_count = update_ai_config(mutate)
 
         reloaded = sync_infer_enable_from_config(cfg)
 
@@ -539,7 +328,7 @@ def update_detection_regions():
             "status": "success",
             "message": "检测区域已保存",
             "data": {
-                "roi_count": len(model_cfg["rois"]),
+                "roi_count": roi_count,
                 "reloaded": reloaded
             }
         })
@@ -588,37 +377,26 @@ def upload_model():
         return jsonify({"status": "error", "message": "txt_file 必须是 .txt 文件"}), 400
 
     try:
-        # 2. 读取并检查配置
-        cfg = read_yaml(AI_CONFIG_PATH)
-        # 如果没有model_names字段则为空列表
-        model_names = cfg.get("model_names") or []
-        if not isinstance(model_names, list):
-            model_names = []
-
-        # 模型名称已存在时返回错误
-        if model_name in model_names:
-            return jsonify({
-                "status": "error",
-                "message": f"模型 '{model_name}' 已存在，请使用其他名称"
-            }), 400
-
-        # 3. 确定保存路径并创建文件夹
-        # /inference/models/<model_name>/
         model_name, save_dir = resolve_model_dir(MODEL_FILE_PATH, model_name)
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        # 4. 保存并重命名文件
-        # /inference/models/<model_name>/<model_name>.engine
-        # /inference/models/<model_name>/<model_name>.txt
         engine_path = save_dir / f"{model_name}.engine"
         txt_path = save_dir / f"{model_name}.txt"
-        engine_file.save(str(engine_path))
-        txt_file.save(str(txt_path))
 
-        # 5. 更新 AIConfig.yaml 中的 model_names 列表字段
-        model_names.append(model_name)
-        cfg["model_names"] = model_names
-        write_ai_config(cfg)
+        def mutate(cfg):
+            model_names = cfg.get("model_names") or []
+            if not isinstance(model_names, list):
+                model_names = []
+
+            if model_name in model_names:
+                raise ValueError(f"模型 '{model_name}' 已存在，请使用其他名称")
+
+            save_dir.mkdir(parents=True, exist_ok=True)
+            engine_file.save(str(engine_path))
+            txt_file.save(str(txt_path))
+
+            model_names.append(model_name)
+            cfg["model_names"] = model_names
+
+        update_ai_config(mutate)
 
         return jsonify({
             "status": "success",
@@ -629,6 +407,12 @@ def upload_model():
                 "txt_path": str(txt_path)
             }
         })
+
+    except ValueError as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 400
 
     except Exception as e:
         return jsonify({
@@ -643,7 +427,7 @@ def get_model_list():
     获取当前已配置的模型名称列表
     """
     try:
-        cfg = read_yaml(AI_CONFIG_PATH)
+        cfg = read_ai_config()
         # 容错处理：确保返回的一定是 list
         model_names = cfg.get("model_names") or [] 
         if not isinstance(model_names, list):
@@ -678,20 +462,19 @@ def delete_model():
         return jsonify({"status": "error", "message": str(error)}), 400
         
     try:
-        cfg = read_yaml(AI_CONFIG_PATH)
-        model_names = cfg.get("model_names") or []
-        if not isinstance(model_names, list):
-            model_names = []
-            
-        if model_name not in model_names:
-            return jsonify({"status": "error", "message": f"模型 '{model_name}' 不存在"}), 404
-            
-        # 1. 移除模型配置
-        model_names.remove(model_name)
-        cfg["model_names"] = model_names
-        write_ai_config(cfg)
+        def mutate(cfg):
+            model_names = cfg.get("model_names") or []
+            if not isinstance(model_names, list):
+                model_names = []
 
-        # 2. 删除对应的模型文件夹
+            if model_name not in model_names:
+                raise FileNotFoundError(f"模型 '{model_name}' 不存在")
+
+            model_names.remove(model_name)
+            cfg["model_names"] = model_names
+
+        update_ai_config(mutate)
+
         model_name, model_dir = resolve_model_dir(MODEL_FILE_PATH, model_name)
         if model_dir.exists() and model_dir.is_dir():
             shutil.rmtree(str(model_dir))
@@ -700,6 +483,9 @@ def delete_model():
             "status": "success",
             "message": f"模型 '{model_name}' 及相关文件删除成功"
         })
+
+    except FileNotFoundError as e:
+        return jsonify({"status": "error", "message": str(e)}), 404
         
     except Exception as e:
         return jsonify({
@@ -821,15 +607,16 @@ def update_exception_output_configuration():
         if duration.is_integer():
             duration = int(duration)
 
-        cfg = read_yaml(AI_CONFIG_PATH)
-
-        cfg["exception_output"] = {
+        exception_output = {
             "gpio": gpio_pins,
             "output_level": output_level,
             "duration": duration
         }
 
-        write_ai_config(cfg)
+        def mutate(cfg):
+            cfg["exception_output"] = exception_output
+
+        update_ai_config(mutate)
 
         # 如果推理流运行中，让它重新读取配置
         reloaded = reload_enabled_streams()
@@ -838,7 +625,7 @@ def update_exception_output_configuration():
             "status": "success",
             "message": "异常输出配置已更新",
             "data": {
-                "exception_output": cfg["exception_output"],
+                "exception_output": exception_output,
                 "reloaded": reloaded
             }
         })
@@ -925,12 +712,11 @@ def handle_record_config():
             if duration_min <= 0:
                 raise ValueError("单个录制分段时长必须大于 0")
                 
-            # 读取并重写 YAML 文件
-            cfg = read_yaml(AI_CONFIG_PATH)
-            record_cfg = cfg.setdefault("record", {})
-            record_cfg["duration_min"] = duration_min
-            
-            write_ai_config(cfg)
+            def mutate(cfg):
+                record_cfg = cfg.setdefault("record", {})
+                record_cfg["duration_min"] = duration_min
+
+            update_ai_config(mutate)
             
             return jsonify({
                 "status": "success",
@@ -949,7 +735,7 @@ def handle_record_config():
     else:
         # GET 请求：返回当前配置的时长
         try:
-            cfg = read_yaml(AI_CONFIG_PATH)
+            cfg = read_ai_config()
             duration_min = cfg.get("record", {}).get("duration_min", 10)
             return jsonify({
                 "status": "success",

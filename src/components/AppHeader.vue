@@ -1,9 +1,9 @@
 <template>
   <aside class="app-sidebar">
-    <RouterLink to="/" class="brand-block" aria-label="AI安全相机平台首页">
+    <RouterLink to="/" class="brand-block" aria-label="AI 人员安全相机平台首页">
       <img class="brand-logo" :src="asvLogoUrl" alt="ASV 艾视维" />
       <span class="brand-copy">
-        <strong>AI安全相机平台</strong>
+        <strong>AI 人员安全相机平台</strong>
       </span>
     </RouterLink>
 
@@ -78,7 +78,7 @@ const navItems = [
 ];
 
 const currentTitle = computed(() => {
-  return navItems.find((item) => item.active(route.path))?.label || "AI安全相机平台";
+  return navItems.find((item) => item.active(route.path))?.label || "AI 人员安全相机平台";
 });
 
 const updateTime = () => {

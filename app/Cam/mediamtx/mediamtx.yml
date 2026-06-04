@@ -413,7 +413,7 @@ webrtcLocalTCPAddress: :8190
 webrtcIPsFromInterfaces: true
 # Interfaces whose IPs will be sent to clients.
 # An empty value means to use all available interfaces.
-webrtcIPsFromInterfacesList: [enP8p1s0]
+webrtcIPsFromInterfacesList: []
 # Additional hosts or IPs to send to clients.
 webrtcAdditionalHosts: [10.10.10.2]
 # ICE servers. Needed only when local listeners can't be reached by clients.
