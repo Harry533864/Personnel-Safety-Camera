@@ -10,6 +10,7 @@ FLASK_HOST="${FLASK_HOST:-0.0.0.0}"
 FLASK_PORT="${FLASK_PORT:-5000}"
 CAMERA_DEVICE="${CAMERA_DEVICE:-/dev/video0}"
 CAMERA_WAIT_SECONDS="${CAMERA_WAIT_SECONDS:-45}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOCK_FILE="/tmp/cam_backend_stack.lock"
 
 mkdir -p "$LOG_DIR"
@@ -34,7 +35,8 @@ start_mediamtx() {
 
   nohup "$MEDIAMTX_BIN" "$MEDIAMTX_CONFIG" \
     >> "$LOG_DIR/mediamtx.out.log" \
-    2>> "$LOG_DIR/mediamtx.err.log" &
+    2>> "$LOG_DIR/mediamtx.err.log" \
+    9>&- &
 
   echo "$(date '+%F %T') mediamtx started pid=$!" >> "$LOG_DIR/autostart.log"
 }
@@ -45,9 +47,10 @@ start_flask() {
     return
   fi
 
-  nohup python3 -m flask --app app run --host="$FLASK_HOST" --port="$FLASK_PORT" \
+  nohup "$PYTHON_BIN" -m flask --app app run --host="$FLASK_HOST" --port="$FLASK_PORT" \
     >> "$LOG_DIR/flask.out.log" \
-    2>> "$LOG_DIR/flask.err.log" &
+    2>> "$LOG_DIR/flask.err.log" \
+    9>&- &
 
   echo "$(date '+%F %T') flask backend started pid=$!" >> "$LOG_DIR/autostart.log"
 }
