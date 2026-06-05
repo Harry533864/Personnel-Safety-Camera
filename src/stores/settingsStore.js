@@ -143,13 +143,17 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
         if (settings.resolution !== this.settings.resolution) {
           console.log("设置分辨率...")
           try {
-            const [width, height] = settings.resolution.split('x').map(Number)
+            const resolutionPayload = settings.resolution === 'max'
+              ? { mode: 'max' }
+              : (() => {
+                  const [width, height] = settings.resolution.split('x').map(Number)
+                  return { width, height }
+                })()
             const response = await fetch(`${getApiUrl()}/api/stream/resolution`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                width,
-                height,
+                ...resolutionPayload,
                 target: settings.target
               }),
             })

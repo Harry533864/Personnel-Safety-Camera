@@ -193,6 +193,13 @@ const selectedTarget = ref(detectionRegionStore.getCurrentTarget() || "all");
 
 const sourceResolution = computed(() => {
   const value = cameraSettingStore.settings.resolution || "1920x1080";
+  if (value === "max") {
+    return {
+      width: 2448,
+      height: 2048,
+    };
+  }
+
   const [width, height] = value.split("x").map(Number);
   return {
     width: width || 1920,

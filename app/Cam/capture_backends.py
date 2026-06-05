@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -153,6 +154,50 @@ class BaumerNeoApiCapture:
             return True
         return self._set_feature(name, value)
 
+    def _env_float(self, name: str, default: float | None = None) -> float | None:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            self.logger.warning("Ignored invalid %s=%r", name, raw)
+            return default
+
+    def _set_numeric_feature(self, name: str, value: float | None) -> bool:
+        if value is None:
+            return False
+        return self._set_feature(name, float(value))
+
+    def _configure_auto_exposure_limits(self) -> None:
+        brightness = self._env_float("BAUMER_BRIGHTNESS_AUTO_NOMINAL", 28.0)
+        exposure_min = self._env_float("BAUMER_EXPOSURE_AUTO_MIN_US", None)
+        exposure_max = self._env_float("BAUMER_EXPOSURE_AUTO_MAX_US", 12000.0)
+        gain_min = self._env_float("BAUMER_GAIN_AUTO_MIN", 1.0)
+        gain_max = self._env_float("BAUMER_GAIN_AUTO_MAX", 32.0)
+        priority = os.environ.get("BAUMER_BRIGHTNESS_AUTO_PRIORITY", "ExposureAuto").strip()
+
+        applied = {
+            "BrightnessAutoNominalValue": self._set_numeric_feature("BrightnessAutoNominalValue", brightness),
+            "ExposureAutoMinValue": self._set_numeric_feature("ExposureAutoMinValue", exposure_min),
+            "ExposureAutoMaxValue": self._set_numeric_feature("ExposureAutoMaxValue", exposure_max),
+            "GainAutoMinValue": self._set_numeric_feature("GainAutoMinValue", gain_min),
+            "GainAutoMaxValue": self._set_numeric_feature("GainAutoMaxValue", gain_max),
+        }
+        priority_ok = self._set_enum_feature("BrightnessAutoPriority", priority) if priority else False
+        self.logger.info(
+            "Baumer auto exposure limits: brightness=%s exposure_min=%s exposure_max=%s "
+            "gain_min=%s gain_max=%s priority=%s applied=%s priority_ok=%s",
+            brightness,
+            exposure_min,
+            exposure_max,
+            gain_min,
+            gain_max,
+            priority or None,
+            applied,
+            priority_ok,
+        )
+
     def _configure_camera(self) -> None:
         # Order matters on many industrial cameras: pixel format first, then ROI.
         self._set_pixel_format()
@@ -188,6 +233,7 @@ class BaumerNeoApiCapture:
         else:
             # Keep automatic exposure as the safe production default.
             self._set_enum_feature("ExposureMode", "Timed")
+            self._configure_auto_exposure_limits()
             exposure_ok = self._set_enum_feature("ExposureAuto", "Continuous")
             gain_ok = self._set_enum_feature("GainAuto", "Continuous")
             white_ok = self._set_enum_feature("BalanceWhiteAuto", "Continuous")

@@ -12,6 +12,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opset", type=int, default=12, help="ONNX opset version")
     parser.add_argument("--dynamic", action="store_true", help="Export with dynamic input shape")
     parser.add_argument("--simplify", action="store_true", help="Simplify ONNX after export")
+    parser.add_argument("--fp16", action="store_true", help="Convert exported ONNX weights to FP16")
     return parser.parse_args()
 
 
@@ -42,6 +43,19 @@ def main() -> None:
     exported_path = Path(exported).resolve()
     if exported_path != output_path:
         output_path.write_bytes(exported_path.read_bytes())
+
+    if args.fp16:
+        try:
+            import onnx
+            from onnxconverter_common import float16
+        except Exception as exc:
+            raise RuntimeError(
+                "FP16 ONNX conversion requires onnx and onnxconverter-common"
+            ) from exc
+
+        model_proto = onnx.load(str(output_path))
+        model_proto = float16.convert_float_to_float16(model_proto, keep_io_types=True)
+        onnx.save(model_proto, str(output_path))
 
     print(f"ONNX output: {output_path}")
 

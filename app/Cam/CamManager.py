@@ -6,6 +6,7 @@ import subprocess
 import logging
 
 from app.Cam.capture_backends import BaumerNeoApiCapture
+from app.Cam.fps_meter import FpsMeter
 
 
 class CamManager:
@@ -58,6 +59,18 @@ class CamManager:
         self._open_fail_count = 0
         self._read_fail_count = 0
         self._last_pipeline = None
+        self._capture_fps = FpsMeter()
+
+    def get_max_resolution(self):
+        env_width = os.environ.get("CAMERA_MAX_WIDTH") or os.environ.get("BAUMER_MAX_WIDTH")
+        env_height = os.environ.get("CAMERA_MAX_HEIGHT") or os.environ.get("BAUMER_MAX_HEIGHT")
+        if env_width and env_height:
+            return int(env_width), int(env_height)
+
+        if self.capture_backend in {"baumer", "baumer_neoapi", "neoapi"}:
+            return 2448, 2048
+
+        return max(1, int(self.width)), max(1, int(self.height))
 
     def _format_time(self, timestamp):
         if not timestamp:
@@ -74,11 +87,15 @@ class CamManager:
             worker_count = len(self.workers)
 
         with self._state_lock:
+            max_width, max_height = self.get_max_resolution()
             return {
                 "camera_id": self.camera_id,
                 "width": self.width,
                 "height": self.height,
+                "max_width": max_width,
+                "max_height": max_height,
                 "fps": self.fps,
+                "actual_capture_fps": self._capture_fps.fps(),
                 "fourcc": self.fourcc,
                 "capture_backend": self.capture_backend,
                 "running": self._is_running,
@@ -342,6 +359,7 @@ class CamManager:
                     _last_frame_at=time.time(),
                     _last_error=None,
                 )
+                self._capture_fps.mark()
 
                 with self._workers_lock:
                     workers = list(self.workers)

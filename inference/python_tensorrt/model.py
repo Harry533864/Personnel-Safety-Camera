@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import sys
 import threading
@@ -24,6 +25,7 @@ except Exception:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "app" / "AIConfig.yaml"
+logger = logging.getLogger(__name__)
 
 
 class Model:
@@ -292,10 +294,18 @@ class Model:
         self.alarm_idle_level = 0 if self.alarm_level == 1 else 1
         self.alarm_duration = float(cfg.get("duration", 0))
 
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BOARD)
-        for pin in self.alarm_gpios:
-            GPIO.setup(pin, GPIO.OUT, initial=self.alarm_idle_level)
+        try:
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BOARD)
+            for pin in self.alarm_gpios:
+                GPIO.setup(pin, GPIO.OUT, initial=self.alarm_idle_level)
+        except Exception as exc:
+            logger.warning("GPIO alarm output disabled: %s", exc)
+            try:
+                GPIO.cleanup(self.alarm_gpios)
+            except Exception:
+                pass
+            self.alarm_gpios = []
 
     def _handle_alarm_gpio(self, alarm_flag: bool) -> None:
         if not self.alarm_gpios or GPIO is None:
@@ -304,8 +314,12 @@ class Model:
         now = time.monotonic()
         if not alarm_flag:
             if self.alarm_led_on:
-                for pin in self.alarm_gpios:
-                    GPIO.output(pin, self.alarm_idle_level)
+                try:
+                    for pin in self.alarm_gpios:
+                        GPIO.output(pin, self.alarm_idle_level)
+                except Exception as exc:
+                    logger.warning("GPIO alarm output disabled: %s", exc)
+                    self._release_alarm_gpio()
             self.alarm_active = False
             self.alarm_led_on = False
             self.alarm_end_time = None
@@ -314,14 +328,24 @@ class Model:
         if not self.alarm_active:
             self.alarm_active = True
             self.alarm_led_on = True
-            for pin in self.alarm_gpios:
-                GPIO.output(pin, self.alarm_level)
+            try:
+                for pin in self.alarm_gpios:
+                    GPIO.output(pin, self.alarm_level)
+            except Exception as exc:
+                logger.warning("GPIO alarm output disabled: %s", exc)
+                self._release_alarm_gpio()
+                return
             self.alarm_end_time = now + self.alarm_duration if self.alarm_duration > 0 else None
             return
 
         if self.alarm_duration > 0 and self.alarm_led_on and self.alarm_end_time is not None and now >= self.alarm_end_time:
-            for pin in self.alarm_gpios:
-                GPIO.output(pin, self.alarm_idle_level)
+            try:
+                for pin in self.alarm_gpios:
+                    GPIO.output(pin, self.alarm_idle_level)
+            except Exception as exc:
+                logger.warning("GPIO alarm output disabled: %s", exc)
+                self._release_alarm_gpio()
+                return
             self.alarm_led_on = False
 
     def _release_alarm_gpio(self) -> None:

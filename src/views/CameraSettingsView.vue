@@ -16,6 +16,7 @@
           <label class="form-label">分辨率：</label>
           <div class="form-control-wrapper">
             <select v-model="settings.resolution" class="form-select">
+              <option value="max">最大分辨率（自动）</option>
               <option value="1920x1080">1920 x 1080</option>
               <option value="1280x720">1280 x 720</option>
               <option value="1024x576">1024 x 576</option>

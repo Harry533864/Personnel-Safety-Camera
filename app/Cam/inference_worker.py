@@ -3,6 +3,7 @@ import threading
 import time
 from pathlib import Path
 
+from app.Cam.fps_meter import FpsMeter
 from inference.python_tensorrt.model import Model
 
 
@@ -32,6 +33,7 @@ class InferenceWorker:
         self._last_latency_ms = None
         self._last_error = None
         self._frame_count = 0
+        self._infer_fps = FpsMeter()
         self._next_model_retry_at = 0.0
         self._model_retry_interval = 10.0
 
@@ -76,6 +78,7 @@ class InferenceWorker:
                 "last_infer_latency_ms": self._last_latency_ms,
                 "last_infer_error": self._last_error,
                 "frames_inferred": self._frame_count,
+                "actual_infer_fps": self._infer_fps.fps(),
             }
 
     def put_frame(self, frame):
@@ -271,6 +274,7 @@ class InferenceWorker:
 
                     with self._status_lock:
                         self._frame_count += 1
+                        self._infer_fps.mark()
                         self._last_success_at = time.time()
                         self._last_latency_ms = round(
                             (infer_end - infer_start) * 1000,

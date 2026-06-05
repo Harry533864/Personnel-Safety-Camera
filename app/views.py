@@ -44,6 +44,32 @@ def read_ai_config():
 def update_ai_config(mutator):
     return ai_config_service.update(mutator)
 
+
+def discover_engine_model_names(model_root: Path):
+    names = []
+    seen = set()
+    root = Path(model_root)
+    if not root.exists():
+        return names
+
+    candidates = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+        if path.is_file() and path.suffix.lower() == ".engine":
+            candidates.append(path.stem)
+        elif path.is_dir() and (path / f"{path.name}.engine").is_file():
+            candidates.append(path.name)
+
+    for candidate in candidates:
+        try:
+            model_name = validate_model_name(candidate)
+        except ValueError:
+            logger.warning("Ignored invalid model file name: %s", candidate)
+            continue
+        if model_name not in seen:
+            names.append(model_name)
+            seen.add(model_name)
+    return names
+
 # =========================================================
 # 基础接口
 # =========================================================
@@ -94,6 +120,7 @@ def stream_mjpeg_preview():
                 time.sleep(0.02)
                 continue
 
+            stream.mark_mjpeg_frame()
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n"
@@ -168,15 +195,21 @@ def set_exposure():
 def set_resolution():
     data = request.get_json(silent=True) or {}
 
-    if "width" not in data or "height" not in data:
+    mode = str(data.get("mode", data.get("resolution", ""))).strip().lower()
+    use_max_resolution = mode in {"max", "maximum", "auto_max"}
+
+    if not use_max_resolution and ("width" not in data or "height" not in data):
         return jsonify({
             "status": "error",
             "message": "缺少 width 或 height 参数"
         }), 400
 
     try:
-        width = int(data["width"])
-        height = int(data["height"])
+        if use_max_resolution:
+            width, height = cam_manager.get_max_resolution()
+        else:
+            width = int(data["width"])
+            height = int(data["height"])
         target = data.get("target", "high")
 
         # 让硬件管理器修改参数并重启硬件取流
@@ -187,7 +220,14 @@ def set_resolution():
 
         return jsonify({
             "status": "success",
-            "message": f"分辨率已设置为 {width}x{height}, target={target}"
+            "message": f"分辨率已设置为 {width}x{height}, target={target}",
+            "data": {
+                "width": width,
+                "height": height,
+                "resolution": f"{width}x{height}",
+                "mode": "max" if use_max_resolution else "custom",
+                "target": target,
+            },
         })
 
     except Exception as e:
@@ -474,10 +514,18 @@ def get_model_list():
         model_names = cfg.get("model_names") or [] 
         if not isinstance(model_names, list):
             model_names = [] # 没有字段 model_names 则为空列表
+        disk_model_names = discover_engine_model_names(MODEL_FILE_PATH)
+        merged_model_names = []
+        seen = set()
+        for model_name in list(model_names) + disk_model_names:
+            if model_name in seen:
+                continue
+            merged_model_names.append(model_name)
+            seen.add(model_name)
 
         return jsonify({
             "status": "success",
-            "models": model_names # 直接返回字段列表(没有时返回空列表)
+            "models": merged_model_names
         })
 
     except Exception as e:

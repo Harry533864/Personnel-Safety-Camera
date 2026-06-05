@@ -24,16 +24,6 @@ find_trtexec() {
 }
 
 TRTEXEC_BIN="$(find_trtexec || true)"
-if [[ -z "$TRTEXEC_BIN" ]]; then
-  cat >&2 <<'EOF'
-trtexec was not found.
-
-Install/enable TensorRT samples or set TRTEXEC=/path/to/trtexec on the Baumer camera.
-The engine must be generated on the final camera hardware.
-EOF
-  exit 1
-fi
-
 if [[ ! -f "$ONNX_PATH" ]]; then
   echo "ONNX file not found: $ONNX_PATH" >&2
   exit 1
@@ -41,10 +31,17 @@ fi
 
 mkdir -p "$ENGINE_DIR"
 
-"$TRTEXEC_BIN" \
-  --onnx="$ONNX_PATH" \
-  --saveEngine="$ENGINE_PATH" \
-  --fp16
+if [[ -n "$TRTEXEC_BIN" ]]; then
+  "$TRTEXEC_BIN" \
+    --onnx="$ONNX_PATH" \
+    --saveEngine="$ENGINE_PATH" \
+    --fp16
+else
+  python3 "$REPO_DIR/scripts/build_tensorrt_engine.py" \
+    --onnx "$ONNX_PATH" \
+    --engine "$ENGINE_PATH" \
+    --fp16
+fi
 
 if [[ -n "$CLASS_TXT" && -f "$CLASS_TXT" ]]; then
   cp "$CLASS_TXT" "$ENGINE_DIR/$MODEL_NAME.txt"

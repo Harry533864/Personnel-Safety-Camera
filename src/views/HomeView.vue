@@ -125,6 +125,11 @@
           <span class="status-text">{{ currentFps || '-- fps' }}</span>
         </div>
 
+        <div class="status-indicator fps-indicator infer-fps-indicator" :class="inferenceFpsClass">
+          <span class="status-dot"></span>
+          <span class="status-text">{{ inferenceFps || '推理 -- fps' }}</span>
+        </div>
+
         <div class="status-indicator" :class="networkStatus">
           <span class="status-dot"></span>
           <span class="status-text">{{ networkSpeed }} MB/s</span>
@@ -144,7 +149,7 @@
           playsinline
         ></video>
         <img
-          v-show="videoLoaded && mjpegMode"
+          v-show="mjpegMode"
           ref="mjpegPlayer"
           class="video-player mjpeg-player"
           :src="mjpegMode ? mjpegPreviewUrl : ''"
@@ -154,7 +159,7 @@
         />
 
         <!-- 视频加载失败的显示层 -->
-        <div class="video-placeholder" v-if="!videoLoaded">
+        <div class="video-placeholder" v-if="!videoLoaded && (!mjpegMode || errorMessage)">
           <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3">
             <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
             <circle cx="8.5" cy="8.5" r="1.5"></circle>
@@ -209,6 +214,8 @@ const mjpegToken = ref(Date.now());
 const videoResolution = ref("");
 const currentFps = ref("");
 const currentFpsValue = ref(0);
+const inferenceFps = ref("");
+const inferenceFpsValue = ref(0);
 const currentTime = ref("");
 const networkSpeed = ref("0.0");
 const networkStatus = ref("normal");
@@ -286,15 +293,21 @@ let videoFrameCallbackId = null;
 let fpsFallbackInterval = null;
 let firstFrameTimer = null;
 let fpsSample = { frames: 0, time: 0 };
+let webrtcAttemptToken = 0;
 
 // 重连机制
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let backendReconnectTimer = null;
+let backendReconnectAttempts = 0;
+let backendReconnectInFlight = false;
 let isConnecting = false;
 let manualReconnectVisiable = false;
 const MAX_RECONNECT_ATTEMPTS = 60;
 const BASE_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 5000;
+const BACKEND_RECONNECT_DELAY = 2000;
+const BACKEND_RECONNECT_MAX_DELAY = 8000;
 
 const activeJetsonLabel = computed(() => {
   try {
@@ -359,22 +372,54 @@ const loadFromSaveState = (saveState, curState) => {
   }
 };
 
-const formatFps = (value) => {
+const formatFps = (value, label = "") => {
   const fps = Number(value);
   if (!Number.isFinite(fps) || fps <= 0) return "";
-  return `${Math.round(fps)} fps`;
+  const text = fps >= 10 ? fps.toFixed(0) : fps.toFixed(1);
+  return `${label}${text} fps`;
 };
 
 const setCurrentFps = (value) => {
   const fps = Number(value);
-  if (!Number.isFinite(fps) || fps <= 0) return;
+  if (!Number.isFinite(fps) || fps <= 0) {
+    currentFpsValue.value = 0;
+    currentFps.value = "预览 -- fps";
+    return;
+  }
   currentFpsValue.value = fps;
-  currentFps.value = formatFps(fps);
+  currentFps.value = formatFps(fps, "预览 ");
+};
+
+const setInferenceFps = (value) => {
+  const fps = Number(value);
+  if (!Number.isFinite(fps) || fps <= 0) {
+    inferenceFpsValue.value = 0;
+    inferenceFps.value = "推理 -- fps";
+    return;
+  }
+  inferenceFpsValue.value = fps;
+  inferenceFps.value = formatFps(fps, "推理 ");
+};
+
+const pickActualFps = (...values) => {
+  for (const value of values) {
+    const fps = Number(value);
+    if (Number.isFinite(fps) && fps > 0) return fps;
+  }
+  return 0;
 };
 
 const currentFpsClass = computed(() => ({
   danger: currentFpsValue.value > 0 && currentFpsValue.value < 10,
 }));
+
+const inferenceFpsClass = computed(() => ({
+  danger: inferenceFpsValue.value > 0 && inferenceFpsValue.value < 10,
+}));
+
+const shouldUseMjpegPreview = (streamStatus) => (
+  streamStatus?.writer_opened === false && streamStatus?.has_stream_frame
+);
 
 const getHostFromUrl = (url) => {
   try {
@@ -458,6 +503,11 @@ const applyJetsonEndpoint = async (device, reconnectNow = true) => {
     videoResolution.value = `${source.width}x${source.height}`;
   }
 
+  if (shouldUseMjpegPreview(device.streamStatus)) {
+    startMjpegPreview(source);
+    return;
+  }
+
   if (reconnectNow) {
     reconnectAttempts = 0;
     manualReconnectVisiable = false;
@@ -528,6 +578,60 @@ const connectPreferredDevice = async () => {
   return false;
 };
 
+const clearBackendReconnect = () => {
+  if (backendReconnectTimer) {
+    clearTimeout(backendReconnectTimer);
+    backendReconnectTimer = null;
+  }
+  backendReconnectAttempts = 0;
+};
+
+const scheduleBackendReconnect = (immediate = false) => {
+  if (backendReconnectTimer || backendReconnectInFlight) return;
+
+  const delay = immediate
+    ? 0
+    : Math.min(
+        BACKEND_RECONNECT_DELAY * Math.pow(1.5, backendReconnectAttempts),
+        BACKEND_RECONNECT_MAX_DELAY
+      );
+
+  backendReconnectTimer = setTimeout(async () => {
+    backendReconnectTimer = null;
+    backendReconnectInFlight = true;
+    let shouldRetry = false;
+
+    try {
+      const connected = await connectPreferredDevice();
+      if (connected) {
+        clearBackendReconnect();
+        activeJetsonOnline.value = true;
+        errorMessage.value = "";
+        await syncRuntimeStreamStatus();
+        if (!mjpegMode.value && !videoLoaded.value) {
+          reconnect();
+        }
+        return;
+      }
+
+      backendReconnectAttempts += 1;
+      shouldRetry = true;
+    } finally {
+      backendReconnectInFlight = false;
+      if (shouldRetry) {
+        scheduleBackendReconnect(false);
+      }
+    }
+  }, delay);
+};
+
+const markBackendOffline = () => {
+  activeJetsonOnline.value = false;
+  videoLoaded.value = false;
+  errorMessage.value = "后端离线，正在尝试重连...";
+  scheduleBackendReconnect(false);
+};
+
 const syncRuntimeStreamStatus = async () => {
   if (!apiBaseUrl.value) return;
 
@@ -538,11 +642,12 @@ const syncRuntimeStreamStatus = async () => {
     });
     const payload = await response.json();
     if (!response.ok || payload.status !== "success") {
-      activeJetsonOnline.value = false;
+      markBackendOffline();
       return;
     }
 
     activeJetsonOnline.value = true;
+    clearBackendReconnect();
 
     const highStream = (payload.data?.streams || []).find((stream) => stream.name === "cam_high");
     const camera = payload.data?.camera;
@@ -553,11 +658,16 @@ const syncRuntimeStreamStatus = async () => {
       videoResolution.value = `${source.width}x${source.height}`;
     }
 
-    if (highStream?.writer_opened === false && highStream?.has_stream_frame) {
+    const isMjpegFallback = shouldUseMjpegPreview(highStream);
+    const actualPreviewFps = isMjpegFallback
+      ? pickActualFps(highStream?.actual_mjpeg_fps)
+      : pickActualFps(highStream?.actual_stream_fps, highStream?.actual_written_fps);
+    setCurrentFps(actualPreviewFps);
+    setInferenceFps(highStream?.actual_infer_fps);
+
+    if (isMjpegFallback) {
       if (!mjpegMode.value) {
         startMjpegPreview(source);
-      } else if (source?.fps) {
-        setCurrentFps(source.fps);
       }
       videoLoaded.value = true;
       errorMessage.value = "";
@@ -576,8 +686,7 @@ const syncRuntimeStreamStatus = async () => {
     }
 
   } catch {
-    activeJetsonOnline.value = false;
-    // Keep the last known display value when runtime status is temporarily unavailable.
+    markBackendOffline();
   }
 };
 
@@ -680,28 +789,35 @@ const stopMjpegPreview = () => {
 const startMjpegPreview = (source = null) => {
   if (!apiBaseUrl.value) return;
 
+  webrtcAttemptToken += 1;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempts = 0;
+  manualReconnectVisiable = false;
   closeWebRTC();
   mjpegMode.value = true;
   mjpegToken.value = Date.now();
   videoLoaded.value = true;
   errorMessage.value = "";
 
-  if (source?.fps) {
-    setCurrentFps(source.fps);
-  }
+  setCurrentFps(source?.actual_mjpeg_fps);
 };
 
 const handleMjpegLoaded = () => {
   if (!mjpegMode.value) return;
   videoLoaded.value = true;
   errorMessage.value = "";
+  clearBackendReconnect();
 };
 
 const handleMjpegError = () => {
   if (!mjpegMode.value) return;
 
   videoLoaded.value = false;
-  errorMessage.value = "MJPEG 预览连接失败，正在重连...";
+  errorMessage.value = "预览连接失败，正在尝试重连...";
+  scheduleBackendReconnect(true);
   setTimeout(() => {
     if (!mjpegMode.value) return;
     mjpegToken.value = Date.now();
@@ -763,6 +879,8 @@ const handleConnectionFailed = () => {
 // ---------- WebRTC 初始化 ----------
 const initWebRTC = async () => {
   if (!videoPlayer.value) return;
+  const attemptToken = webrtcAttemptToken + 1;
+  webrtcAttemptToken = attemptToken;
   stopMjpegPreview();
   // 先关闭可能存在的旧连接
   closeWebRTC();
@@ -827,7 +945,9 @@ const initWebRTC = async () => {
 
     // 创建 Offer（SDP）
     const offer = await pc.createOffer();
+    if (attemptToken !== webrtcAttemptToken || mjpegMode.value) return;
     await pc.setLocalDescription(offer);
+    if (attemptToken !== webrtcAttemptToken || mjpegMode.value) return;
 
     // 等待 ICE 候选收集完成（一次性发送，避免 Trickle ICE 复杂度）
     await new Promise(resolve => {
@@ -839,6 +959,7 @@ const initWebRTC = async () => {
         };
       }
     });
+    if (attemptToken !== webrtcAttemptToken || mjpegMode.value) return;
 
     // 发送 Offer SDP 到 WHEP 端点
     const response = await fetch(`${streamBaseUrl.value}/cam_high/whep`, {
@@ -846,6 +967,7 @@ const initWebRTC = async () => {
       headers: { "Content-Type": "application/sdp" },
       body: pc.localDescription.sdp
     });
+    if (attemptToken !== webrtcAttemptToken || mjpegMode.value) return;
 
     if (!response.ok) {
       throw new Error(`WHEP 请求失败: ${response.status}`);
@@ -853,6 +975,7 @@ const initWebRTC = async () => {
 
     // 获取 Answer SDP
     const answerSDP = await response.text();
+    if (attemptToken !== webrtcAttemptToken || mjpegMode.value) return;
     await pc.setRemoteDescription(new RTCSessionDescription({
       type: "answer",
       sdp: answerSDP
@@ -922,13 +1045,15 @@ onMounted(async () => {
   loadFromSaveState(saveExceptionOutputState, exceptionOutputState);
 
   await connectPreferredDevice();
-  reconnect();
-  syncRuntimeStreamStatus();
+  await syncRuntimeStreamStatus();
+  if (!mjpegMode.value) {
+    reconnect();
+  }
   runtimeStatusInterval = setInterval(syncRuntimeStreamStatus, 3000);
 
   // 尝试获取设置的分辨率值
   const saveCameraSettings = cameraSettingStore.getSettings();
-  if (!videoResolution.value && saveCameraSettings.resolution) {
+  if (!videoResolution.value && saveCameraSettings.resolution && saveCameraSettings.resolution !== "max") {
     videoResolution.value = `${saveCameraSettings.resolution}`;
   }
 });
@@ -938,6 +1063,7 @@ onUnmounted(() => {
   clearInterval(speedInterval);
   if (runtimeStatusInterval) clearInterval(runtimeStatusInterval);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (backendReconnectTimer) clearTimeout(backendReconnectTimer);
   closeWebRTC();
   stopMjpegPreview();
 });

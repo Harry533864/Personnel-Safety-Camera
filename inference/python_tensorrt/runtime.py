@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -62,6 +64,107 @@ class FrameResult:
     allow_start: bool = False
     warning: bool = False
     alarm: bool = False
+
+
+class CudaRuntime:
+    MEMCPY_HOST_TO_DEVICE = 1
+    MEMCPY_DEVICE_TO_HOST = 2
+
+    def __init__(self) -> None:
+        self.lib = self._load_libcudart()
+        self._bind()
+
+    @staticmethod
+    def _load_libcudart():
+        candidates = [
+            ctypes.util.find_library("cudart"),
+            "libcudart.so",
+            "libcudart.so.11.0",
+            "libcudart.so.12",
+            "/usr/local/cuda/lib64/libcudart.so",
+        ]
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                return ctypes.CDLL(candidate)
+            except OSError:
+                continue
+        raise RuntimeError("libcudart.so not found")
+
+    def _bind(self) -> None:
+        self.lib.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        self.lib.cudaMalloc.restype = ctypes.c_int
+        self.lib.cudaFree.argtypes = [ctypes.c_void_p]
+        self.lib.cudaFree.restype = ctypes.c_int
+        self.lib.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self.lib.cudaMemcpyAsync.restype = ctypes.c_int
+        self.lib.cudaStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self.lib.cudaStreamCreate.restype = ctypes.c_int
+        self.lib.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        self.lib.cudaStreamDestroy.restype = ctypes.c_int
+        self.lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self.lib.cudaStreamSynchronize.restype = ctypes.c_int
+        self.lib.cudaGetErrorString.argtypes = [ctypes.c_int]
+        self.lib.cudaGetErrorString.restype = ctypes.c_char_p
+
+    def _check(self, code: int, action: str) -> None:
+        if code == 0:
+            return
+        message = self.lib.cudaGetErrorString(code)
+        text = message.decode("utf-8", "replace") if message else str(code)
+        raise RuntimeError(f"CUDA {action} failed: {text}")
+
+    def malloc(self, nbytes: int) -> ctypes.c_void_p:
+        ptr = ctypes.c_void_p()
+        self._check(self.lib.cudaMalloc(ctypes.byref(ptr), int(nbytes)), "malloc")
+        return ptr
+
+    def free(self, ptr: ctypes.c_void_p | None) -> None:
+        if ptr and ptr.value:
+            self._check(self.lib.cudaFree(ptr), "free")
+
+    def create_stream(self) -> ctypes.c_void_p:
+        stream = ctypes.c_void_p()
+        self._check(self.lib.cudaStreamCreate(ctypes.byref(stream)), "stream create")
+        return stream
+
+    def destroy_stream(self, stream: ctypes.c_void_p | None) -> None:
+        if stream and stream.value:
+            self._check(self.lib.cudaStreamDestroy(stream), "stream destroy")
+
+    def synchronize(self, stream: ctypes.c_void_p) -> None:
+        self._check(self.lib.cudaStreamSynchronize(stream), "stream synchronize")
+
+    def memcpy_htod_async(self, dst: ctypes.c_void_p, src: np.ndarray, stream: ctypes.c_void_p) -> None:
+        self._check(
+            self.lib.cudaMemcpyAsync(
+                dst,
+                ctypes.c_void_p(src.ctypes.data),
+                int(src.nbytes),
+                self.MEMCPY_HOST_TO_DEVICE,
+                stream,
+            ),
+            "memcpy host to device",
+        )
+
+    def memcpy_dtoh_async(self, dst: np.ndarray, src: ctypes.c_void_p, stream: ctypes.c_void_p) -> None:
+        self._check(
+            self.lib.cudaMemcpyAsync(
+                ctypes.c_void_p(dst.ctypes.data),
+                src,
+                int(dst.nbytes),
+                self.MEMCPY_DEVICE_TO_HOST,
+                stream,
+            ),
+            "memcpy device to host",
+        )
 
 
 @dataclass
@@ -306,30 +409,35 @@ class TensorRTDetector:
         if not self.input_names or not self.output_names:
             raise RuntimeError("TensorRT engine 必须至少包含一个输入和一个输出 tensor")
 
-        self.device_tensors: Dict[str, Any] = {}
-        self._allocate_buffers()
-        self._warmup()
+        self.cuda = CudaRuntime()
+        self.stream = self.cuda.create_stream()
+        self.device_tensors: Dict[str, ctypes.c_void_p] = {}
+        self.host_outputs: Dict[str, np.ndarray] = {}
+        self.tensor_shapes: Dict[str, Tuple[int, ...]] = {}
+        self.tensor_dtypes: Dict[str, Any] = {}
+        try:
+            self._allocate_buffers()
+            self._warmup()
+        except Exception:
+            self.close()
+            raise
 
     def _load_runtime_modules(self) -> None:
         try:
             import tensorrt as trt
-            import torch
         except Exception as exc:
-            raise RuntimeError("Python TensorRT 运行需要 tensorrt 和 torch CUDA 环境") from exc
-        if not torch.cuda.is_available():
-            raise RuntimeError("torch.cuda 不可用，无法运行 TensorRT engine")
+            raise RuntimeError("Python TensorRT 运行需要 tensorrt 环境") from exc
         self.trt = trt
-        self.torch = torch
 
-    def _torch_dtype(self, trt_dtype: Any) -> Any:
+    def _numpy_dtype(self, trt_dtype: Any) -> Any:
         mapping = {
-            self.trt.float32: self.torch.float32,
-            self.trt.float16: self.torch.float16,
-            self.trt.int32: self.torch.int32,
-            self.trt.int8: self.torch.int8,
-            self.trt.bool: self.torch.bool,
+            self.trt.float32: np.float32,
+            self.trt.float16: np.float16,
+            self.trt.int32: np.int32,
+            self.trt.int8: np.int8,
+            self.trt.bool: np.bool_,
         }
-        return mapping.get(trt_dtype, self.torch.float32)
+        return mapping.get(trt_dtype, np.float32)
 
     def _allocate_buffers(self) -> None:
         height, width = self.config.input_size
@@ -343,23 +451,47 @@ class TensorRTDetector:
                 shape = tuple(int(dim) for dim in self.engine.get_tensor_shape(name))
             if any(dim <= 0 for dim in shape):
                 raise RuntimeError(f"无法解析 TensorRT tensor shape: {name}={shape}")
-            dtype = self._torch_dtype(self.engine.get_tensor_dtype(name))
-            tensor = self.torch.empty(shape, device="cuda", dtype=dtype)
-            self.device_tensors[name] = tensor
-            self.context.set_tensor_address(name, tensor.data_ptr())
+            dtype = self._numpy_dtype(self.engine.get_tensor_dtype(name))
+            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+            ptr = self.cuda.malloc(nbytes)
+            self.device_tensors[name] = ptr
+            self.tensor_shapes[name] = shape
+            self.tensor_dtypes[name] = dtype
+            if name in self.output_names:
+                self.host_outputs[name] = np.empty(shape, dtype=dtype)
+            self.context.set_tensor_address(name, int(ptr.value))
 
     def _warmup(self) -> None:
         input_name = self.input_names[0]
-        self.device_tensors[input_name].zero_()
+        tensor = np.zeros(self.tensor_shapes[input_name], dtype=self.tensor_dtypes[input_name])
+        self.cuda.memcpy_htod_async(self.device_tensors[input_name], tensor, self.stream)
         for _ in range(5):
             self._execute()
 
     def _execute(self) -> None:
-        stream = self.torch.cuda.current_stream()
-        ok = self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+        ok = self.context.execute_async_v3(stream_handle=int(self.stream.value))
         if not ok:
             raise RuntimeError("TensorRT execute_async_v3 执行失败")
-        stream.synchronize()
+        self.cuda.synchronize(self.stream)
+
+    def close(self) -> None:
+        for ptr in list(getattr(self, "device_tensors", {}).values()):
+            try:
+                self.cuda.free(ptr)
+            except Exception:
+                pass
+        self.device_tensors = {}
+        try:
+            self.cuda.destroy_stream(getattr(self, "stream", None))
+        except Exception:
+            pass
+        self.stream = ctypes.c_void_p()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _letterbox(image: np.ndarray, input_size: Tuple[int, int]) -> Tuple[np.ndarray, float, float, float]:
@@ -385,10 +517,16 @@ class TensorRTDetector:
     def infer(self, frame: np.ndarray) -> List[Detection]:
         tensor, ratio, dw, dh = self._letterbox(frame, self.config.input_size)
         input_name = self.input_names[0]
-        input_tensor = self.torch.as_tensor(tensor, device="cuda")
-        self.device_tensors[input_name].copy_(input_tensor)
+        input_dtype = self.tensor_dtypes[input_name]
+        if tensor.dtype != input_dtype:
+            tensor = tensor.astype(input_dtype, copy=False)
+        tensor = np.ascontiguousarray(tensor)
+        self.cuda.memcpy_htod_async(self.device_tensors[input_name], tensor, self.stream)
         self._execute()
-        output = self.device_tensors[self.output_names[0]].detach().cpu().numpy()
+        output_name = self.output_names[0]
+        output = self.host_outputs[output_name]
+        self.cuda.memcpy_dtoh_async(output, self.device_tensors[output_name], self.stream)
+        self.cuda.synchronize(self.stream)
         return self._postprocess(output, frame.shape, ratio, dw, dh)
 
     def _postprocess(
