@@ -131,6 +131,28 @@ class BaumerNeoApiCapture:
             self.logger.info("Baumer feature %s=%r not applied: %s", name, value, exc)
             return False
 
+    def _enum_value(self, feature_name: str, value: str):
+        if self.neoapi is None:
+            return None
+
+        normalized = str(value).strip().replace(" ", "").replace("-", "")
+        candidates = [
+            f"{feature_name}_{normalized}",
+            f"{feature_name}_{normalized.capitalize()}",
+            f"{feature_name}_{normalized.upper()}",
+        ]
+        for candidate in candidates:
+            enum_value = getattr(self.neoapi, candidate, None)
+            if enum_value is not None:
+                return enum_value
+        return None
+
+    def _set_enum_feature(self, name: str, value: str) -> bool:
+        enum_value = self._enum_value(name, value)
+        if enum_value is not None and self._set_feature(name, enum_value):
+            return True
+        return self._set_feature(name, value)
+
     def _configure_camera(self) -> None:
         # Order matters on many industrial cameras: pixel format first, then ROI.
         self._set_pixel_format()
@@ -158,11 +180,23 @@ class BaumerNeoApiCapture:
 
     def _configure_exposure(self) -> None:
         if self.exposure_us > 0:
-            self._set_feature("ExposureAuto", "Off")
+            self._set_enum_feature("ExposureMode", "Timed")
+            self._set_enum_feature("ExposureAuto", "Off")
+            self._set_enum_feature("GainAuto", "Off")
             self._set_feature("ExposureTime", float(self.exposure_us))
+            self.logger.info("Baumer manual exposure requested: %sus", self.exposure_us)
         else:
             # Keep automatic exposure as the safe production default.
-            self._set_feature("ExposureAuto", "Continuous")
+            self._set_enum_feature("ExposureMode", "Timed")
+            exposure_ok = self._set_enum_feature("ExposureAuto", "Continuous")
+            gain_ok = self._set_enum_feature("GainAuto", "Continuous")
+            white_ok = self._set_enum_feature("BalanceWhiteAuto", "Continuous")
+            self.logger.info(
+                "Baumer auto exposure requested: exposure_auto=%s gain_auto=%s white_auto=%s",
+                exposure_ok,
+                gain_ok,
+                white_ok,
+            )
 
     def _normalize_frame(self, frame):
         if frame is None:
