@@ -146,6 +146,16 @@ class StreamRecorder:
     def _open(self, current_w, current_h, current_fps, stream_stats=None):
         self.close(stream_stats)
 
+        unavailable_reason = StreamPublisher.unavailable_reason()
+        if unavailable_reason:
+            self.last_error = f"record unavailable: {unavailable_reason}"
+            self.logger.warning(
+                "Local recording unavailable: %s; cooling down for 60s",
+                unavailable_reason,
+            )
+            self.cooldown_until = time.time() + 60.0
+            return
+
         duration_min = read_record_config(self.ai_config_path)
         self.duration_limit = duration_min * 60.0
 

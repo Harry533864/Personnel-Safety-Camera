@@ -8,6 +8,7 @@ import cv2
 class StreamPublisher:
     _probe_cache = {}
     _encoder_probe = None
+    _opencv_gstreamer_probe = None
 
     def __init__(self, name, url):
         self.name = name
@@ -40,6 +41,42 @@ class StreamPublisher:
 
         cls._probe_cache[element] = available
         return available
+
+    @classmethod
+    def _opencv_has_gstreamer(cls):
+        if cls._opencv_gstreamer_probe is not None:
+            return cls._opencv_gstreamer_probe
+
+        try:
+            info = cv2.getBuildInformation()
+            cls._opencv_gstreamer_probe = "GStreamer:                   YES" in info
+        except Exception:
+            cls._opencv_gstreamer_probe = False
+        return cls._opencv_gstreamer_probe
+
+    @classmethod
+    def unavailable_reason(cls):
+        if not cls._opencv_has_gstreamer():
+            return "OpenCV was built without GStreamer support"
+
+        required = ["appsrc", "videoconvert", "h264parse", "flvmux", "rtmpsink"]
+        missing = [element for element in required if not cls._has_gst_element(element)]
+        if missing:
+            return f"Missing GStreamer elements: {', '.join(missing)}"
+
+        encoder = cls._select_encoder()
+        if encoder == "nvv4l2h264enc":
+            missing = [
+                element
+                for element in ("nvv4l2h264enc", "nvvidconv")
+                if not cls._has_gst_element(element)
+            ]
+            if missing:
+                return f"Missing GStreamer elements: {', '.join(missing)}"
+        elif not cls._has_gst_element("x264enc"):
+            return "Missing GStreamer element: x264enc"
+
+        return None
 
     @classmethod
     def _select_encoder(cls):
@@ -121,6 +158,11 @@ class StreamPublisher:
         return pipeline
 
     def open_writer(self, current_w, current_h, current_fps):
+        unavailable_reason = self.unavailable_reason()
+        if unavailable_reason:
+            self.last_error = unavailable_reason
+            raise RuntimeError(f"[{self.name}] {unavailable_reason}")
+
         pipeline = self.build_pipeline(
             current_w=current_w,
             current_h=current_h,

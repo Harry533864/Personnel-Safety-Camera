@@ -154,8 +154,16 @@ const modelOptions = computed(() => {
   if (models.length) {
     return models;
   }
+
   return settings.detectionModel ? [settings.detectionModel] : [];
 });
+
+const syncSelectedModelWithList = (models) => {
+  if (!Array.isArray(models) || !models.length) return;
+  if (models.includes(settings.detectionModel)) return;
+  settings.detectionModel = models[0];
+  detectionSettingStore.setSettings(settings);
+};
 
 const goBack = () => {
   if (isLoading.value) return;
@@ -176,19 +184,24 @@ const confirmSettings = async () => {
   } finally {
     isLoading.value = false;
   }
-
-  // 返回首页
-  router.push("/");
 };
 
 onMounted(async () => {
-  if (modelManagementStore.getModels().length) {
-    return;
-  }
-
   modelsLoading.value = true;
-  await modelManagementStore.fetchModels();
-  modelsLoading.value = false;
+  try {
+    const [remoteSettings, models] = await Promise.all([
+      detectionSettingStore.fetchSettings(),
+      modelManagementStore.fetchModels(),
+    ]);
+
+    if (remoteSettings) {
+      Object.assign(settings, remoteSettings);
+    }
+
+    syncSelectedModelWithList(models || modelManagementStore.getModels());
+  } finally {
+    modelsLoading.value = false;
+  }
 });
 </script>
 

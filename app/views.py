@@ -4,13 +4,19 @@ from pathlib import Path
 import shutil
 import logging
 import time
+import threading
 
 from app import app
 import cv2
 from flask import Response, request, jsonify, render_template, send_file, url_for
 
 from app.config_schema import validate_model_name, resolve_model_dir
-from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
+from app.runtime_paths import (
+    AI_CONFIG_PATH,
+    CAMERA_CONFIG_PATH,
+    MODEL_FILE_PATH,
+    VIDEO_BASE_PATH,
+)
 from app.runtime import (
     build_runtime_status,
     cam_manager,
@@ -21,6 +27,7 @@ from app.runtime import (
     sync_infer_enable_from_config,
 )
 from app.services.config_service import ai_config_service
+from app.services.camera_config_service import camera_config_service
 
 from app.utils import (
     to_bool,
@@ -33,8 +40,12 @@ from app.utils import (
 
 logger = logging.getLogger(__name__)
 logger.info("AI config path: %s", AI_CONFIG_PATH)
+logger.info("Camera config path: %s", CAMERA_CONFIG_PATH)
 logger.info("Model directory: %s", MODEL_FILE_PATH)
 logger.info("Video base directory: %s", VIDEO_BASE_PATH)
+
+_mjpeg_client_lock = threading.Lock()
+_mjpeg_active_clients = {}
 
 
 def read_ai_config():
@@ -43,6 +54,38 @@ def read_ai_config():
 
 def update_ai_config(mutator):
     return ai_config_service.update(mutator)
+
+
+def _current_camera_settings_payload():
+    status = cam_manager.get_status()
+    defaults = {
+        "width": status.get("width", 1920),
+        "height": status.get("height", 1080),
+        "fps": status.get("fps", 60),
+        "exposure": status.get("exposure", 0),
+        "gain": status.get("gain", 0),
+        "white_balance": status.get("white_balance", "continuous"),
+    }
+    persisted = camera_config_service.read(defaults=defaults)
+
+    width = int(status.get("width") or persisted["width"])
+    height = int(status.get("height") or persisted["height"])
+    fps = int(status.get("fps") or persisted["fps"])
+    resolution = persisted.get("resolution") or f"{width}x{height}"
+    if resolution != "max" or persisted.get("width") != width or persisted.get("height") != height:
+        resolution = f"{width}x{height}"
+
+    return {
+        "resolution": resolution,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "exposure": int(status.get("exposure", persisted["exposure"]) or 0),
+        "gain": float(status.get("gain", persisted["gain"]) or 0),
+        "white_balance": status.get("white_balance") or persisted["white_balance"],
+        "whiteBalance": status.get("white_balance") or persisted["white_balance"],
+        "target": persisted.get("target", "high"),
+    }
 
 
 def discover_engine_model_names(model_root: Path):
@@ -70,6 +113,46 @@ def discover_engine_model_names(model_root: Path):
             seen.add(model_name)
     return names
 
+
+def build_detection_settings_payload(cfg):
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+
+    try:
+        detection_enabled = to_bool(model_cfg.get("detect_enable", False))
+    except Exception:
+        detection_enabled = False
+
+    try:
+        detection_threshold = float(model_cfg.get("conf_thres", 0.5))
+    except (TypeError, ValueError):
+        detection_threshold = 0.5
+
+    overlap_rate = 0.1
+    rois = model_cfg.get("rois", [])
+    if isinstance(rois, list):
+        for roi in rois:
+            if not isinstance(roi, dict) or "overlap_thres" not in roi:
+                continue
+            try:
+                overlap_rate = float(roi["overlap_thres"])
+                break
+            except (TypeError, ValueError):
+                continue
+
+    target = str(model_cfg.get("infer_target") or "all").lower()
+    if target not in {"high", "low", "all"}:
+        target = "all"
+
+    return {
+        "detectionEnabled": detection_enabled,
+        "detectionModel": str(model_cfg.get("model_name") or ""),
+        "detectionThreshold": detection_threshold,
+        "overlapRate": overlap_rate,
+        "target": target,
+    }
+
 # =========================================================
 # 基础接口
 # =========================================================
@@ -91,10 +174,39 @@ def get_runtime_status():
     })
 
 
+@app.route("/api/stream/config", methods=["GET"])
+def get_stream_config():
+    try:
+        return jsonify({
+            "status": "success",
+            "data": _current_camera_settings_payload(),
+        })
+    except Exception as e:
+        logger.exception("Failed to read camera stream config")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
+
+
 @app.route("/api/stream/mjpeg", methods=["GET"])
 def stream_mjpeg_preview():
     """Lightweight preview fallback for devices without OpenCV GStreamer."""
     target = request.args.get("target", "high")
+    try:
+        preview_fps = max(1, min(60, int(request.args.get("fps", "60"))))
+    except (TypeError, ValueError):
+        preview_fps = 60
+    try:
+        jpeg_quality = max(35, min(95, int(request.args.get("quality", "55"))))
+    except (TypeError, ValueError):
+        jpeg_quality = 55
+    try:
+        max_width = max(0, int(request.args.get("max_width", "1024")))
+    except (TypeError, ValueError):
+        max_width = 1024
+    include_overlay = to_bool(request.args.get("overlay", "1"))
+
     streams = get_target_streams(target)
     stream = streams[0] if streams else None
 
@@ -104,32 +216,136 @@ def stream_mjpeg_preview():
             "message": "No stream is available for MJPEG preview",
         }), 404
 
+    client_key = getattr(stream, "name", target)
+    client_id = request.args.get("t") or f"{time.time()}-{id(request)}"
+    with _mjpeg_client_lock:
+        _mjpeg_active_clients[client_key] = client_id
+
+    frame_interval = 1.0 / preview_fps
+
     def generate():
-        while True:
-            frame = stream.inference.get_frame()
-            if frame is None:
-                time.sleep(0.05)
-                continue
+        last_frame_time = 0.0
+        next_frame_at = 0.0
 
-            ok, encoded = cv2.imencode(
-                ".jpg",
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), 85],
-            )
-            if not ok:
-                time.sleep(0.02)
-                continue
+        try:
+            while True:
+                with _mjpeg_client_lock:
+                    if _mjpeg_active_clients.get(client_key) != client_id:
+                        break
 
-            stream.mark_mjpeg_frame()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + encoded.tobytes()
-                + b"\r\n"
-            )
-            time.sleep(0.03)
+                frame, frame_time = stream.inference.get_frame_snapshot(
+                    include_overlay=include_overlay,
+                )
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
 
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+                if frame_time and frame_time <= last_frame_time:
+                    time.sleep(0.005)
+                    continue
+
+                now = time.perf_counter()
+                if now < next_frame_at:
+                    time.sleep(next_frame_at - now)
+                next_frame_at = time.perf_counter() + frame_interval
+
+                if max_width and frame.shape[1] > max_width:
+                    scale = max_width / frame.shape[1]
+                    frame = cv2.resize(
+                        frame,
+                        (max_width, max(1, int(frame.shape[0] * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+                )
+                if not ok:
+                    time.sleep(0.02)
+                    continue
+
+                frame_bytes = encoded.tobytes()
+                last_frame_time = frame_time or time.time()
+                stream.mark_mjpeg_frame()
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"Content-Length: " + str(len(frame_bytes)).encode("ascii") + b"\r\n\r\n"
+                    + frame_bytes
+                    + b"\r\n"
+                )
+        finally:
+            with _mjpeg_client_lock:
+                if _mjpeg_active_clients.get(client_key) == client_id:
+                    _mjpeg_active_clients.pop(client_key, None)
+
+    response = Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@app.route("/api/stream/snapshot", methods=["GET"])
+def stream_snapshot():
+    target = request.args.get("target", "high")
+    try:
+        jpeg_quality = max(35, min(95, int(request.args.get("quality", "70"))))
+    except (TypeError, ValueError):
+        jpeg_quality = 70
+    try:
+        max_width = max(0, int(request.args.get("max_width", "0")))
+    except (TypeError, ValueError):
+        max_width = 0
+    include_overlay = to_bool(request.args.get("overlay", "0"))
+
+    streams = get_target_streams(target)
+    stream = streams[0] if streams else None
+
+    if stream is None:
+        return jsonify({
+            "status": "error",
+            "message": "No stream is available for snapshot",
+        }), 404
+
+    frame, frame_time = stream.inference.get_frame_snapshot(
+        include_overlay=include_overlay,
+    )
+    if frame is None:
+        return jsonify({
+            "status": "error",
+            "message": "No video frame is available yet",
+        }), 404
+
+    if max_width and frame.shape[1] > max_width:
+        scale = max_width / frame.shape[1]
+        frame = cv2.resize(
+            frame,
+            (max_width, max(1, int(frame.shape[0] * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+    )
+    if not ok:
+        return jsonify({
+            "status": "error",
+            "message": "Failed to encode snapshot",
+        }), 500
+
+    response = Response(encoded.tobytes(), mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    if frame_time:
+        response.headers["X-Frame-Time"] = str(frame_time)
+    return response
+
 
 # =========================================================
 # 推流接口
@@ -177,7 +393,12 @@ def set_exposure():
 
     try:
         value = int(data["value"])
+        target = data.get("target", "high")
         cam_manager.set_exposure(value)
+        camera_config_service.update({
+            "exposure": value,
+            "target": target,
+        })
 
         return jsonify({
             "status": "success",
@@ -188,6 +409,73 @@ def set_exposure():
         return jsonify({
             "status": "error",
             "message": f"设置曝光失败: {e}"
+        }), 400
+
+
+@app.route("/api/stream/gain", methods=["POST"])
+def set_gain():
+    data = request.get_json(silent=True) or {}
+
+    if "value" not in data:
+        return jsonify({
+            "status": "error",
+            "message": "缺少 gain 参数"
+        }), 400
+
+    try:
+        value = float(data["value"])
+        if value < 0:
+            raise ValueError("gain must be >= 0")
+
+        target = data.get("target", "high")
+        cam_manager.set_gain(value)
+        camera_config_service.update({
+            "gain": value,
+            "target": target,
+        })
+
+        return jsonify({
+            "status": "success",
+            "message": f"增益已设置为: {value:g}"
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"设置增益失败: {e}"
+        }), 400
+
+
+@app.route("/api/stream/white_balance", methods=["POST"])
+def set_white_balance():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+
+    if mode is None and "auto" in data:
+        mode = "continuous" if to_bool(data.get("auto")) else "off"
+    mode = str(mode or "continuous").strip().lower()
+
+    try:
+        target = data.get("target", "high")
+        cam_manager.set_white_balance(mode)
+        settings = camera_config_service.update({
+            "white_balance": mode,
+            "target": target,
+        })
+
+        return jsonify({
+            "status": "success",
+            "message": f"白平衡已设置为: {mode}",
+            "data": {
+                "mode": settings["white_balance"],
+                "target": settings["target"],
+            },
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"设置白平衡失败: {e}"
         }), 400
 
 
@@ -217,6 +505,12 @@ def set_resolution():
 
         for stream in get_target_streams(target):
             stream.set_resolution(width, height)
+        settings = camera_config_service.update({
+            "resolution": "max" if use_max_resolution else f"{width}x{height}",
+            "width": width,
+            "height": height,
+            "target": target,
+        })
 
         return jsonify({
             "status": "success",
@@ -225,8 +519,9 @@ def set_resolution():
                 "width": width,
                 "height": height,
                 "resolution": f"{width}x{height}",
-                "mode": "max" if use_max_resolution else "custom",
-                "target": target,
+                "savedResolution": settings["resolution"],
+                "mode": "max" if settings["resolution"] == "max" else "custom",
+                "target": settings["target"],
             },
         })
 
@@ -256,6 +551,10 @@ def set_fps():
 
         for stream in get_target_streams(target):
             stream.set_fps(fps)
+        settings = camera_config_service.update({
+            "fps": fps,
+            "target": target,
+        })
 
         return jsonify({
             "status": "success",
@@ -272,6 +571,21 @@ def set_fps():
 # =========================================================
 # AI检测配置接口
 # =========================================================
+
+@app.route("/api/detection/config", methods=["GET"])
+def get_detection_configuration():
+    try:
+        cfg = read_ai_config()
+        return jsonify({
+            "status": "success",
+            "data": build_detection_settings_payload(cfg),
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
+
 
 @app.route("/api/detection/detect", methods=["POST"])
 def update_inference_configuration():
@@ -760,7 +1074,8 @@ def add_header(response):
     Disable browser cache.
     """
     response.headers["X-UA-Compatible"] = "IE=Edge,chrome=1"
-    response.headers["Cache-Control"] = "public, max-age=0"
+    if "Cache-Control" not in response.headers:
+        response.headers["Cache-Control"] = "public, max-age=0"
     return response
 
 

@@ -9,7 +9,13 @@ from typing import Any
 
 from app.Cam.CamManager import CamManager
 from app.Cam.CamStream import CamStream
-from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
+from app.runtime_paths import (
+    AI_CONFIG_PATH,
+    CAMERA_CONFIG_PATH,
+    MODEL_FILE_PATH,
+    VIDEO_BASE_PATH,
+)
+from app.services.camera_config_service import camera_config_service
 from app.services.config_service import ai_config_service
 from app.utils import should_enable_stream_ai, to_bool
 
@@ -48,9 +54,30 @@ def _read_ai_startup_state() -> tuple[bool, str]:
     return enable, target
 
 
-ORI_WIDTH = _env_int("CAMERA_WIDTH", 1920)
-ORI_HEIGHT = _env_int("CAMERA_HEIGHT", 1080)
-ORI_FPS = _env_int("CAMERA_FPS", 60)
+ENV_CAMERA_DEFAULTS = {
+    "width": _env_int("CAMERA_WIDTH", 1920),
+    "height": _env_int("CAMERA_HEIGHT", 1080),
+    "fps": _env_int("CAMERA_FPS", 60),
+    "exposure": _env_int("CAMERA_EXPOSURE", 0),
+    "gain": float(os.environ.get("CAMERA_GAIN", "0") or 0),
+    "white_balance": os.environ.get("CAMERA_WHITE_BALANCE", "continuous"),
+    "target": "high",
+}
+STARTUP_CAMERA_CONFIG = camera_config_service.read(defaults=ENV_CAMERA_DEFAULTS)
+ORI_WIDTH = int(STARTUP_CAMERA_CONFIG["width"])
+ORI_HEIGHT = int(STARTUP_CAMERA_CONFIG["height"])
+ORI_FPS = int(STARTUP_CAMERA_CONFIG["fps"])
+
+logger.info(
+    "Camera startup config path=%s width=%s height=%s fps=%s exposure=%s gain=%s white_balance=%s",
+    CAMERA_CONFIG_PATH,
+    ORI_WIDTH,
+    ORI_HEIGHT,
+    ORI_FPS,
+    STARTUP_CAMERA_CONFIG["exposure"],
+    STARTUP_CAMERA_CONFIG["gain"],
+    STARTUP_CAMERA_CONFIG["white_balance"],
+)
 
 cam_manager = CamManager(
     camera_id=_camera_id(),
@@ -59,6 +86,9 @@ cam_manager = CamManager(
     fps=ORI_FPS,
     capture_backend=os.environ.get("CAM_CAPTURE_BACKEND", "v4l2"),
 )
+cam_manager.set_exposure(int(STARTUP_CAMERA_CONFIG["exposure"]))
+cam_manager.set_gain(float(STARTUP_CAMERA_CONFIG["gain"]))
+cam_manager.set_white_balance(STARTUP_CAMERA_CONFIG["white_balance"])
 
 AI_INFER_ENABLE, AI_INFER_TARGET = _read_ai_startup_state()
 

@@ -312,8 +312,21 @@ class CamStream:
                 current_fps = max(1, int(self.fps))
                 need_restart = self._need_writer_restart
 
+            publisher_unavailable = self.publisher.unavailable_reason()
+            if publisher_unavailable:
+                self._close_writer(writer)
+                writer = None
+                with self.status_lock:
+                    self.writer_opened = False
+                    self.last_writer_error = publisher_unavailable
+                with self.set_lock:
+                    self._need_writer_restart = False
+
             # 1. 分辨率/FPS 变化时，先重启 GStreamer writer
-            if need_restart or writer is None or not writer.isOpened():
+            if (
+                not publisher_unavailable
+                and (need_restart or writer is None or not writer.isOpened())
+            ):
                 self._close_writer(writer)
                 writer = None
                 with self.status_lock:
@@ -391,6 +404,10 @@ class CamStream:
 
             # 6. 写入 GStreamer 推流
             try:
+                if publisher_unavailable:
+                    self.recorder.write(frame, self._record_stats())
+                    continue
+
                 if writer is None or not writer.isOpened():
                     self.logger.warning("GStreamer writer closed; restarting")
                     with self.status_lock:

@@ -1,4 +1,4 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHashHistory, createWebHistory } from 'vue-router'
 
 // 导入各个模块的路由
 import homeRoutes from './home'
@@ -10,7 +10,9 @@ import exceptionOutputRoutes from './exceptionOutput'
 import videoPageRoutes from './videoPage'
 
 const router = createRouter({
-  history: createWebHistory(import.meta.env.BASE_URL),
+  history: import.meta.env.VITE_ROUTER_MODE === 'hash'
+    ? createWebHashHistory(import.meta.env.BASE_URL)
+    : createWebHistory(import.meta.env.BASE_URL),
   routes: [
     ...homeRoutes,
     ...cameraRoutes,

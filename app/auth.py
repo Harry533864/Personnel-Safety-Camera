@@ -13,6 +13,8 @@ PROTECTED_RULES: tuple[tuple[str, set[str]], ...] = (
     ("/api/stream/start", {"GET", "POST"}),
     ("/api/stream/stop", {"GET", "POST"}),
     ("/api/stream/exposure", {"POST"}),
+    ("/api/stream/gain", {"POST"}),
+    ("/api/stream/white_balance", {"POST"}),
     ("/api/stream/resolution", {"POST"}),
     ("/api/stream/fps", {"POST"}),
     ("/api/detection/detect", {"POST"}),

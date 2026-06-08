@@ -8,7 +8,7 @@ model:
   camera_id: cam_demo_001
   detect_enable: true
   infer_target: all
-  model_name: yolo11n_person_fp16
+  model_name: ASV_person_FP16
   imgsz: 640
   conf_thres: 0.5
   iou_thres: 0.1
@@ -43,7 +43,7 @@ test:
   show: false
   save_path: ../outputs/python_tensorrt_result.jpg
 model_names:
-- yolo11n_person_fp16
+- ASV_person_FP16
 exception_output:
   gpio:
   - 7

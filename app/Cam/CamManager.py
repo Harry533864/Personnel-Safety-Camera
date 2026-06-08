@@ -51,6 +51,10 @@ class CamManager:
 
         self._exposure_val = 0
         self._exposure_changed = False
+        self._gain_val = 0.0
+        self._gain_changed = False
+        self._white_balance_mode = "continuous"
+        self._white_balance_changed = False
         self._need_reopen = False
         self._reconnect_interval = 1.0
         self._camera_opened = False
@@ -106,7 +110,12 @@ class CamManager:
                 "open_fail_count": self._open_fail_count,
                 "read_fail_count": self._read_fail_count,
                 "need_reopen": self._need_reopen,
+                "exposure": self._exposure_val,
                 "exposure_pending": self._exposure_changed,
+                "gain": self._gain_val,
+                "gain_pending": self._gain_changed,
+                "white_balance": self._white_balance_mode,
+                "white_balance_pending": self._white_balance_changed,
                 "worker_count": worker_count,
                 "last_pipeline": self._last_pipeline,
             }
@@ -137,16 +146,58 @@ class CamManager:
             self._exposure_changed = True
         self.logger.info("Camera exposure requested: %s", value)
 
-    def _apply_exposure(self):
+    def set_gain(self, value=0):
+        value = float(value)
+        if value < 0:
+            return
+
+        with self._state_lock:
+            self._gain_val = value
+            self._gain_changed = True
+        self.logger.info("Camera gain requested: %s", value)
+
+    def set_white_balance(self, mode="continuous"):
+        value = str(mode or "continuous").strip().lower()
+        aliases = {
+            "auto": "continuous",
+            "on": "continuous",
+            "true": "continuous",
+            "1": "continuous",
+            "continuous": "continuous",
+            "once": "once",
+            "single": "once",
+            "off": "off",
+            "manual": "off",
+            "false": "off",
+            "0": "off",
+        }
+        value = aliases.get(value, "continuous")
+
+        with self._state_lock:
+            self._white_balance_mode = value
+            self._white_balance_changed = True
+        self.logger.info("Camera white balance requested: %s", value)
+
+    def _apply_exposure(self, cap=None):
+        with self._state_lock:
+            exposure_val = self._exposure_val
+
         if self.capture_backend in {"baumer", "baumer_neoapi", "neoapi"}:
+            setter = getattr(cap, "set_exposure", None)
+            if callable(setter):
+                setter(exposure_val)
+                self.logger.info(
+                    "Baumer exposure applied to active capture: %s",
+                    exposure_val,
+                )
+                return
+
             self.logger.info(
                 "Baumer exposure will be applied when capture is opened/reopened"
             )
             return
 
         dev_path = self.camera_id
-        with self._state_lock:
-            exposure_val = self._exposure_val
 
         if isinstance(dev_path, int) or (
             isinstance(dev_path, str) and dev_path.isdigit()
@@ -199,6 +250,88 @@ class CamManager:
                 e.returncode,
                 err_msg,
             )
+
+    def _apply_gain(self, cap=None):
+        with self._state_lock:
+            gain_val = self._gain_val
+
+        if self.capture_backend in {"baumer", "baumer_neoapi", "neoapi"}:
+            setter = getattr(cap, "set_gain", None)
+            if callable(setter):
+                setter(gain_val)
+                self.logger.info(
+                    "Baumer gain applied to active capture: %s",
+                    gain_val,
+                )
+                return
+
+            self.logger.info(
+                "Baumer gain will be applied when capture is opened/reopened"
+            )
+            return
+
+        dev_path = self.camera_id
+
+        if isinstance(dev_path, int) or (
+            isinstance(dev_path, str) and dev_path.isdigit()
+        ):
+            dev_path = f"/dev/video{dev_path}"
+
+        try:
+            if gain_val == 0:
+                subprocess.run(
+                    ["v4l2-ctl", "-d", dev_path, "-c", "gain_automatic=1"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.logger.info("Camera auto gain restored for %s", dev_path)
+            else:
+                gain_float = float(gain_val)
+                command = f"gain_automatic=0,gain={gain_float:g}"
+                subprocess.run(
+                    ["v4l2-ctl", "-d", dev_path, "-c", command],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.logger.info(
+                    "Camera manual gain set for %s: %s",
+                    dev_path,
+                    gain_float,
+                )
+
+        except FileNotFoundError:
+            self.logger.error("v4l2-ctl command not found")
+
+        except subprocess.CalledProcessError as e:
+            err_msg = e.stderr.strip()
+            self.logger.error(
+                "Camera gain command failed: returncode=%s stderr=%s",
+                e.returncode,
+                err_msg,
+            )
+
+    def _apply_white_balance(self, cap=None):
+        with self._state_lock:
+            white_balance_mode = self._white_balance_mode
+
+        if self.capture_backend in {"baumer", "baumer_neoapi", "neoapi"}:
+            setter = getattr(cap, "set_white_balance", None)
+            if callable(setter):
+                setter(white_balance_mode)
+                self.logger.info(
+                    "Baumer white balance applied to active capture: %s",
+                    white_balance_mode,
+                )
+                return
+
+            self.logger.info(
+                "Baumer white balance will be applied when capture is opened/reopened"
+            )
+            return
+
+        self.logger.info("White balance is only implemented for Baumer capture")
 
     def start(self):
         if self._is_running and self._thread and self._thread.is_alive():
@@ -267,6 +400,8 @@ class CamManager:
                     height=self.height,
                     fps=self.fps,
                     exposure_us=self._exposure_val,
+                    gain_db=self._gain_val,
+                    white_balance=self._white_balance_mode,
                     pixel_format=os.environ.get("BAUMER_PIXEL_FORMAT", "BGR8"),
                     connect_retries=int(os.environ.get("BAUMER_CONNECT_RETRIES", "3")),
                 )
@@ -307,6 +442,8 @@ class CamManager:
             if need_reopen:
                 self._need_reopen = False
                 self._exposure_changed = True
+                self._gain_changed = True
+                self._white_balance_changed = True
             return need_reopen
 
     def _consume_exposure_flag(self):
@@ -315,6 +452,20 @@ class CamManager:
             if exposure_changed:
                 self._exposure_changed = False
             return exposure_changed
+
+    def _consume_gain_flag(self):
+        with self._state_lock:
+            gain_changed = self._gain_changed
+            if gain_changed:
+                self._gain_changed = False
+            return gain_changed
+
+    def _consume_white_balance_flag(self):
+        with self._state_lock:
+            white_balance_changed = self._white_balance_changed
+            if white_balance_changed:
+                self._white_balance_changed = False
+            return white_balance_changed
 
     def _capture_task(self):
         cap = None
@@ -339,7 +490,13 @@ class CamManager:
                     continue
 
                 if self._consume_exposure_flag():
-                    self._apply_exposure()
+                    self._apply_exposure(cap)
+
+                if self._consume_gain_flag():
+                    self._apply_gain(cap)
+
+                if self._consume_white_balance_flag():
+                    self._apply_white_balance(cap)
 
                 ret, frame = cap.read()
 

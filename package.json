@@ -1,17 +1,20 @@
 {
-  "name": "info3180-vuejs-flask-starter",
+  "name": "asv-safety-camera",
   "version": "1.0.0",
+  "description": "ASV AI personnel safety camera frontend",
+  "author": "ASV",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "package:win": "powershell -ExecutionPolicy Bypass -File scripts/build_frontend_installer.ps1"
   },
   "dependencies": {
-    "vue": "^3.2.47",
-    "vue-router": "^4.1.6",
-    "pinia": "^2.1.7",
+    "flv.js": "^1.6.2",
     "hls.js": "^1.5.0",
-    "flv.js": "^1.6.2"
+    "pinia": "^2.1.7",
+    "vue": "^3.2.47",
+    "vue-router": "^4.1.6"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^4.0.0",

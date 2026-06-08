@@ -115,6 +115,33 @@ class InferenceWorker:
             self.logger.exception("Failed to render latest AI overlay; streaming raw frame")
             return frame
 
+    def get_frame_snapshot(self, include_overlay=True):
+        with self._frame_lock:
+            frame = self._latest_stream_frame
+
+        with self._status_lock:
+            frame_time = self._last_raw_frame_at
+
+        if frame is None:
+            return None, frame_time
+
+        if not include_overlay:
+            return frame, frame_time
+
+        with self._ai_lock:
+            enable_infer = self._enabled
+            model = self._model
+
+        if not enable_infer or model is None:
+            return frame, frame_time
+
+        try:
+            rendered = model.try_render_latest(frame)
+            return (rendered if rendered is not None else frame), frame_time
+        except Exception:
+            self.logger.exception("Failed to render latest AI overlay; streaming raw frame")
+            return frame, frame_time
+
     def start(self):
         if self._running:
             return

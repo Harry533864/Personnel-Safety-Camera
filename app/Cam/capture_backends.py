@@ -18,6 +18,8 @@ class BaumerNeoApiCapture:
         height: int,
         fps: int,
         exposure_us: int = 0,
+        gain_db: float = 0.0,
+        white_balance: str = "continuous",
         pixel_format: str = "BGR8",
         connect_retries: int = 3,
     ):
@@ -25,6 +27,8 @@ class BaumerNeoApiCapture:
         self.height = int(height)
         self.fps = max(1, int(fps))
         self.exposure_us = int(exposure_us or 0)
+        self.gain_db = float(gain_db or 0)
+        self.white_balance = self._normalize_white_balance(white_balance)
         self.pixel_format = str(pixel_format or "BGR8")
         self.connect_retries = max(1, int(connect_retries))
         self.camera: Any | None = None
@@ -113,6 +117,34 @@ class BaumerNeoApiCapture:
         self.exposure_us = int(exposure_us or 0)
         if self.camera is not None:
             self._configure_exposure()
+            self._configure_gain()
+
+    def set_gain(self, gain_db: float) -> None:
+        self.gain_db = float(gain_db or 0)
+        if self.camera is not None:
+            self._configure_gain()
+
+    def set_white_balance(self, mode: str) -> None:
+        self.white_balance = self._normalize_white_balance(mode)
+        if self.camera is not None:
+            self._configure_white_balance()
+
+    def _normalize_white_balance(self, mode: str) -> str:
+        value = str(mode or "continuous").strip().lower()
+        aliases = {
+            "auto": "continuous",
+            "on": "continuous",
+            "true": "continuous",
+            "1": "continuous",
+            "continuous": "continuous",
+            "once": "once",
+            "single": "once",
+            "off": "off",
+            "manual": "off",
+            "false": "off",
+            "0": "off",
+        }
+        return aliases.get(value, "continuous")
 
     def _feature(self, name: str):
         if self.camera is None:
@@ -206,6 +238,8 @@ class BaumerNeoApiCapture:
         self._set_feature("AcquisitionFrameRateEnable", True)
         self._set_feature("AcquisitionFrameRate", float(self.fps))
         self._configure_exposure()
+        self._configure_gain()
+        self._configure_white_balance()
 
     def _set_pixel_format(self) -> None:
         pixel_format = self.pixel_format.strip()
@@ -229,6 +263,7 @@ class BaumerNeoApiCapture:
             self._set_enum_feature("ExposureAuto", "Off")
             self._set_enum_feature("GainAuto", "Off")
             self._set_feature("ExposureTime", float(self.exposure_us))
+            self._configure_white_balance()
             self.logger.info("Baumer manual exposure requested: %sus", self.exposure_us)
         else:
             # Keep automatic exposure as the safe production default.
@@ -236,13 +271,32 @@ class BaumerNeoApiCapture:
             self._configure_auto_exposure_limits()
             exposure_ok = self._set_enum_feature("ExposureAuto", "Continuous")
             gain_ok = self._set_enum_feature("GainAuto", "Continuous")
-            white_ok = self._set_enum_feature("BalanceWhiteAuto", "Continuous")
+            white_ok = self._configure_white_balance()
             self.logger.info(
                 "Baumer auto exposure requested: exposure_auto=%s gain_auto=%s white_auto=%s",
                 exposure_ok,
                 gain_ok,
                 white_ok,
             )
+
+    def _configure_gain(self) -> None:
+        if self.gain_db > 0:
+            self._set_enum_feature("GainAuto", "Off")
+            gain_ok = self._set_feature("Gain", float(self.gain_db))
+            self.logger.info("Baumer manual gain requested: %sdB applied=%s", self.gain_db, gain_ok)
+        else:
+            gain_ok = self._set_enum_feature("GainAuto", "Continuous")
+            self.logger.info("Baumer auto gain requested: gain_auto=%s", gain_ok)
+
+    def _configure_white_balance(self) -> bool:
+        value = {
+            "continuous": "Continuous",
+            "once": "Once",
+            "off": "Off",
+        }.get(self.white_balance, "Continuous")
+        ok = self._set_enum_feature("BalanceWhiteAuto", value)
+        self.logger.info("Baumer white balance requested: %s applied=%s", value, ok)
+        return ok
 
     def _normalize_frame(self, frame):
         if frame is None:

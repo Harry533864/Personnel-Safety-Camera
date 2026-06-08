@@ -16,7 +16,8 @@
           <label class="form-label">分辨率：</label>
           <div class="form-control-wrapper">
             <select v-model="settings.resolution" class="form-select">
-              <option value="max">最大分辨率（自动）</option>
+              <option value="max">最大分辨率（2448 x 2048）</option>
+              <option value="2448x2048">2448 x 2048（500万像素）</option>
               <option value="1920x1080">1920 x 1080</option>
               <option value="1280x720">1280 x 720</option>
               <option value="1024x576">1024 x 576</option>
@@ -38,6 +39,34 @@
               @change="validateExposure"
             />
             <span class="unit">1 ~ 10000 us；0表示自动。</span>
+          </div>
+        </div>
+
+        <div class="form-item">
+          <label class="form-label">画面增益：</label>
+          <div class="form-control-wrapper">
+            <input
+              type="number"
+              v-model.number="settings.gain"
+              class="form-input"
+              min="0"
+              max="32"
+              step="0.1"
+              @change="validateGain"
+            />
+            <span class="unit">0 ~ 32 dB；0表示自动。</span>
+          </div>
+        </div>
+
+        <div class="form-item">
+          <label class="form-label">白平衡：</label>
+          <div class="form-control-wrapper">
+            <select v-model="settings.whiteBalance" class="form-select">
+              <option value="continuous">自动连续</option>
+              <option value="once">校准一次</option>
+              <option value="off">关闭</option>
+            </select>
+            <span class="unit">推荐自动</span>
           </div>
         </div>
 
@@ -78,7 +107,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onUnmounted } from "vue";
+import { ref, reactive, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { useCameraSettingStore } from '@/stores/settingsStore'
 
@@ -92,6 +121,16 @@ const goBack = () => {
   if (isLoading.value) return;
   router.push("/");
 };
+
+onMounted(async () => {
+  isLoading.value = true;
+  try {
+    const remoteSettings = await cameraSettingStore.fetchSettings();
+    Object.assign(settings, remoteSettings);
+  } finally {
+    isLoading.value = false;
+  }
+});
 
 const confirmSettings = async () => {
   // 如果已经有定时器在等待，直接返回，防止重复触发
@@ -128,6 +167,19 @@ const validateExposure = () => {
     settings.exposure = 0
   } else if (val > 10000) {
     settings.exposure = 10000
+  }
+};
+
+const validateGain = () => {
+  let val = settings.gain
+  if (val === null || val === undefined || isNaN(val)) {
+    settings.gain = 0
+  } else if (val < 0) {
+    settings.gain = 0
+  } else if (val > 32) {
+    settings.gain = 32
+  } else {
+    settings.gain = Math.round(val * 10) / 10
   }
 };
 

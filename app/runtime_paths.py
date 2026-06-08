@@ -46,3 +46,9 @@ LOG_DIR = _resolve_path(
     "LOG_DIR",
     default=PROJECT_ROOT / "logs",
 )
+
+CAMERA_CONFIG_PATH = _resolve_path(
+    "CAM_CAMERA_CONFIG_PATH",
+    "CAMERA_CONFIG_PATH",
+    default=PROJECT_ROOT / "app" / "CameraConfig.yaml",
+)

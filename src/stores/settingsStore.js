@@ -3,15 +3,62 @@ import { defineStore } from 'pinia'
 // 从环境变量中获取后端路由ip
 const JETSON_ENDPOINT_STORAGE_KEY = 'jetson_runtime_endpoint'
 
+const normalizeBaseUrl = (url, fallbackPort) => {
+  if (!url) return ''
+  try {
+    const parsed = new URL(url)
+    return `${parsed.protocol}//${parsed.hostname}:${parsed.port || fallbackPort}`
+  } catch {
+    return ''
+  }
+}
+
+const configuredApiUrl = normalizeBaseUrl(import.meta.env.VITE_FLASK_BACKEND_URL, '5000')
+const configuredApiHost = (() => {
+  try {
+    return new URL(configuredApiUrl).hostname
+  } catch {
+    return ''
+  }
+})()
+const configuredCameraHosts = new Set(
+  [
+    configuredApiHost,
+    ...(import.meta.env.VITE_CAMERA_CANDIDATE_HOSTS || '')
+      .split(',')
+      .map((host) => host.trim())
+      .filter(Boolean),
+  ].filter(Boolean)
+)
+
+const isCurrentDeploymentEndpoint = (endpoint) => {
+  if (!endpoint?.api) return false
+
+  try {
+    const savedHost = new URL(endpoint.api).hostname
+    return savedHost === configuredApiHost ||
+      endpoint.configuredApi === configuredApiUrl ||
+      endpoint.configuredHost === configuredApiHost
+  } catch {
+    return false
+  }
+}
+
 const getApiUrl = () => {
   try {
     const saved = JSON.parse(localStorage.getItem(JETSON_ENDPOINT_STORAGE_KEY) || 'null')
-    if (saved?.api && new URL(saved.api).hostname === '10.10.10.2') return saved.api
+    if (
+      saved?.api &&
+      configuredCameraHosts.has(new URL(saved.api).hostname) &&
+      isCurrentDeploymentEndpoint(saved)
+    ) {
+      return saved.api
+    }
   } catch {
     // Ignore malformed localStorage data and use the configured fallback.
   }
 
-  return import.meta.env.VITE_FLASK_BACKEND_URL
+  return configuredApiUrl || import.meta.env.VITE_FLASK_BACKEND_URL
 }
 
 export function sleep(ms) {
@@ -95,21 +142,68 @@ const clearStorage = () => {
 const CAMERA_DEFAULTS = {
   resolution: '1920x1080',
   exposure: '0',
+  gain: '0',
+  whiteBalance: 'continuous',
   fps: '60',
   target: 'high',
 }
 
+const normalizeCameraSettings = (raw = {}) => {
+  const width = Number(raw.width)
+  const height = Number(raw.height)
+  const resolution = raw.resolution === 'max'
+    ? 'max'
+    : (raw.resolution || (width > 0 && height > 0 ? `${width}x${height}` : CAMERA_DEFAULTS.resolution))
+  const whiteBalance = raw.whiteBalance || raw.white_balance || CAMERA_DEFAULTS.whiteBalance
+
+  return {
+    ...CAMERA_DEFAULTS,
+    ...raw,
+    resolution: String(resolution),
+    exposure: String(raw.exposure ?? CAMERA_DEFAULTS.exposure),
+    gain: String(raw.gain ?? CAMERA_DEFAULTS.gain),
+    whiteBalance: String(whiteBalance),
+    fps: String(raw.fps ?? CAMERA_DEFAULTS.fps),
+    target: String(raw.target || CAMERA_DEFAULTS.target),
+  }
+}
+
 export const useCameraSettingStore = defineStore('cameraSetting', {
   state: () => ({
-    settings: loadFromStorage(STORAGE_KEY_CAMERA, CAMERA_DEFAULTS),
+    settings: normalizeCameraSettings(loadFromStorage(STORAGE_KEY_CAMERA, CAMERA_DEFAULTS)),
     lastSaveResult: loadFromStorage(STORAGE_KEY_CAMERA_STATE, { unset: true }),
   }),
   actions: {
+    async fetchSettings() {
+      try {
+        const response = await fetch(`${getApiUrl()}/api/stream/config`, {
+          method: 'GET',
+          cache: 'no-store',
+        })
+        const data = await response.json().catch(() => ({}))
+        if (!response.ok || data.status !== 'success') {
+          throw new Error(data.message || `HTTP ${response.status}`)
+        }
+
+        this.settings = normalizeCameraSettings(data.data || {})
+        saveToStorage(STORAGE_KEY_CAMERA, this.settings)
+        return { ...this.settings }
+      } catch (error) {
+        this.lastSaveResult = {
+          success: false,
+          message: formatApiError(error),
+        }
+        saveToStorage(STORAGE_KEY_CAMERA_STATE, this.lastSaveResult)
+        return { ...this.settings }
+      }
+    },
     async saveSettings(settings) {
       // 用临时对象记录本次实际要保存的值，失败回滚为旧值
-      const finalSettings = { ...settings }
+      const finalSettings = normalizeCameraSettings(settings)
       const messages = []
       let exposureSuccess = true
+      let gainSuccess = true
+      let whiteBalanceSuccess = true
       let resolutionSuccess = true
       let fpsSuccess = true
 
@@ -139,8 +233,55 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
           }
         }
 
+        // ---- 处理增益 ----
+        if (settings.gain !== this.settings.gain) {
+          console.log("Setting gain...")
+          try {
+            const response = await fetch(`${getApiUrl()}/api/stream/gain`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                value: parseFloat(settings.gain),
+                target: settings.target || CAMERA_DEFAULTS.target
+              }),
+            })
+            const data = await response.json()
+            if (data.status === 'success') {
+              // Success; keep the new value.
+            } else {
+              throw new Error(data.message || 'Gain setting failed')
+            }
+          } catch (err) {
+            finalSettings.gain = this.settings.gain
+            gainSuccess = false
+            messages.push(`Gain setting failed: ${err.message}`)
+          }
+        }
+
         // ---- 处理分辨率 ----
-        if (settings.resolution !== this.settings.resolution) {
+        if (settings.whiteBalance !== this.settings.whiteBalance) {
+          try {
+            const response = await fetch(`${getApiUrl()}/api/stream/white_balance`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                mode: settings.whiteBalance || CAMERA_DEFAULTS.whiteBalance,
+                target: settings.target || CAMERA_DEFAULTS.target
+              }),
+            })
+            const data = await response.json()
+            if (data.status !== 'success') {
+              throw new Error(data.message || 'White balance setting failed')
+            }
+          } catch (err) {
+            finalSettings.whiteBalance = this.settings.whiteBalance
+            whiteBalanceSuccess = false
+            messages.push(`White balance setting failed: ${err.message}`)
+          }
+        }
+
+        const shouldApplyResolution = settings.resolution === 'max' || settings.resolution !== this.settings.resolution
+        if (shouldApplyResolution) {
           console.log("设置分辨率...")
           try {
             const resolutionPayload = settings.resolution === 'max'
@@ -198,13 +339,13 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
         }
 
         // ---- 更新 store 和持久化 ----
-        const allSuccess = exposureSuccess && resolutionSuccess && fpsSuccess
+        const allSuccess = exposureSuccess && gainSuccess && whiteBalanceSuccess && resolutionSuccess && fpsSuccess
         if (allSuccess) {
           // 全部成功：完全替换 settings
-          this.settings = { ...finalSettings }
+          this.settings = normalizeCameraSettings(finalSettings)
         } else {
           // 部分成功：只写入成功的字段（失败的已回滚为旧值）
-          this.settings = { ...finalSettings }
+          this.settings = normalizeCameraSettings(finalSettings)
         }
 
         saveToStorage(STORAGE_KEY_CAMERA, this.settings)
@@ -222,7 +363,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
       }
     },
     getSettings() {
-      return { ...this.settings }
+      return normalizeCameraSettings(this.settings)
     },
     getState() {
       return { ...this.lastSaveResult }
@@ -236,7 +377,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
 // ========== 检测设置 ==========
 const DETECTION_DEFAULTS = {
   detectionEnabled: true,
-  detectionModel: 'YOLO11',
+  detectionModel: 'ASV_person_FP16',
   detectionThreshold: 0.50,
   overlapRate: 0.10,
   // matchEnabled: true,
@@ -245,20 +386,71 @@ const DETECTION_DEFAULTS = {
   target: 'all',
 }
 
+const normalizeDetectionModelName = (modelName) => {
+  const name = String(modelName || '').trim()
+  if (!name || name === 'YOLO11') {
+    return DETECTION_DEFAULTS.detectionModel
+  }
+  return name
+}
+
+const normalizeDetectionSettings = (raw = {}) => {
+  const detectionThreshold = Number(raw.detectionThreshold)
+  const overlapRate = Number(raw.overlapRate)
+
+  return {
+    ...DETECTION_DEFAULTS,
+    ...raw,
+    detectionEnabled: typeof raw.detectionEnabled === 'boolean'
+      ? raw.detectionEnabled
+      : DETECTION_DEFAULTS.detectionEnabled,
+    detectionModel: normalizeDetectionModelName(raw.detectionModel),
+    detectionThreshold: Number.isFinite(detectionThreshold)
+      ? detectionThreshold
+      : DETECTION_DEFAULTS.detectionThreshold,
+    overlapRate: Number.isFinite(overlapRate)
+      ? overlapRate
+      : DETECTION_DEFAULTS.overlapRate,
+    target: raw.target || DETECTION_DEFAULTS.target,
+  }
+}
+
 export const useDetectionSettingStore = defineStore('detectionSetting', {
   state: () => ({
-    settings: loadFromStorage(STORAGE_KEY_DETECTION, DETECTION_DEFAULTS),
+    settings: normalizeDetectionSettings(loadFromStorage(STORAGE_KEY_DETECTION, DETECTION_DEFAULTS)),
     lastSaveResult: loadFromStorage(STORAGE_KEY_DETECTION_STATE, { unset: true }),
   }),
   actions: {
+    async fetchSettings() {
+      try {
+        const response = await fetch(`${getApiUrl()}/api/detection/config`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        })
+
+        const data = await response.json()
+        if (!response.ok || data.status !== 'success') {
+          throw new Error(data.message || `HTTP ${response.status}`)
+        }
+
+        this.settings = normalizeDetectionSettings(data.data || {})
+        saveToStorage(STORAGE_KEY_DETECTION, this.settings)
+        return { ...this.settings }
+      } catch (error) {
+        this.lastSaveResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_DETECTION_STATE, this.lastSaveResult)
+        return null
+      }
+    },
     async saveSettings(settings) {
       try {
+        const nextSettings = normalizeDetectionSettings(settings)
         const response = await fetch(`${getApiUrl()}/api/detection/detect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            ...settings,
-            target: settings.target || DETECTION_DEFAULTS.target
+            ...nextSettings,
+            target: nextSettings.target || DETECTION_DEFAULTS.target
           }),
         })
 
@@ -268,7 +460,7 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
         }
 
         if (data.status === 'success') {
-          this.settings = { ...settings }
+          this.settings = { ...nextSettings }
           saveToStorage(STORAGE_KEY_DETECTION, this.settings)
           this.lastSaveResult = { success: true }
           saveToStorage(STORAGE_KEY_DETECTION_STATE, this.lastSaveResult)
@@ -283,6 +475,11 @@ export const useDetectionSettingStore = defineStore('detectionSetting', {
       }
     },
     getSettings() {
+      return normalizeDetectionSettings(this.settings)
+    },
+    setSettings(settings) {
+      this.settings = normalizeDetectionSettings(settings)
+      saveToStorage(STORAGE_KEY_DETECTION, this.settings)
       return { ...this.settings }
     },
     getState() {

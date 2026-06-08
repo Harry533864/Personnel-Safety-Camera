@@ -49,13 +49,11 @@
           </div>
 
           <div class="canvas-frame">
-            <video
-              ref="frameVideoRef"
-              class="frame-video"
-              autoplay
-              muted
-              playsinline
-            ></video>
+            <img
+              ref="frameImageRef"
+              class="frame-image"
+              alt=""
+            />
             <canvas
               ref="canvasRef"
               :width="CANVAS_WIDTH"
@@ -177,8 +175,52 @@ const MAX_REGIONS = 3;
 const MIN_RECT_SIZE = 10;
 const MIN_POLYGON_POINTS = 3;
 const POLYGON_CLOSE_DISTANCE = 14;
-const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL;
-const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;
+const JETSON_ENDPOINT_STORAGE_KEY = "jetson_runtime_endpoint";
+const configuredApiBaseUrl = import.meta.env.VITE_FLASK_BACKEND_URL;
+const configuredApiHost = (() => {
+  try {
+    return new URL(configuredApiBaseUrl).hostname;
+  } catch {
+    return "";
+  }
+})();
+const configuredCameraHosts = new Set(
+  [
+    configuredApiHost,
+    ...(import.meta.env.VITE_CAMERA_CANDIDATE_HOSTS || "")
+      .split(",")
+      .map((host) => host.trim())
+      .filter(Boolean),
+  ].filter(Boolean)
+);
+const isCurrentDeploymentEndpoint = (endpoint) => {
+  if (!endpoint?.api) return false;
+
+  try {
+    const savedHost = new URL(endpoint.api).hostname;
+    return savedHost === configuredApiHost ||
+      endpoint.configuredApi === configuredApiBaseUrl ||
+      endpoint.configuredHost === configuredApiHost;
+  } catch {
+    return false;
+  }
+};
+const getApiBaseUrl = () => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(JETSON_ENDPOINT_STORAGE_KEY) || "null");
+    if (
+      saved?.api &&
+      configuredCameraHosts.has(new URL(saved.api).hostname) &&
+      isCurrentDeploymentEndpoint(saved)
+    ) {
+      return saved.api;
+    }
+  } catch {
+    // Fall back to the configured API URL.
+  }
+  return configuredApiBaseUrl;
+};
+const API_BASE_URL = getApiBaseUrl();
 const regionColors = {
   1: "#22c55e",
   2: "#3b82f6",
@@ -191,7 +233,7 @@ const detectionSettingStore = useDetectionSettingStore();
 const detectionRegionStore = useDetectionRegionStore();
 
 const canvasRef = ref(null);
-const frameVideoRef = ref(null);
+const frameImageRef = ref(null);
 const isDrawing = ref(false);
 const isSaving = ref(false);
 const frameLoaded = ref(false);
@@ -204,8 +246,8 @@ const drawMode = ref("rect");
 const candidateRegions = ref([]);
 const committedRegions = ref([]);
 const successFeedback = ref("");
-let framePc = null;
 let frameRefreshTimer = null;
+let frameSnapshotLoading = false;
 
 const modalState = ref({
   visible: false,
@@ -467,18 +509,15 @@ function closeFrameStream() {
     frameRefreshTimer = null;
   }
 
-  if (framePc) {
-    framePc.ontrack = null;
-    framePc.close();
-    framePc = null;
-  }
-
-  if (frameVideoRef.value) {
-    frameVideoRef.value.srcObject = null;
+  frameSnapshotLoading = false;
+  if (frameImageRef.value) {
+    frameImageRef.value.onload = null;
+    frameImageRef.value.onerror = null;
+    frameImageRef.value.removeAttribute("src");
   }
 }
 
-async function initFrameStream() {
+async function initFrameStreamLegacy() {
   if (!frameVideoRef.value) return;
 
   closeFrameStream();
@@ -554,11 +593,59 @@ async function initFrameStream() {
   }
 }
 
+function buildFrameSnapshotUrl() {
+  if (!API_BASE_URL) return "";
+  const params = new URLSearchParams({
+    target: "high",
+    quality: "70",
+    max_width: "1280",
+    overlay: "0",
+    t: String(Date.now()),
+  });
+  return `${API_BASE_URL}/api/stream/snapshot?${params.toString()}`;
+}
+
+function loadFrameSnapshot() {
+  const image = frameImageRef.value;
+  const url = buildFrameSnapshotUrl();
+  if (!image || !url || frameSnapshotLoading) return;
+
+  frameSnapshotLoading = true;
+  image.onload = () => {
+    frameSnapshotLoading = false;
+    frameLoaded.value = true;
+    frameError.value = "";
+    redrawCanvas();
+  };
+  image.onerror = () => {
+    frameSnapshotLoading = false;
+    if (!frameLoaded.value) {
+      frameError.value = "当前视频帧加载失败，已切换为示意底图";
+      redrawCanvas();
+    }
+  };
+  image.src = url;
+}
+
+async function initFrameStream() {
+  if (!frameImageRef.value) return;
+
+  closeFrameStream();
+  frameLoaded.value = false;
+  frameError.value = "当前视频帧加载中，拖拽鼠标绘制检测区域";
+  loadFrameSnapshot();
+  frameRefreshTimer = setInterval(loadFrameSnapshot, 1000);
+}
+
 function drawBackground(ctx) {
-  const video = frameVideoRef.value;
-  if (frameLoaded.value && video && video.readyState >= 2) {
-    ctx.drawImage(video, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-    return;
+  const image = frameImageRef.value;
+  if (frameLoaded.value && image?.naturalWidth) {
+    try {
+      ctx.drawImage(image, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      return;
+    } catch {
+      frameLoaded.value = false;
+    }
   }
 
   ctx.fillStyle = "#ffffff";
@@ -1138,7 +1225,7 @@ onUnmounted(() => {
   box-shadow: var(--industrial-shadow);
 }
 
-.frame-video {
+.frame-image {
   position: absolute;
   width: 1px;
   height: 1px;
