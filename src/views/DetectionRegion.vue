@@ -27,6 +27,24 @@
                 <option value="high">高分辨率分支</option>
                 <option value="low">低分辨率分支</option>
               </select>
+              <div class="draw-mode-tabs" role="group" aria-label="ROI draw mode">
+                <button
+                  type="button"
+                  :class="{ active: drawMode === 'rect' }"
+                  :disabled="isSaving"
+                  @click="setDrawMode('rect')"
+                >
+                  矩形
+                </button>
+                <button
+                  type="button"
+                  :class="{ active: drawMode === 'polygon' }"
+                  :disabled="isSaving"
+                  @click="setDrawMode('polygon')"
+                >
+                  多边形
+                </button>
+              </div>
             </div>
           </div>
 
@@ -45,7 +63,8 @@
               @mousedown="beginDraw"
               @mousemove="updateDraw"
               @mouseup="finishDraw"
-              @mouseleave="finishDraw"
+              @click="addPolygonPoint"
+              @mouseleave="handleCanvasLeave"
             />
           </div>
 
@@ -56,6 +75,13 @@
             <button class="secondary-btn" @click="cancelCurrentBoxes" :disabled="isSaving">
               取消当前框
             </button>
+            <button
+              class="secondary-btn"
+              @click="finishPolygon"
+              :disabled="isSaving || drawMode !== 'polygon' || draftPolygon.length < MIN_POLYGON_POINTS"
+            >
+              完成多边形
+            </button>
             <button class="danger-btn" @click="openConfirmClear" :disabled="isSaving">
               清除所有检测区域
             </button>
@@ -65,6 +91,7 @@
             <p>1. 鼠标按下后拖动，松开即可画出一个区域。</p>
             <p>2. 虚线框表示暂存区域，点击“添加检测区域”后才会正式生效。</p>
             <p>3. 最多只能设置 3 个区域；如果画错了，可点“取消当前框”重新画。</p>
+            <p>4. 多边形模式下逐点点击画布，点击起点附近或点击“完成多边形”即可闭合。</p>
           </div>
         </div>
 
@@ -76,6 +103,7 @@
                 <div class="region-title">
                   <span class="region-dot" :style="{ backgroundColor: regionColors[region.id] }"></span>
                   <strong>{{ getRegionDisplayName(region.id) }}</strong>
+                  <span class="region-meta">{{ getRegionPointCount(region) }} 点</span>
                 </div>
               </div>
             </div>
@@ -87,6 +115,7 @@
             <div v-if="candidateRegions.length" class="region-list">
               <div v-for="(region, index) in candidateRegions" :key="region.tempId" class="region-card candidate">
                 <strong>{{ getRegionDisplayName(index + 1) }}</strong>
+                <span class="region-meta">{{ getRegionPointCount(region) }} 点</span>
               </div>
             </div>
             <p v-else class="empty-text">暂无候选区域</p>
@@ -146,6 +175,8 @@ const CANVAS_WIDTH = 960;
 const CANVAS_HEIGHT = 540;
 const MAX_REGIONS = 3;
 const MIN_RECT_SIZE = 10;
+const MIN_POLYGON_POINTS = 3;
+const POLYGON_CLOSE_DISTANCE = 14;
 const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL;
 const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;
 const regionColors = {
@@ -167,6 +198,9 @@ const frameLoaded = ref(false);
 const frameError = ref("");
 const startPoint = ref({ x: 0, y: 0 });
 const draftRect = ref(null);
+const draftPolygon = ref([]);
+const hoverPoint = ref(null);
+const drawMode = ref("rect");
 const candidateRegions = ref([]);
 const committedRegions = ref([]);
 const successFeedback = ref("");
@@ -217,8 +251,15 @@ const saveStatusClass = computed(() => {
   return state.success ? "status-success" : "status-error";
 });
 
-function cloneRect(rect) {
-  return { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+function clonePoint(point = {}) {
+  return {
+    x: Number(point.x) || 0,
+    y: Number(point.y) || 0,
+  };
+}
+
+function clonePoints(points = []) {
+  return points.map((point) => clonePoint(point));
 }
 
 function getCanvasContext() {
@@ -248,24 +289,95 @@ function normalizeRect(start, end) {
   return { x, y, w, h };
 }
 
+function rectToPoints(rect) {
+  return [
+    { x: rect.x, y: rect.y },
+    { x: rect.x + rect.w, y: rect.y },
+    { x: rect.x + rect.w, y: rect.y + rect.h },
+    { x: rect.x, y: rect.y + rect.h },
+  ];
+}
+
+function pointsToRect(points = []) {
+  const validPoints = points.filter(
+    (point) => Number.isFinite(point.x) && Number.isFinite(point.y)
+  );
+
+  if (!validPoints.length) {
+    return { x: 0, y: 0, w: 0, h: 0 };
+  }
+
+  const xs = validPoints.map((point) => point.x);
+  const ys = validPoints.map((point) => point.y);
+  const minX = clamp(Math.min(...xs), 0, CANVAS_WIDTH);
+  const maxX = clamp(Math.max(...xs), 0, CANVAS_WIDTH);
+  const minY = clamp(Math.min(...ys), 0, CANVAS_HEIGHT);
+  const maxY = clamp(Math.max(...ys), 0, CANVAS_HEIGHT);
+
+  return {
+    x: minX,
+    y: minY,
+    w: maxX - minX,
+    h: maxY - minY,
+  };
+}
+
+function createRegionShape({ id, tempId, points, shape = "polygon" }) {
+  const clonedPoints = clonePoints(points);
+  return {
+    id,
+    tempId,
+    shape,
+    rect: pointsToRect(clonedPoints),
+    points: clonedPoints,
+  };
+}
+
+function getRegionPoints(region = {}) {
+  if (Array.isArray(region.points) && region.points.length) {
+    return region.points;
+  }
+  if (Array.isArray(region.polygon) && region.polygon.length) {
+    return region.polygon;
+  }
+  if (region.rect) {
+    return rectToPoints(region.rect);
+  }
+  return [];
+}
+
+function getRegionPointCount(region) {
+  return getRegionPoints(region).length;
+}
+
 function getRegionDisplayName(id) {
   return `候选区域${id}`;
 }
 
 function normalizePoint(x, y) {
   return [
-    Number((x / CANVAS_WIDTH).toFixed(4)),
-    Number((y / CANVAS_HEIGHT).toFixed(4)),
+    Number((clamp(x, 0, CANVAS_WIDTH) / CANVAS_WIDTH).toFixed(4)),
+    Number((clamp(y, 0, CANVAS_HEIGHT) / CANVAS_HEIGHT).toFixed(4)),
   ];
 }
 
-function rectToPolygon(rect) {
-  return [
-    normalizePoint(rect.x, rect.y),
-    normalizePoint(rect.x + rect.w, rect.y),
-    normalizePoint(rect.x + rect.w, rect.y + rect.h),
-    normalizePoint(rect.x, rect.y + rect.h),
-  ];
+function pointsToNormalizedPolygon(points) {
+  return points.map((point) => normalizePoint(point.x, point.y));
+}
+
+function normalizedPolygonToPoints(polygon = []) {
+  return polygon
+    .map((point) => {
+      if (!Array.isArray(point) || point.length !== 2) return null;
+      const x = Number(point[0]);
+      const y = Number(point[1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return {
+        x: clamp(x * CANVAS_WIDTH, 0, CANVAS_WIDTH),
+        y: clamp(y * CANVAS_HEIGHT, 0, CANVAS_HEIGHT),
+      };
+    })
+    .filter(Boolean);
 }
 
 function getOverlapThreshold() {
@@ -281,7 +393,7 @@ function toBackendRoi(region) {
     roi_type: "forbidden_zone",
     judge_method: "overlap",
     coordinate_mode: "normalized",
-    polygon: rectToPolygon(region.rect),
+    polygon: pointsToNormalizedPolygon(getRegionPoints(region)),
     overlap_thres: getOverlapThreshold(),
     target: selectedTarget.value,
   };
@@ -289,30 +401,28 @@ function toBackendRoi(region) {
 
 function fromStoredRegion(region = {}) {
   const polygon = Array.isArray(region.polygon) ? region.polygon : [];
-  if (polygon.length >= 4) {
-    const xs = polygon.map((point) => Number(point[0]) * CANVAS_WIDTH);
-    const ys = polygon.map((point) => Number(point[1]) * CANVAS_HEIGHT);
-
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
-
-    return {
-      x: clamp(minX, 0, CANVAS_WIDTH),
-      y: clamp(minY, 0, CANVAS_HEIGHT),
-      w: clamp(maxX - minX, 0, CANVAS_WIDTH),
-      h: clamp(maxY - minY, 0, CANVAS_HEIGHT),
-    };
+  if (polygon.length >= MIN_POLYGON_POINTS) {
+    const points = normalizedPolygonToPoints(polygon);
+    if (points.length >= MIN_POLYGON_POINTS) {
+      return createRegionShape({
+        shape: points.length === 4 ? "rect" : "polygon",
+        points,
+      });
+    }
   }
 
   const rect = region.rect || {};
-  return {
+  const safeRect = {
     x: clamp(rect.x || 0, 0, CANVAS_WIDTH),
     y: clamp(rect.y || 0, 0, CANVAS_HEIGHT),
     w: clamp(rect.w || 0, 0, CANVAS_WIDTH),
     h: clamp(rect.h || 0, 0, CANVAS_HEIGHT),
   };
+
+  return createRegionShape({
+    shape: "rect",
+    points: rectToPoints(safeRect),
+  });
 }
 
 function openAlert(message) {
@@ -475,33 +585,65 @@ function drawBackground(ctx) {
   ctx.fillText(frameError.value || "当前视频帧加载中，拖拽鼠标绘制检测区域", 28, 62);
 }
 
-function drawRect(ctx, rect, options = {}) {
+function drawPolygon(ctx, points, options = {}) {
+  if (!points.length) return;
+
   const {
     strokeStyle = "#ffffff",
     fillStyle = "rgba(255, 255, 255, 0.12)",
     lineDash = [],
     label = "",
     lineWidth = 2,
+    closePath = true,
+    previewPoint = null,
   } = options;
+
+  const pathPoints = previewPoint ? [...points, previewPoint] : points;
 
   ctx.save();
   ctx.setLineDash(lineDash);
   ctx.lineWidth = lineWidth;
   ctx.strokeStyle = strokeStyle;
   ctx.fillStyle = fillStyle;
-  ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
-  ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+
+  if (pathPoints.length > 1) {
+    ctx.beginPath();
+    ctx.moveTo(pathPoints[0].x, pathPoints[0].y);
+    pathPoints.slice(1).forEach((point) => {
+      ctx.lineTo(point.x, point.y);
+    });
+    if (closePath && points.length >= MIN_POLYGON_POINTS) {
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.stroke();
+  }
+
+  ctx.setLineDash([]);
+  points.forEach((point, index) => {
+    ctx.beginPath();
+    ctx.fillStyle = index === 0 ? "#ffffff" : strokeStyle;
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = 2;
+    ctx.arc(point.x, point.y, index === 0 ? 5 : 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
 
   if (label) {
-    ctx.setLineDash([]);
+    const bounds = pointsToRect(points);
     ctx.font = "bold 14px Arial";
     const pillWidth = Math.max(28, 16 + ctx.measureText(label).width);
     const pillHeight = 24;
+    const labelX = bounds.x;
+    const labelY = Math.max(0, bounds.y - pillHeight);
+
     ctx.fillStyle = strokeStyle;
-    ctx.fillRect(rect.x, Math.max(0, rect.y - pillHeight), pillWidth, pillHeight);
+    ctx.fillRect(labelX, labelY, pillWidth, pillHeight);
     ctx.fillStyle = "#ffffff";
-    ctx.fillText(label, rect.x + 8, Math.max(17, rect.y - 7));
+    ctx.fillText(label, labelX + 8, labelY + 17);
   }
+
   ctx.restore();
 }
 
@@ -513,7 +655,7 @@ function redrawCanvas() {
   drawBackground(ctx);
 
   committedRegions.value.forEach((region) => {
-    drawRect(ctx, region.rect, {
+    drawPolygon(ctx, getRegionPoints(region), {
       strokeStyle: regionColors[region.id],
       fillStyle: `${regionColors[region.id]}22`,
       label: String(region.id),
@@ -522,7 +664,7 @@ function redrawCanvas() {
   });
 
   candidateRegions.value.forEach((region, index) => {
-    drawRect(ctx, region.rect, {
+    drawPolygon(ctx, getRegionPoints(region), {
       strokeStyle: "#facc15",
       fillStyle: "rgba(250, 204, 21, 0.18)",
       lineDash: [8, 6],
@@ -531,19 +673,33 @@ function redrawCanvas() {
   });
 
   if (draftRect.value) {
-    drawRect(ctx, draftRect.value, {
+    drawPolygon(ctx, rectToPoints(draftRect.value), {
       strokeStyle: "#f8fafc",
       fillStyle: "rgba(248, 250, 252, 0.12)",
       lineDash: [10, 6],
     });
   }
+
+  if (draftPolygon.value.length) {
+    drawPolygon(ctx, draftPolygon.value, {
+      strokeStyle: "#dc2626",
+      fillStyle: "rgba(220, 38, 38, 0.12)",
+      lineDash: [8, 6],
+      closePath: false,
+      previewPoint: hoverPoint.value,
+      label: draftPolygon.value.length >= MIN_POLYGON_POINTS ? "待闭合" : "",
+    });
+  }
 }
 
 function loadSavedRegions() {
-  committedRegions.value = detectionRegionStore.getRegions(selectedTarget.value).map((region) => ({
-    id: Number(String(region.roi_id || "").split("_").pop()) || 1,
-    rect: fromStoredRegion(region),
-  }));
+  committedRegions.value = detectionRegionStore.getRegions(selectedTarget.value).map((region) => {
+    const shape = fromStoredRegion(region);
+    return {
+      ...shape,
+      id: Number(String(region.roi_id || "").split("_").pop()) || 1,
+    };
+  });
 }
 
 async function syncRegionsFromServer() {
@@ -557,7 +713,7 @@ async function syncRegionsFromServer() {
 }
 
 function beginDraw(event) {
-  if (isSaving.value) return;
+  if (drawMode.value !== "rect" || isSaving.value) return;
 
   if (totalRegionCount.value >= MAX_REGIONS) {
     openAlert("最多只能勾选三个区域！");
@@ -572,6 +728,14 @@ function beginDraw(event) {
 }
 
 function updateDraw(event) {
+  if (drawMode.value === "polygon") {
+    if (draftPolygon.value.length && !isSaving.value) {
+      hoverPoint.value = getCanvasPoint(event);
+      redrawCanvas();
+    }
+    return;
+  }
+
   if (!isDrawing.value || isSaving.value) return;
 
   const currentPoint = getCanvasPoint(event);
@@ -580,7 +744,7 @@ function updateDraw(event) {
 }
 
 function finishDraw(event) {
-  if (!isDrawing.value || isSaving.value) return;
+  if (drawMode.value !== "rect" || !isDrawing.value || isSaving.value) return;
 
   const endPoint = getCanvasPoint(event);
   const rect = normalizeRect(startPoint.value, endPoint);
@@ -598,23 +762,104 @@ function finishDraw(event) {
     return;
   }
 
-  candidateRegions.value.push({
-    tempId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    rect,
-  });
+  candidateRegions.value.push(
+    createRegionShape({
+      tempId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      shape: "rect",
+      points: rectToPoints(rect),
+    })
+  );
+  redrawCanvas();
+}
+
+function distanceBetween(left, right) {
+  const dx = left.x - right.x;
+  const dy = left.y - right.y;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function setDrawMode(mode) {
+  if (isSaving.value || drawMode.value === mode) return;
+
+  drawMode.value = mode;
+  draftRect.value = null;
+  draftPolygon.value = [];
+  hoverPoint.value = null;
+  isDrawing.value = false;
+  redrawCanvas();
+}
+
+function addPolygonPoint(event) {
+  if (drawMode.value !== "polygon" || isSaving.value) return;
+
+  if (totalRegionCount.value >= MAX_REGIONS) {
+    openAlert("最多只能勾选三个区域！");
+    return;
+  }
+
+  const point = getCanvasPoint(event);
+  const firstPoint = draftPolygon.value[0];
+  if (
+    firstPoint &&
+    draftPolygon.value.length >= MIN_POLYGON_POINTS &&
+    distanceBetween(point, firstPoint) <= POLYGON_CLOSE_DISTANCE
+  ) {
+    finishPolygon();
+    return;
+  }
+
+  draftPolygon.value = [...draftPolygon.value, point];
+  hoverPoint.value = point;
+  redrawCanvas();
+}
+
+function finishPolygon() {
+  if (drawMode.value !== "polygon" || isSaving.value) return;
+
+  if (draftPolygon.value.length < MIN_POLYGON_POINTS) {
+    openAlert("多边形至少需要 3 个点");
+    return;
+  }
+
+  if (totalRegionCount.value >= MAX_REGIONS) {
+    openAlert("最多只能勾选三个区域！");
+    return;
+  }
+
+  candidateRegions.value.push(
+    createRegionShape({
+      tempId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      shape: "polygon",
+      points: draftPolygon.value,
+    })
+  );
+  draftPolygon.value = [];
+  hoverPoint.value = null;
+  redrawCanvas();
+}
+
+function handleCanvasLeave(event) {
+  if (drawMode.value === "rect") {
+    finishDraw(event);
+    return;
+  }
+
+  hoverPoint.value = null;
   redrawCanvas();
 }
 
 function cancelCurrentBoxes() {
   if (isSaving.value) return;
 
-  if (!candidateRegions.value.length && !draftRect.value) {
+  if (!candidateRegions.value.length && !draftRect.value && !draftPolygon.value.length) {
     openAlert("当前没有正在绘制或暂存的候选区域");
     return;
   }
 
   candidateRegions.value = [];
   draftRect.value = null;
+  draftPolygon.value = [];
+  hoverPoint.value = null;
   isDrawing.value = false;
   redrawCanvas();
 }
@@ -633,10 +878,13 @@ async function addDetectionRegions() {
   }
 
   const ids = availableIds.value.slice(0, candidateRegions.value.length);
-  const pendingRegions = candidateRegions.value.map((region, index) => ({
-    id: ids[index],
-    rect: cloneRect(region.rect),
-  }));
+  const pendingRegions = candidateRegions.value.map((region, index) =>
+    createRegionShape({
+      id: ids[index],
+      shape: region.shape,
+      points: getRegionPoints(region),
+    })
+  );
   const nextCommitted = [...committedRegions.value, ...pendingRegions].sort(
     (left, right) => left.id - right.id
   );
@@ -658,6 +906,8 @@ async function addDetectionRegions() {
     await syncRegionsFromServer();
     committedRegions.value = committedRegions.value.length ? committedRegions.value : nextCommitted;
     candidateRegions.value = [];
+    draftPolygon.value = [];
+    hoverPoint.value = null;
     successFeedback.value = successMessage;
     redrawCanvas();
   } finally {
@@ -685,6 +935,9 @@ async function confirmClearAll() {
     committedRegions.value = [];
     candidateRegions.value = [];
     draftRect.value = null;
+    draftPolygon.value = [];
+    hoverPoint.value = null;
+    isDrawing.value = false;
     successFeedback.value = "已清除所有检测区域";
     redrawCanvas();
   } finally {
@@ -709,6 +962,9 @@ watch(selectedTarget, async () => {
   detectionRegionStore.setCurrentTarget(selectedTarget.value);
   candidateRegions.value = [];
   draftRect.value = null;
+  draftPolygon.value = [];
+  hoverPoint.value = null;
+  isDrawing.value = false;
   successFeedback.value = "";
   await syncRegionsFromServer();
 });
@@ -818,10 +1074,43 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .toolbar-label {
   white-space: nowrap;
+}
+
+.draw-mode-tabs {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  gap: 2px;
+  background: #f3f4f6;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+}
+
+.draw-mode-tabs button {
+  min-height: 28px;
+  padding: 0 10px;
+  color: #4b5563;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.draw-mode-tabs button.active {
+  color: #ffffff;
+  background: #c1121f;
+  box-shadow: 0 4px 10px rgba(193, 18, 31, 0.2);
 }
 
 .target-select {
@@ -949,6 +1238,10 @@ button:disabled {
 }
 
 .region-card.candidate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   border-style: dashed;
 }
 
@@ -957,6 +1250,13 @@ button:disabled {
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+
+.region-meta {
+  margin-left: auto;
+  color: #6b7280;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .region-dot {
