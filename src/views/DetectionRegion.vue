@@ -164,7 +164,6 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
-  useCameraSettingStore,
   useDetectionSettingStore,
   useDetectionRegionStore,
 } from "@/stores/settingsStore";
@@ -226,9 +225,12 @@ const regionColors = {
   2: "#3b82f6",
   3: "#f97316",
 };
+const DEFAULT_SOURCE_SIZE = {
+  width: 1920,
+  height: 1080,
+};
 
 const router = useRouter();
-const cameraSettingStore = useCameraSettingStore();
 const detectionSettingStore = useDetectionSettingStore();
 const detectionRegionStore = useDetectionRegionStore();
 
@@ -243,6 +245,7 @@ const draftRect = ref(null);
 const draftPolygon = ref([]);
 const hoverPoint = ref(null);
 const drawMode = ref("rect");
+const videoSourceSize = ref({ ...DEFAULT_SOURCE_SIZE });
 const candidateRegions = ref([]);
 const committedRegions = ref([]);
 const successFeedback = ref("");
@@ -268,18 +271,9 @@ const availableIds = computed(() => {
 const selectedTarget = ref(detectionRegionStore.getCurrentTarget() || "all");
 
 const sourceResolution = computed(() => {
-  const value = cameraSettingStore.settings.resolution || "1920x1080";
-  if (value === "max") {
-    return {
-      width: 2448,
-      height: 2048,
-    };
-  }
-
-  const [width, height] = value.split("x").map(Number);
   return {
-    width: width || 1920,
-    height: height || 1080,
+    width: videoSourceSize.value.width || DEFAULT_SOURCE_SIZE.width,
+    height: videoSourceSize.value.height || DEFAULT_SOURCE_SIZE.height,
   };
 });
 
@@ -319,15 +313,56 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-function getCanvasPoint(event) {
+function getVideoDrawRect() {
+  const sourceWidth = Math.max(1, Number(sourceResolution.value.width) || DEFAULT_SOURCE_SIZE.width);
+  const sourceHeight = Math.max(1, Number(sourceResolution.value.height) || DEFAULT_SOURCE_SIZE.height);
+  const scale = Math.min(CANVAS_WIDTH / sourceWidth, CANVAS_HEIGHT / sourceHeight);
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
+
+  return {
+    x: (CANVAS_WIDTH - width) / 2,
+    y: (CANVAS_HEIGHT - height) / 2,
+    width,
+    height,
+  };
+}
+
+function clampPointToVideoFrame(point) {
+  const rect = getVideoDrawRect();
+  return {
+    x: clamp(point.x, rect.x, rect.x + rect.width),
+    y: clamp(point.y, rect.y, rect.y + rect.height),
+  };
+}
+
+function getCanvasPoint(event, clampToVideoFrame = true) {
   const rect = canvasRef.value.getBoundingClientRect();
   const scaleX = CANVAS_WIDTH / rect.width;
   const scaleY = CANVAS_HEIGHT / rect.height;
 
-  return {
+  const point = {
     x: clamp((event.clientX - rect.left) * scaleX, 0, CANVAS_WIDTH),
     y: clamp((event.clientY - rect.top) * scaleY, 0, CANVAS_HEIGHT),
   };
+
+  return clampToVideoFrame ? clampPointToVideoFrame(point) : point;
+}
+
+function refreshVideoSourceSize() {
+  const image = frameImageRef.value;
+  const width = Number(image?.naturalWidth) || DEFAULT_SOURCE_SIZE.width;
+  const height = Number(image?.naturalHeight) || DEFAULT_SOURCE_SIZE.height;
+  const changed =
+    width !== videoSourceSize.value.width ||
+    height !== videoSourceSize.value.height;
+
+  if (changed) {
+    videoSourceSize.value = { width, height };
+    loadSavedRegions();
+  }
+
+  redrawCanvas();
 }
 
 function normalizeRect(start, end) {
@@ -404,9 +439,13 @@ function getRegionDisplayName(id) {
 }
 
 function normalizePoint(x, y) {
+  const rect = getVideoDrawRect();
+  const safeWidth = Math.max(1, rect.width);
+  const safeHeight = Math.max(1, rect.height);
+
   return [
-    Number((clamp(x, 0, CANVAS_WIDTH) / CANVAS_WIDTH).toFixed(4)),
-    Number((clamp(y, 0, CANVAS_HEIGHT) / CANVAS_HEIGHT).toFixed(4)),
+    Number(((clamp(x, rect.x, rect.x + safeWidth) - rect.x) / safeWidth).toFixed(4)),
+    Number(((clamp(y, rect.y, rect.y + safeHeight) - rect.y) / safeHeight).toFixed(4)),
   ];
 }
 
@@ -415,6 +454,10 @@ function pointsToNormalizedPolygon(points) {
 }
 
 function normalizedPolygonToPoints(polygon = []) {
+  const rect = getVideoDrawRect();
+  const safeWidth = Math.max(1, rect.width);
+  const safeHeight = Math.max(1, rect.height);
+
   return polygon
     .map((point) => {
       if (!Array.isArray(point) || point.length !== 2) return null;
@@ -422,8 +465,8 @@ function normalizedPolygonToPoints(polygon = []) {
       const y = Number(point[1]);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
       return {
-        x: clamp(x * CANVAS_WIDTH, 0, CANVAS_WIDTH),
-        y: clamp(y * CANVAS_HEIGHT, 0, CANVAS_HEIGHT),
+        x: rect.x + clamp(x, 0, 1) * safeWidth,
+        y: rect.y + clamp(y, 0, 1) * safeHeight,
       };
     })
     .filter(Boolean);
@@ -517,82 +560,6 @@ function closeFrameStream() {
   }
 }
 
-async function initFrameStreamLegacy() {
-  if (!frameVideoRef.value) return;
-
-  closeFrameStream();
-  frameLoaded.value = false;
-  frameError.value = "";
-
-  try {
-    framePc = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-
-    framePc.addTransceiver("video", { direction: "recvonly" });
-
-    framePc.ontrack = (event) => {
-      if (event.track.kind !== "video") return;
-
-      const stream = new MediaStream([event.track]);
-      frameVideoRef.value.srcObject = stream;
-
-      frameVideoRef.value.onloadeddata = () => {
-        frameLoaded.value = true;
-        redrawCanvas();
-      };
-
-      event.track.onunmute = () => {
-        frameLoaded.value = true;
-        redrawCanvas();
-      };
-    };
-
-    const offer = await framePc.createOffer();
-    await framePc.setLocalDescription(offer);
-
-    await new Promise((resolve) => {
-      if (framePc.iceGatheringState === "complete") {
-        resolve();
-        return;
-      }
-      framePc.onicegatheringstatechange = () => {
-        if (framePc?.iceGatheringState === "complete") {
-          resolve();
-        }
-      };
-    });
-
-    const response = await fetch(MEDIAMTX_WHEP_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/sdp" },
-      body: framePc.localDescription.sdp,
-    });
-
-    if (!response.ok) {
-      throw new Error(`WHEP 请求失败: ${response.status}`);
-    }
-
-    const answerSDP = await response.text();
-    await framePc.setRemoteDescription(
-      new RTCSessionDescription({
-        type: "answer",
-        sdp: answerSDP,
-      })
-    );
-
-    frameRefreshTimer = setInterval(() => {
-      if (frameLoaded.value) {
-        redrawCanvas();
-      }
-    }, 200);
-  } catch (error) {
-    frameError.value = "当前视频帧加载失败，已切换为示意底图";
-    frameLoaded.value = false;
-    closeFrameStream();
-  }
-}
-
 function buildFrameSnapshotUrl() {
   if (!API_BASE_URL) return "";
   const params = new URLSearchParams({
@@ -615,7 +582,7 @@ function loadFrameSnapshot() {
     frameSnapshotLoading = false;
     frameLoaded.value = true;
     frameError.value = "";
-    redrawCanvas();
+    refreshVideoSourceSize();
   };
   image.onerror = () => {
     frameSnapshotLoading = false;
@@ -639,9 +606,15 @@ async function initFrameStream() {
 
 function drawBackground(ctx) {
   const image = frameImageRef.value;
-  if (frameLoaded.value && image?.naturalWidth) {
+  if (frameLoaded.value && image?.naturalWidth && image?.naturalHeight) {
     try {
-      ctx.drawImage(image, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      const rect = getVideoDrawRect();
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.drawImage(image, rect.x, rect.y, rect.width, rect.height);
+      ctx.strokeStyle = "rgba(15, 23, 42, 0.18)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
       return;
     } catch {
       frameLoaded.value = false;

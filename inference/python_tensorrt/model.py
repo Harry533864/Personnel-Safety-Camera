@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import atexit
+import errno
 import json
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -145,11 +147,33 @@ class Model:
         self.engine_path = self._resolve_engine_path(model_root, model_name)
         class_names = self._resolve_class_names(model_cfg, model_root, model_name)
 
+        self.runtime_config = self._build_runtime_config(model_cfg, model_name, class_names)
         runtime_dir = self._resolve_path(model_cfg.get("runtime_config_dir", "../inference/configs/runtime"))
+        self._write_runtime_config_files(runtime_dir)
+
+    def _write_runtime_config_files(self, runtime_dir: Path) -> None:
+        try:
+            self._write_runtime_config_files_to_dir(runtime_dir)
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+
+            fallback_dir = (
+                Path(tempfile.gettempdir())
+                / "asv-inference-runtime"
+                / self.config_path.stem
+            )
+            logger.warning(
+                "Runtime config directory is out of space: %s; falling back to %s",
+                runtime_dir,
+                fallback_dir,
+            )
+            self._write_runtime_config_files_to_dir(fallback_dir)
+
+    def _write_runtime_config_files_to_dir(self, runtime_dir: Path) -> None:
         runtime_dir.mkdir(parents=True, exist_ok=True)
         self.det_config_path = runtime_dir / "config_runtime.json"
         self.roi_config_path = runtime_dir / "roi_config_runtime.json"
-        self.runtime_config = self._build_runtime_config(model_cfg, model_name, class_names)
         self._write_json_atomic(self.det_config_path, self.runtime_config)
         self._write_json_atomic(
             self.roi_config_path,

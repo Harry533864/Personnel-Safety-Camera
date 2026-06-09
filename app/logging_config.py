@@ -8,6 +8,13 @@ from app.runtime_paths import LOG_DIR
 _CONFIGURED = False
 
 
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def configure_logging():
     global _CONFIGURED
     if _CONFIGURED:
@@ -19,6 +26,9 @@ def configure_logging():
 
     root_logger = logging.getLogger()
     root_logger.setLevel(level)
+
+    if not _env_flag("CAM_ACCESS_LOG", default=False):
+        logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     if not root_logger.handlers:
         console_handler = logging.StreamHandler()

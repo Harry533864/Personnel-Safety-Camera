@@ -37,6 +37,7 @@ class StreamRecorder:
         self.frame_count = 0
         self.last_error = None
         self.last_encoder = None
+        self._last_unavailable_reason = None
 
     @staticmethod
     def _default_bitrate_kbps(w, h, fps):
@@ -149,10 +150,17 @@ class StreamRecorder:
         unavailable_reason = StreamPublisher.unavailable_reason()
         if unavailable_reason:
             self.last_error = f"record unavailable: {unavailable_reason}"
-            self.logger.warning(
-                "Local recording unavailable: %s; cooling down for 60s",
-                unavailable_reason,
-            )
+            if self._last_unavailable_reason != unavailable_reason:
+                self.logger.warning(
+                    "Local recording unavailable: %s; cooling down for 60s",
+                    unavailable_reason,
+                )
+                self._last_unavailable_reason = unavailable_reason
+            else:
+                self.logger.debug(
+                    "Local recording still unavailable: %s; cooling down for 60s",
+                    unavailable_reason,
+                )
             self.cooldown_until = time.time() + 60.0
             return
 
@@ -246,6 +254,7 @@ class StreamRecorder:
         self.need_restart = False
         self.last_error = None
         self.last_encoder = encoder
+        self._last_unavailable_reason = None
         self.logger.info(
             "Record segment started: %s duration_min=%s",
             file_path,

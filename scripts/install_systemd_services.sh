@@ -21,6 +21,13 @@ PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
 INSTALL_DIR="${INSTALL_DIR:-/etc/systemd/system}"
 DISABLE_CRON_AUTOSTART="${DISABLE_CRON_AUTOSTART:-1}"
 STOP_LEGACY_STACK="${STOP_LEGACY_STACK:-1}"
+CAM_ACCESS_LOG="${CAM_ACCESS_LOG:-0}"
+CAM_LOG_LEVEL="${CAM_LOG_LEVEL:-INFO}"
+CAM_LOG_MAX_BYTES="${CAM_LOG_MAX_BYTES:-1048576}"
+CAM_LOG_BACKUP_COUNT="${CAM_LOG_BACKUP_COUNT:-2}"
+CAM_HOME_MIN_FREE_MB="${CAM_HOME_MIN_FREE_MB:-120}"
+CAM_HOME_CRITICAL_FREE_MB="${CAM_HOME_CRITICAL_FREE_MB:-60}"
+CAM_VIDEO_RETENTION_DAYS="${CAM_VIDEO_RETENTION_DAYS:-7}"
 
 MEDIAMTX_DIR="$REPO_DIR/app/Cam/mediamtx"
 MEDIAMTX_BIN="$MEDIAMTX_DIR/mediamtx"
@@ -58,8 +65,8 @@ WorkingDirectory=$MEDIAMTX_DIR
 ExecStart=$MEDIAMTX_BIN $MEDIAMTX_CONFIG
 Restart=always
 RestartSec=2
-StandardOutput=append:$LOG_DIR/mediamtx.out.log
-StandardError=append:$LOG_DIR/mediamtx.err.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -91,18 +98,58 @@ Environment=BAUMER_BRIGHTNESS_AUTO_PRIORITY=$BAUMER_BRIGHTNESS_AUTO_PRIORITY
 Environment=BAUMER_EXPOSURE_AUTO_MAX_US=$BAUMER_EXPOSURE_AUTO_MAX_US
 Environment=BAUMER_GAIN_AUTO_MAX=$BAUMER_GAIN_AUTO_MAX
 Environment=CAM_AUTO_START=1
+Environment=CAM_ACCESS_LOG=$CAM_ACCESS_LOG
+Environment=CAM_LOG_LEVEL=$CAM_LOG_LEVEL
+Environment=CAM_LOG_MAX_BYTES=$CAM_LOG_MAX_BYTES
+Environment=CAM_LOG_BACKUP_COUNT=$CAM_LOG_BACKUP_COUNT
+Environment=CAM_HOME_MIN_FREE_MB=$CAM_HOME_MIN_FREE_MB
+Environment=CAM_HOME_CRITICAL_FREE_MB=$CAM_HOME_CRITICAL_FREE_MB
+Environment=CAM_VIDEO_RETENTION_DAYS=$CAM_VIDEO_RETENTION_DAYS
 Environment=FLASK_DEBUG=0
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHON_BIN=$PYTHON_BIN
+ExecStartPre=/bin/sh -c 'if [ -x "$REPO_DIR/scripts/baumer_storage_guard.sh" ]; then "$REPO_DIR/scripts/baumer_storage_guard.sh" --service-start; fi'
 ExecStartPre=/bin/sh -c 'i=0; while [ ! -e "\$CAMERA_DEVICE" ] && [ "\$i" -lt "\$CAMERA_WAIT_SECONDS" ]; do i=\$((i+1)); sleep 1; done; exit 0'
 ExecStart=/bin/sh -c 'if command -v gunicorn >/dev/null 2>&1; then exec gunicorn --workers 1 --threads 4 --bind "\$FLASK_HOST:\$FLASK_PORT" app:app; else exec "\$PYTHON_BIN" -m flask --app app run --host="\$FLASK_HOST" --port="\$FLASK_PORT"; fi'
 Restart=always
 RestartSec=3
-StandardOutput=append:$LOG_DIR/flask.out.log
-StandardError=append:$LOG_DIR/flask.err.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+cat > "$INSTALL_DIR/asv-storage-guard.service" <<EOF
+[Unit]
+Description=ASV camera storage guard
+
+[Service]
+Type=oneshot
+User=$RUN_USER
+WorkingDirectory=$REPO_DIR
+Environment=CAM_PROJECT_ROOT=$REPO_DIR
+Environment=CAM_LOG_MAX_BYTES=$CAM_LOG_MAX_BYTES
+Environment=CAM_LOG_BACKUP_COUNT=$CAM_LOG_BACKUP_COUNT
+Environment=CAM_HOME_MIN_FREE_MB=$CAM_HOME_MIN_FREE_MB
+Environment=CAM_HOME_CRITICAL_FREE_MB=$CAM_HOME_CRITICAL_FREE_MB
+Environment=CAM_VIDEO_RETENTION_DAYS=$CAM_VIDEO_RETENTION_DAYS
+ExecStart=$REPO_DIR/scripts/baumer_storage_guard.sh --timer
+StandardOutput=journal
+StandardError=journal
+EOF
+
+cat > "$INSTALL_DIR/asv-storage-guard.timer" <<EOF
+[Unit]
+Description=Run ASV camera storage guard periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 EOF
 
 if [[ "$DISABLE_CRON_AUTOSTART" == "1" ]]; then
@@ -121,10 +168,13 @@ if [[ "$STOP_LEGACY_STACK" == "1" ]]; then
 fi
 
 systemctl daemon-reload
-systemctl enable asv-mediamtx.service asv-backend.service
+systemctl enable asv-mediamtx.service asv-backend.service asv-storage-guard.timer
+systemctl restart asv-storage-guard.timer
+systemctl start asv-storage-guard.service || true
 systemctl restart asv-mediamtx.service
 systemctl restart asv-backend.service
 
 echo "Installed systemd services without LAN startup dependency."
 echo "  systemctl status asv-mediamtx asv-backend"
+echo "  systemctl list-timers asv-storage-guard.timer"
 echo "  journalctl -u asv-backend -f"

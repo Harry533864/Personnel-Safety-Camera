@@ -499,18 +499,32 @@ def set_resolution():
             width = int(data["width"])
             height = int(data["height"])
         target = data.get("target", "high")
+        cfg = read_ai_config()
+        model_cfg = cfg.get("model", {})
+        infer_target = str(model_cfg.get("infer_target", "high")).lower()
+        streams_to_update = list(get_target_streams(target))
+        if to_bool(model_cfg.get("detect_enable", False)):
+            streams_to_update.extend(get_target_streams(infer_target))
 
         # 让硬件管理器修改参数并重启硬件取流
         cam_manager.set_resolution(width, height)
 
-        for stream in get_target_streams(target):
+        seen_streams = set()
+        updated_streams = []
+        for stream in streams_to_update:
+            if stream.name in seen_streams:
+                continue
             stream.set_resolution(width, height)
+            seen_streams.add(stream.name)
+            updated_streams.append(stream.name)
+
         settings = camera_config_service.update({
             "resolution": "max" if use_max_resolution else f"{width}x{height}",
             "width": width,
             "height": height,
             "target": target,
         })
+        ai_sync = sync_infer_enable_from_config(cfg)
 
         return jsonify({
             "status": "success",
@@ -522,6 +536,8 @@ def set_resolution():
                 "savedResolution": settings["resolution"],
                 "mode": "max" if settings["resolution"] == "max" else "custom",
                 "target": settings["target"],
+                "updated_streams": updated_streams,
+                "ai_sync": ai_sync,
             },
         })
 
