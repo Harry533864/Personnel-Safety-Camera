@@ -5,7 +5,12 @@ REQUIRE_SUPER_MODE="${REQUIRE_SUPER_MODE:-1}"
 REQUIRE_HW_ENCODER="${REQUIRE_HW_ENCODER:-1}"
 REQUIRE_CAMERA_1080P60="${REQUIRE_CAMERA_1080P60:-1}"
 REQUIRE_BACKEND="${REQUIRE_BACKEND:-0}"
+CAMERA_SOURCE="${CAMERA_SOURCE:-usb}"
 CAMERA_DEVICE="${CAMERA_DEVICE:-/dev/video0}"
+CSI_SENSOR_ID="${CSI_SENSOR_ID:-0}"
+CSI_CAMERA_WIDTH="${CSI_CAMERA_WIDTH:-1920}"
+CSI_CAMERA_HEIGHT="${CSI_CAMERA_HEIGHT:-1080}"
+CSI_CAMERA_FPS="${CSI_CAMERA_FPS:-30}"
 BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:5000/api/runtime/status}"
 
 failures=0
@@ -67,7 +72,7 @@ check_hw_encoder() {
   fi
 }
 
-check_camera() {
+check_usb_camera() {
   if [[ ! -e "$CAMERA_DEVICE" ]]; then
     fail "Camera device not found: $CAMERA_DEVICE"
     return
@@ -85,6 +90,34 @@ check_camera() {
     fail "$CAMERA_DEVICE does not report 1920x1080@60 support"
   else
     echo "[WARN] $CAMERA_DEVICE does not report 1920x1080@60 support"
+  fi
+}
+
+check_csi_camera() {
+  if ! gst-inspect-1.0 nvarguscamerasrc >/dev/null 2>&1; then
+    fail "GStreamer nvarguscamerasrc element not found"
+    return
+  fi
+
+  output="$(timeout 12s gst-launch-1.0 \
+    nvarguscamerasrc sensor-id="$CSI_SENSOR_ID" num-buffers=3 \
+    ! "video/x-raw(memory:NVMM),width=$CSI_CAMERA_WIDTH,height=$CSI_CAMERA_HEIGHT,framerate=$CSI_CAMERA_FPS/1" \
+    ! fakesink 2>&1 || true)"
+
+  if echo "$output" | grep -Eq "No cameras available|Invalid camera device"; then
+    fail "CSI camera sensor-id=$CSI_SENSOR_ID was not detected"
+  elif echo "$output" | grep -Eq "Available Sensor modes|Done Success|Got EOS"; then
+    pass "CSI camera sensor-id=$CSI_SENSOR_ID responds through Argus"
+  else
+    fail "CSI camera probe did not confirm a usable camera: ${output//$'\n'/; }"
+  fi
+}
+
+check_camera() {
+  if [[ "$CAMERA_SOURCE" == "csi" ]]; then
+    check_csi_camera
+  else
+    check_usb_camera
   fi
 }
 

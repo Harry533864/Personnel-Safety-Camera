@@ -12,6 +12,7 @@ from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
 from app.runtime import (
     build_runtime_status,
     cam_manager,
+    get_detection_overlay,
     get_target_streams,
     reload_enabled_streams,
     start_runtime,
@@ -285,6 +286,43 @@ def get_detection_regions():
             "status": "error",
             "message": f"获取检测区域失败: {e}",
             "rois": []
+        }), 400
+
+
+@app.route("/api/detection/overlay", methods=["GET"])
+def get_detection_overlay_state():
+    """
+    获取实时预览叠层数据。视频仍走低延迟直通流，前端用这些坐标画 ROI/AI 框。
+    """
+    try:
+        target = request.args.get("target", "high")
+        max_age_sec = float(request.args.get("max_age_sec", 1.0))
+        cfg = read_ai_config()
+        rois = cfg.get("model", {}).get("rois", [])
+        overlay = get_detection_overlay(target=target, max_age_sec=max_age_sec)
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "target": target,
+                "rois": rois,
+                "overlay": overlay,
+            },
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"获取检测叠层失败: {e}",
+            "data": {
+                "target": request.args.get("target", "high"),
+                "rois": [],
+                "overlay": {
+                    "detections": [],
+                    "zone_summary": [],
+                    "stale": True,
+                },
+            },
         }), 400
 
 

@@ -11,8 +11,8 @@ from app.Cam.stream_recorder import StreamRecorder
 
 class CamStream:
     """
-    CamManager 负责采集，InferenceWorker 负责推理，
-    CamStream 只调度推流和录制，避免把所有运行职责揉在一个类里。
+    CamManager owns capture, InferenceWorker owns inference.
+    CamStream coordinates publishing and recording.
     """
 
     def __init__(
@@ -23,6 +23,7 @@ class CamStream:
         height=720,
         fps=15,
         enable_infer=False,
+        enable_publish=True,
         enable_record=False,
         ai_config_path=None,
         video_base_dir=None,
@@ -35,6 +36,7 @@ class CamStream:
         self.width = int(width)
         self.height = int(height)
         self.fps = max(1, int(fps))
+        self.enable_publish = bool(enable_publish)
 
         self._is_running = False
         self._thread = None          # 推流/录制线程
@@ -104,6 +106,7 @@ class CamStream:
                 "infer_thread_alive": infer_status["thread_alive"],
                 "writer_opened": self.writer_opened,
                 "need_writer_restart": need_writer_restart,
+                "enable_publish": self.enable_publish,
                 "enable_infer": infer_status["enable_infer"],
                 "model_loaded": infer_status["model_loaded"],
                 "enable_record": record_status["enabled"],
@@ -165,10 +168,10 @@ class CamStream:
         height = int(height)
 
         if width <= 0 or height <= 0:
-            raise ValueError("width 和 height 必须大于 0")
+            raise ValueError("width and height must be greater than 0")
 
         if width % 2 != 0 or height % 2 != 0:
-            raise ValueError("H.264/I420 要求 width 和 height 必须是偶数")
+            raise ValueError("H.264/I420 requires even width and height")
 
         with self.set_lock:
             self.width = width
@@ -203,15 +206,16 @@ class CamStream:
     def reload_ai_config(self):
         self.inference.reload_config()
 
+    def get_overlay_state(self, max_age_sec=1.0):
+        return self.inference.overlay_state(max_age_sec=max_age_sec)
+
     # =========================================================
-    # 队列与线程控制
+    # Queue and thread control
     # =========================================================
 
     def put_frame(self, frame):
         """
-        最小改动关键点：
-        不再使用 maxsize=10 的队列，只保留最新帧。
-        这样 AI 推理永远处理最新画面，不会处理历史积压帧。
+        Keep only the latest frame so inference does not build latency.
         """
         if not self._is_running:
             return
@@ -231,14 +235,16 @@ class CamStream:
         self.inference.start()
 
         # 推流/录制线程
-        self._thread = threading.Thread(
-            target=self._worker_task,
-            daemon=True,
-            name=f"CamStreamWriter-{self.name}",
-        )
-        self._thread.start()
-
-        self.logger.info("Stream writer thread started: %s", self.url)
+        if self.enable_publish or self.recorder.enabled:
+            self._thread = threading.Thread(
+                target=self._worker_task,
+                daemon=True,
+                name=f"CamStreamWriter-{self.name}",
+            )
+            self._thread.start()
+            self.logger.info("Stream writer thread started: %s", self.url)
+        else:
+            self.logger.info("Stream publisher disabled: %s", self.name)
 
     def stop(self):
         self._is_running = False
@@ -281,7 +287,7 @@ class CamStream:
         return frame
 
     # =========================================================
-    # 主推流/录制线程
+    # Publishing and recording thread
     # =========================================================
 
     def _worker_task(self):
@@ -295,8 +301,10 @@ class CamStream:
                 current_fps = max(1, int(self.fps))
                 need_restart = self._need_writer_restart
 
-            # 1. 分辨率/FPS 变化时，先重启 GStreamer writer
-            if need_restart or writer is None or not writer.isOpened():
+            # 1. Reopen the GStreamer writer when resolution or FPS changes.
+            if self.enable_publish and (
+                need_restart or writer is None or not writer.isOpened()
+            ):
                 self._close_writer(writer)
                 writer = None
                 with self.status_lock:
@@ -333,6 +341,13 @@ class CamStream:
 
                     time.sleep(1.0)
                     continue
+            elif not self.enable_publish:
+                if writer is not None:
+                    self._close_writer(writer)
+                    writer = None
+                with self.status_lock:
+                    self.writer_opened = False
+                    self.last_writer_error = None
 
             # 2. 检查、切换或创建本地录制 VideoWriter
             self.recorder.maintain(
@@ -355,14 +370,14 @@ class CamStream:
             else:
                 next_time += frame_duration
 
-            # 4. 取最新 AI 推理结果
+            # 4. Fetch the latest inference result.
             frame = self.inference.get_frame()
 
             if frame is None:
                 time.sleep(0.001)
                 continue
 
-            # 5. 写入前格式检查、resize 到推流尺寸
+            # 5. Normalize format and resize before publishing.
             frame = self._prepare_frame_for_writer(
                 frame,
                 current_w=current_w,
@@ -370,6 +385,11 @@ class CamStream:
             )
 
             if frame is None:
+                continue
+
+            if not self.enable_publish:
+                self.recorder.write(frame, self._record_stats())
+                time.sleep(0.001)
                 continue
 
             # 6. 写入 GStreamer 推流

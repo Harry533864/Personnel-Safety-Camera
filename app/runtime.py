@@ -27,8 +27,35 @@ def _env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _env_choice(name: str, default: str, allowed: set[str]) -> str:
+    raw = str(os.environ.get(name, default)).strip().lower()
+    if raw not in allowed:
+        logger.warning("Invalid %s=%s; using %s", name, raw, default)
+        return default
+    return raw
+
+
+def _source_env(name: str, source: str, fallback: str | None = None) -> str | None:
+    return os.environ.get(f"{source.upper()}_{name}", os.environ.get(fallback or name))
+
+
+def _source_env_int(
+    name: str,
+    source: str,
+    default: int,
+    fallback: str | None = None,
+) -> int:
+    raw = _source_env(name, source, fallback)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
 def _camera_id() -> int | str:
-    raw = os.environ.get("CAMERA_DEVICE", os.environ.get("CAM_CAMERA_ID", "0"))
+    raw = os.environ.get(
+        f"{CAMERA_SOURCE.upper()}_CAMERA_DEVICE",
+        os.environ.get("CAMERA_DEVICE", os.environ.get("CAM_CAMERA_ID", "0")),
+    )
     return int(raw) if str(raw).isdigit() else raw
 
 
@@ -48,15 +75,49 @@ def _read_ai_startup_state() -> tuple[bool, str]:
     return enable, target
 
 
-ORI_WIDTH = _env_int("CAMERA_WIDTH", 1920)
-ORI_HEIGHT = _env_int("CAMERA_HEIGHT", 1080)
-ORI_FPS = _env_int("CAMERA_FPS", 60)
+CAMERA_SOURCE = _env_choice("CAMERA_SOURCE", "usb", {"usb", "csi"})
+
+if CAMERA_SOURCE == "csi":
+    ORI_WIDTH = _source_env_int("CAMERA_WIDTH", "csi", 1920)
+    ORI_HEIGHT = _source_env_int("CAMERA_HEIGHT", "csi", 1080)
+    ORI_FPS = _source_env_int("CAMERA_FPS", "csi", 30)
+else:
+    ORI_WIDTH = _source_env_int("CAMERA_WIDTH", "usb", 1920)
+    ORI_HEIGHT = _source_env_int("CAMERA_HEIGHT", "usb", 1080)
+    ORI_FPS = _source_env_int("CAMERA_FPS", "usb", 60)
+
+CSI_SENSOR_ID = _env_int("CSI_SENSOR_ID", 0)
+CSI_FLIP_METHOD = _env_int("CSI_FLIP_METHOD", 0)
+CSI_DIRECT_STREAM = to_bool(os.environ.get("CSI_DIRECT_STREAM", "0"))
+CSI_DIRECT_RTMP_URL = os.environ.get("CSI_DIRECT_RTMP_URL", URL_HIGH)
+STREAM_HIGH_PUBLISH = to_bool(
+    os.environ.get(
+        "STREAM_HIGH_PUBLISH",
+        "0" if CAMERA_SOURCE == "csi" and CSI_DIRECT_STREAM else "1",
+    )
+)
+STREAM_HIGH_RECORD = to_bool(
+    os.environ.get(
+        "STREAM_HIGH_RECORD",
+        "0" if CAMERA_SOURCE == "csi" and CSI_DIRECT_STREAM else "1",
+    )
+)
+CAMERA_FOURCC = _source_env("CAMERA_FOURCC", CAMERA_SOURCE) or "MJPG"
 
 cam_manager = CamManager(
     camera_id=_camera_id(),
+    camera_source=CAMERA_SOURCE,
+    csi_sensor_id=CSI_SENSOR_ID,
+    csi_flip_method=CSI_FLIP_METHOD,
+    direct_stream_url=(
+        CSI_DIRECT_RTMP_URL
+        if CAMERA_SOURCE == "csi" and CSI_DIRECT_STREAM
+        else None
+    ),
     width=ORI_WIDTH,
     height=ORI_HEIGHT,
     fps=ORI_FPS,
+    fourcc=CAMERA_FOURCC,
 )
 
 AI_INFER_ENABLE, AI_INFER_TARGET = _read_ai_startup_state()
@@ -64,12 +125,13 @@ AI_INFER_ENABLE, AI_INFER_TARGET = _read_ai_startup_state()
 stream_high = CamStream(
     name="cam_high",
     url=URL_HIGH,
-    width=1920,
-    height=1080,
-    fps=60,
+    width=ORI_WIDTH,
+    height=ORI_HEIGHT,
+    fps=ORI_FPS,
     enable_infer=should_enable_stream_ai("cam_high", AI_INFER_ENABLE, AI_INFER_TARGET),
+    enable_publish=STREAM_HIGH_PUBLISH,
     ai_config_path=str(AI_CONFIG_PATH),
-    enable_record=True,
+    enable_record=STREAM_HIGH_RECORD,
     video_base_dir=VIDEO_BASE_PATH,
 )
 
@@ -159,6 +221,14 @@ def reload_enabled_streams() -> list[str]:
             stream.reload_ai_config()
             reloaded.append(stream.name)
     return reloaded
+
+
+def get_detection_overlay(target: str = "high", max_age_sec: float = 1.0) -> dict[str, Any]:
+    streams = get_target_streams(target)
+    if not streams:
+        raise ValueError("target must be high, low, or all")
+    stream = streams[0]
+    return stream.get_overlay_state(max_age_sec=max_age_sec)
 
 
 def start_runtime() -> None:

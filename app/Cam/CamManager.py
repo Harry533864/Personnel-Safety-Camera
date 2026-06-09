@@ -1,4 +1,5 @@
 import cv2
+import os
 import time
 import threading
 import subprocess
@@ -20,12 +21,20 @@ class CamManager:
     def __init__(
         self,
         camera_id="/dev/video0",
+        camera_source="usb",
+        csi_sensor_id=0,
+        csi_flip_method=0,
+        direct_stream_url=None,
         width=1280,
         height=720,
         fps=15,
         fourcc="MJPG",
     ):
         self.camera_id = camera_id
+        self.camera_source = str(camera_source or "usb").lower()
+        self.csi_sensor_id = int(csi_sensor_id)
+        self.csi_flip_method = int(csi_flip_method)
+        self.direct_stream_url = direct_stream_url
         self.width = width
         self.height = height
         self.fps = fps
@@ -66,6 +75,11 @@ class CamManager:
         with self._state_lock:
             return {
                 "camera_id": self.camera_id,
+                "camera_source": self.camera_source,
+                "csi_sensor_id": self.csi_sensor_id,
+                "csi_flip_method": self.csi_flip_method,
+                "direct_stream_enabled": bool(self.direct_stream_url),
+                "direct_stream_url": self.direct_stream_url,
                 "width": self.width,
                 "height": self.height,
                 "fps": self.fps,
@@ -110,6 +124,10 @@ class CamManager:
         self.logger.info("Camera exposure requested: %s", value)
 
     def _apply_exposure(self):
+        if self.camera_source == "csi":
+            self.logger.info("Skipping v4l2 exposure controls for CSI camera")
+            return
+
         dev_path = self.camera_id
         with self._state_lock:
             exposure_val = self._exposure_val
@@ -204,17 +222,67 @@ class CamManager:
         self.logger.info("Camera capture stopped")
 
     def _build_pipeline(self):
+        with self._state_lock:
+            width = self.width
+            height = self.height
+            fps = self.fps
+
+        if self.camera_source == "csi":
+            capture_caps = (
+                f"video/x-raw(memory:NVMM), "
+                f"width={width}, height={height}, framerate={fps}/1"
+            )
+            appsink_branch = (
+                f"nvvidconv flip-method={self.csi_flip_method} ! "
+                f"video/x-raw, format=BGRx ! "
+                f"videoconvert ! "
+                f"video/x-raw, format=BGR ! "
+                f"appsink drop=true max-buffers=1 sync=false"
+            )
+
+            if self.direct_stream_url:
+                direct_branch = (
+                    f"queue leaky=downstream max-size-buffers=2 ! "
+                    f"nvvidconv flip-method={self.csi_flip_method} ! "
+                    f"video/x-raw, format=I420 ! "
+                    f"x264enc "
+                    f"bitrate={self._suggest_bitrate_kbps(width, height, fps)} "
+                    f"speed-preset=ultrafast "
+                    f"tune=zerolatency "
+                    f"vbv-buf-capacity={self._direct_vbv_ms()} "
+                    f"rc-lookahead=0 "
+                    f"sync-lookahead=0 "
+                    f"key-int-max={self._direct_key_int(fps)} "
+                    f"bframes=0 "
+                    f"threads={self._x264_threads()} "
+                    f"sliced-threads={str(self._x264_sliced_threads()).lower()} "
+                    f"byte-stream=false ! "
+                    f"h264parse config-interval=1 ! "
+                    f"flvmux streamable=true ! "
+                    f"rtmpsink location={self.direct_stream_url} sync=false async=false"
+                )
+
+                return (
+                    f"nvarguscamerasrc sensor-id={self.csi_sensor_id} ! "
+                    f"{capture_caps} ! "
+                    f"tee name=t "
+                    f"t. ! {direct_branch} "
+                    f"t. ! queue leaky=downstream max-size-buffers=1 ! "
+                    f"{appsink_branch}"
+                )
+
+            return (
+                f"nvarguscamerasrc sensor-id={self.csi_sensor_id} ! "
+                f"{capture_caps} ! "
+                f"{appsink_branch}"
+            )
+
         dev_path = self.camera_id
 
         if isinstance(dev_path, int) or (
             isinstance(dev_path, str) and dev_path.isdigit()
         ):
             dev_path = f"/dev/video{dev_path}"
-
-        with self._state_lock:
-            width = self.width
-            height = self.height
-            fps = self.fps
 
         return (
             f"v4l2src device={dev_path} ! "
@@ -224,6 +292,49 @@ class CamManager:
             f"video/x-raw, format=BGR ! "
             f"appsink drop=true max-buffers=1 sync=false"
         )
+
+    @staticmethod
+    def _suggest_bitrate_kbps(w, h, fps):
+        pixels = int(w) * int(h)
+        if pixels >= 2560 * 1440:
+            return int(os.environ.get("CSI_DIRECT_BITRATE_KBPS", "15000"))
+        if pixels >= 1920 * 1080:
+            return 12000
+        if pixels >= 1280 * 720:
+            return 8000
+        return 4000
+
+    @staticmethod
+    def _x264_threads():
+        raw = os.environ.get("STREAM_X264_THREADS", "0")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _x264_sliced_threads():
+        raw = os.environ.get("STREAM_X264_SLICED_THREADS", "0")
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+    @staticmethod
+    def _direct_key_int(fps):
+        default_key_int = max(1, min(int(fps), 10))
+        raw = os.environ.get("CSI_DIRECT_KEY_INT")
+        if raw is None or raw == "":
+            return default_key_int
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return default_key_int
+
+    @staticmethod
+    def _direct_vbv_ms():
+        raw = os.environ.get("CSI_DIRECT_VBV_MS", "100")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 100
 
     def _open_capture(self):
         pipeline = self._build_pipeline()

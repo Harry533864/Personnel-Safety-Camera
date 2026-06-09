@@ -25,6 +25,7 @@ class InferenceWorker:
         self._latest_stream_frame = None
         self._latest_output_frame = None
         self._latest_output_time = 0.0
+        self._latest_frame_shape = None
 
         self._status_lock = threading.Lock()
         self._last_raw_frame_at = 0.0
@@ -32,6 +33,15 @@ class InferenceWorker:
         self._last_latency_ms = None
         self._last_error = None
         self._frame_count = 0
+        self._latest_overlay = {
+            "detections": [],
+            "zone_summary": [],
+            "task_results": [],
+            "system_state": "safe",
+            "warning": False,
+            "alarm": False,
+        }
+        self._latest_overlay_at = 0.0
         self._next_model_retry_at = 0.0
         self._model_retry_interval = 10.0
 
@@ -78,6 +88,116 @@ class InferenceWorker:
                 "frames_inferred": self._frame_count,
             }
 
+    @staticmethod
+    def _json_value(value):
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                return InferenceWorker._json_value(item())
+            except Exception:
+                pass
+        if hasattr(value, "value"):
+            return InferenceWorker._json_value(value.value)
+        if isinstance(value, dict):
+            return {str(k): InferenceWorker._json_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [InferenceWorker._json_value(v) for v in value]
+        if isinstance(value, (str, bool, int, float)) or value is None:
+            return value
+        return str(value)
+
+    @staticmethod
+    def _serialize_detection(detection):
+        return {
+            "bbox": [float(v) for v in getattr(detection, "bbox", [])],
+            "class_id": int(getattr(detection, "class_id", 0)),
+            "class_name": str(getattr(detection, "class_name", "")),
+            "confidence": float(getattr(detection, "confidence", 0.0)),
+            "center": [float(v) for v in getattr(detection, "center", [])],
+            "foot_point": [float(v) for v in getattr(detection, "foot_point", [])],
+            "roi_hits": InferenceWorker._json_value(
+                getattr(detection, "roi_hits", []) or []
+            ),
+        }
+
+    @staticmethod
+    def _serialize_zone(zone):
+        return {
+            "roi_id": str(getattr(zone, "roi_id", "")),
+            "roi_name": str(getattr(zone, "roi_name", "")),
+            "roi_type": str(getattr(zone, "roi_type", "")),
+            "person_count": int(getattr(zone, "person_count", 0)),
+            "raw_active": bool(getattr(zone, "raw_active", False)),
+            "stable_active": bool(getattr(zone, "stable_active", False)),
+            "enter_counter": int(getattr(zone, "enter_counter", 0)),
+            "exit_counter": int(getattr(zone, "exit_counter", 0)),
+        }
+
+    @classmethod
+    def _serialize_overlay(cls, frame_result, task_results, frame_shape):
+        height = int(frame_shape[0]) if frame_shape is not None else 0
+        width = int(frame_shape[1]) if frame_shape is not None else 0
+        if frame_result is None:
+            return {
+                "source_width": width,
+                "source_height": height,
+                "detections": [],
+                "zone_summary": [],
+                "task_results": cls._json_value(task_results or []),
+                "system_state": "safe",
+                "warning": False,
+                "alarm": False,
+            }
+
+        state = getattr(frame_result, "system_state", "safe")
+        state = getattr(state, "value", state)
+        return {
+            "source_width": width,
+            "source_height": height,
+            "detections": [
+                cls._serialize_detection(detection)
+                for detection in getattr(frame_result, "detections", []) or []
+            ],
+            "zone_summary": [
+                cls._serialize_zone(zone)
+                for zone in getattr(frame_result, "zone_summary", []) or []
+            ],
+            "task_results": cls._json_value(task_results or []),
+            "system_state": str(state),
+            "warning": bool(getattr(frame_result, "warning", False)),
+            "alarm": bool(getattr(frame_result, "alarm", False)),
+        }
+
+    def overlay_state(self, max_age_sec=1.0):
+        now = time.time()
+        with self._status_lock:
+            overlay = dict(self._latest_overlay)
+            updated_at = self._latest_overlay_at
+            last_error = self._last_error
+            frames_inferred = self._frame_count
+
+        age_sec = now - updated_at if updated_at else None
+        stale = age_sec is None or (
+            max_age_sec is not None and max_age_sec > 0 and age_sec > max_age_sec
+        )
+        if stale:
+            overlay["detections"] = []
+
+        with self._ai_lock:
+            enabled = self._enabled
+            model_loaded = self._model is not None
+
+        overlay.update({
+            "enable_infer": enabled,
+            "model_loaded": model_loaded,
+            "updated_at": self._format_time(updated_at),
+            "age_sec": round(age_sec, 3) if age_sec is not None else None,
+            "stale": stale,
+            "last_error": last_error,
+            "frames_inferred": frames_inferred,
+        })
+        return overlay
+
     def put_frame(self, frame):
         if not self._running or frame is None:
             return False
@@ -85,6 +205,7 @@ class InferenceWorker:
         with self._frame_lock:
             self._latest_raw_frame = frame
             self._latest_stream_frame = frame
+            self._latest_frame_shape = frame.shape
 
         with self._status_lock:
             self._last_raw_frame_at = time.time()
@@ -277,6 +398,12 @@ class InferenceWorker:
                             2,
                         )
                         self._last_error = None
+                        self._latest_overlay = self._serialize_overlay(
+                            getattr(model, "last_frame_result", None),
+                            getattr(model, "last_task_results", []),
+                            frame.shape,
+                        )
+                        self._latest_overlay_at = self._last_success_at
 
                 except Exception as error:
                     self.logger.exception(

@@ -8,8 +8,19 @@ MEDIAMTX_BIN="$MEDIAMTX_DIR/mediamtx"
 MEDIAMTX_CONFIG="$MEDIAMTX_DIR/mediamtx.yml"
 FLASK_HOST="${FLASK_HOST:-0.0.0.0}"
 FLASK_PORT="${FLASK_PORT:-5000}"
+CAMERA_SOURCE="${CAMERA_SOURCE:-usb}"
 CAMERA_DEVICE="${CAMERA_DEVICE:-/dev/video0}"
+CSI_READY_DEVICE="${CSI_READY_DEVICE:-/dev/media0}"
 CAMERA_WAIT_SECONDS="${CAMERA_WAIT_SECONDS:-45}"
+CSI_DIRECT_STREAM="${CSI_DIRECT_STREAM:-0}"
+CSI_DIRECT_RTMP_URL="${CSI_DIRECT_RTMP_URL:-rtmp://127.0.0.1:1935/cam_high}"
+CSI_DIRECT_BITRATE_KBPS="${CSI_DIRECT_BITRATE_KBPS:-15000}"
+CSI_DIRECT_KEY_INT="${CSI_DIRECT_KEY_INT:-10}"
+CSI_DIRECT_VBV_MS="${CSI_DIRECT_VBV_MS:-100}"
+STREAM_HIGH_PUBLISH="${STREAM_HIGH_PUBLISH:-1}"
+STREAM_HIGH_RECORD="${STREAM_HIGH_RECORD:-1}"
+STREAM_X264_THREADS="${STREAM_X264_THREADS:-0}"
+STREAM_X264_SLICED_THREADS="${STREAM_X264_SLICED_THREADS:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOCK_FILE="/tmp/cam_backend_stack.lock"
 
@@ -57,16 +68,21 @@ start_flask() {
 
 wait_for_camera() {
   local waited=0
+  local ready_device="$CAMERA_DEVICE"
 
-  while [[ ! -e "$CAMERA_DEVICE" && "$waited" -lt "$CAMERA_WAIT_SECONDS" ]]; do
+  if [[ "$CAMERA_SOURCE" == "csi" ]]; then
+    ready_device="$CSI_READY_DEVICE"
+  fi
+
+  while [[ ! -e "$ready_device" && "$waited" -lt "$CAMERA_WAIT_SECONDS" ]]; do
     sleep 1
     waited=$((waited + 1))
   done
 
-  if [[ -e "$CAMERA_DEVICE" ]]; then
-    echo "$(date '+%F %T') camera device ready: $CAMERA_DEVICE waited=${waited}s" >> "$LOG_DIR/autostart.log"
+  if [[ -e "$ready_device" ]]; then
+    echo "$(date '+%F %T') camera source=$CAMERA_SOURCE ready: $ready_device waited=${waited}s" >> "$LOG_DIR/autostart.log"
   else
-    echo "$(date '+%F %T') camera device not found after ${CAMERA_WAIT_SECONDS}s: $CAMERA_DEVICE; starting backend anyway" >> "$LOG_DIR/autostart.log"
+    echo "$(date '+%F %T') camera source=$CAMERA_SOURCE not ready after ${CAMERA_WAIT_SECONDS}s: $ready_device; starting backend anyway" >> "$LOG_DIR/autostart.log"
   fi
 }
 

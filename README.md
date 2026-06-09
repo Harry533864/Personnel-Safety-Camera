@@ -41,6 +41,22 @@ Start backend + MediaMTX once:
 RUN_NOW=1 bash scripts/bootstrap_jetson.sh
 ```
 
+Switch camera input without losing the USB profile:
+
+```bash
+# USB / UVC camera profile, default.
+CAMERA_SOURCE=usb \
+USB_CAMERA_DEVICE=/dev/video0 \
+USB_CAMERA_WIDTH=1920 USB_CAMERA_HEIGHT=1080 USB_CAMERA_FPS=60 \
+RUN_NOW=1 bash scripts/bootstrap_jetson.sh
+
+# Jetson CSI / Argus profile, suitable for a single IMX219 on sensor-id 0.
+CAMERA_SOURCE=csi \
+CSI_SENSOR_ID=0 \
+CSI_CAMERA_WIDTH=1920 CSI_CAMERA_HEIGHT=1080 CSI_CAMERA_FPS=30 \
+RUN_NOW=1 bash scripts/bootstrap_jetson.sh
+```
+
 Start backend + MediaMTX + Vite frontend once:
 
 ```bash
@@ -89,7 +105,8 @@ bash scripts/factory_readiness_check.sh
 ```
 
 This checks Super/25W mode, hardware encoder availability, camera 1080p60
-support, and optional backend status.
+support for USB cameras or Argus availability for CSI cameras, and optional
+backend status.
 
 ## Notes
 

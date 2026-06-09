@@ -1,4 +1,5 @@
 import logging
+import os
 import shutil
 import subprocess
 
@@ -66,12 +67,27 @@ class StreamPublisher:
             return 8000
         return 4000
 
+    @staticmethod
+    def _x264_threads():
+        raw = os.environ.get("STREAM_X264_THREADS", "0")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _x264_sliced_threads():
+        raw = os.environ.get("STREAM_X264_SLICED_THREADS", "0")
+        return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
     def build_pipeline(self, current_w, current_h, current_fps):
         current_w = int(current_w)
         current_h = int(current_h)
         current_fps = max(1, int(current_fps))
         bitrate_kbps = self.suggest_bitrate_kbps(current_w, current_h, current_fps)
         encoder = self._select_encoder()
+        x264_threads = self._x264_threads()
+        x264_sliced_threads = str(self._x264_sliced_threads()).lower()
 
         base = (
             f"appsrc is-live=true block=false format=time do-timestamp=true "
@@ -108,8 +124,8 @@ class StreamPublisher:
                 f"tune=zerolatency "
                 f"key-int-max={current_fps} "
                 f"bframes=0 "
-                f"threads=2 "
-                f"sliced-threads=true "
+                f"threads={x264_threads} "
+                f"sliced-threads={x264_sliced_threads} "
                 f"byte-stream=false "
                 f"! h264parse config-interval=1 "
                 f"! flvmux streamable=true "

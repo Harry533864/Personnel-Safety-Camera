@@ -125,6 +125,11 @@
           <span class="status-text">{{ currentFps || '-- fps' }}</span>
         </div>
 
+        <div class="status-indicator latency-indicator" :class="currentLatencyClass">
+          <span class="status-dot"></span>
+          <span class="status-text">{{ currentLatency || '-- ms' }}</span>
+        </div>
+
         <div class="status-indicator" :class="networkStatus">
           <span class="status-dot"></span>
           <span class="status-text">{{ networkSpeed }} MB/s</span>
@@ -143,6 +148,11 @@
           muted
           playsinline
         ></video>
+        <canvas
+          v-show="videoLoaded"
+          ref="videoOverlay"
+          class="video-overlay"
+        ></canvas>
 
         <!-- 视频加载失败的显示层 -->
         <div class="video-placeholder" v-if="!videoLoaded">
@@ -193,10 +203,13 @@ import {
 
 const router = useRouter();
 const videoPlayer = ref(null);
+const videoOverlay = ref(null);
 const videoLoaded = ref(false);
 const videoResolution = ref("");
 const currentFps = ref("");
 const currentFpsValue = ref(0);
+const currentLatency = ref("");
+const currentLatencyMs = ref(0);
 const currentTime = ref("");
 const networkSpeed = ref("0.0");
 const networkStatus = ref("normal");
@@ -270,6 +283,17 @@ let videoFrameCallbackId = null;
 let fpsFallbackInterval = null;
 let firstFrameTimer = null;
 let fpsSample = { frames: 0, time: 0 };
+let overlayFetchTimer = null;
+let overlayDrawFrame = null;
+let overlaySamples = [];
+const overlayState = ref({
+  rois: [],
+  overlay: {
+    detections: [],
+    source_width: 0,
+    source_height: 0,
+  },
+});
 
 // 重连机制
 let reconnectAttempts = 0;
@@ -356,8 +380,25 @@ const setCurrentFps = (value) => {
   currentFps.value = formatFps(fps);
 };
 
+const setCurrentLatency = (metadata) => {
+  const captureTime = Number(metadata?.captureTime || 0);
+  const displayTime = Number(metadata?.expectedDisplayTime || performance.now());
+  if (!Number.isFinite(captureTime) || !Number.isFinite(displayTime) || captureTime <= 0) return;
+
+  const latencyMs = displayTime - captureTime;
+  if (!Number.isFinite(latencyMs) || latencyMs < 0 || latencyMs > 10000) return;
+
+  currentLatencyMs.value = latencyMs;
+  currentLatency.value = `${Math.round(latencyMs)} ms`;
+};
+
 const currentFpsClass = computed(() => ({
   danger: currentFpsValue.value > 0 && currentFpsValue.value < 10,
+}));
+
+const currentLatencyClass = computed(() => ({
+  normal: currentLatencyMs.value > 250 && currentLatencyMs.value <= 500,
+  poor: currentLatencyMs.value > 500,
 }));
 
 const getHostFromUrl = (url) => {
@@ -580,6 +621,7 @@ const startFpsMonitor = () => {
   const update = (_now, metadata) => {
     const frames = Number(metadata.presentedFrames || 0);
     const time = performance.now();
+    setCurrentLatency(metadata);
 
     if (fpsSample.frames && time > fpsSample.time) {
       const deltaFrames = frames - fpsSample.frames;
@@ -613,10 +655,228 @@ const stopFpsMonitor = () => {
     fpsFallbackInterval = null;
   }
   fpsSample = { frames: 0, time: 0 };
+  currentLatency.value = "";
+  currentLatencyMs.value = 0;
+};
+
+const roiColors = ["#f97316", "#22c55e", "#38bdf8", "#eab308", "#a855f7"];
+
+const sourcePointToCanvas = (point, layout) => ({
+  x: layout.x + point.x * layout.scale,
+  y: layout.y + point.y * layout.scale,
+});
+
+const getOverlayLayout = (canvas, overlay) => {
+  const video = videoPlayer.value;
+  const cssWidth = canvas.clientWidth || 0;
+  const cssHeight = canvas.clientHeight || 0;
+  const sourceWidth = Number(overlay?.source_width || video?.videoWidth || 0);
+  const sourceHeight = Number(overlay?.source_height || video?.videoHeight || 0);
+
+  if (!cssWidth || !cssHeight || !sourceWidth || !sourceHeight) return null;
+
+  const dpr = window.devicePixelRatio || 1;
+  const targetWidth = Math.max(1, Math.round(cssWidth * dpr));
+  const targetHeight = Math.max(1, Math.round(cssHeight * dpr));
+  if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+  }
+
+  const scale = Math.min(cssWidth / sourceWidth, cssHeight / sourceHeight);
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  return {
+    ctx,
+    cssWidth,
+    cssHeight,
+    sourceWidth,
+    sourceHeight,
+    scale,
+    x: (cssWidth - width) / 2,
+    y: (cssHeight - height) / 2,
+    width,
+    height,
+  };
+};
+
+const getAlignedOverlaySample = () => {
+  if (!overlaySamples.length) return overlayState.value;
+  const latency = Number(currentLatencyMs.value || 350);
+  const targetTime = performance.now() - Math.min(Math.max(latency, 120), 900);
+  let selected = overlaySamples[overlaySamples.length - 1];
+  for (let index = overlaySamples.length - 1; index >= 0; index -= 1) {
+    if (overlaySamples[index].receivedAt <= targetTime) {
+      selected = overlaySamples[index];
+      break;
+    }
+  }
+  return selected.data;
+};
+
+const roiPointToSource = (point, roi, layout) => {
+  const x = Number(point?.[0] ?? point?.x ?? 0);
+  const y = Number(point?.[1] ?? point?.y ?? 0);
+  const normalized = String(roi?.coordinate_mode || "normalized").toLowerCase() === "normalized";
+  return {
+    x: normalized ? x * layout.sourceWidth : x,
+    y: normalized ? y * layout.sourceHeight : y,
+  };
+};
+
+const drawOverlayPolygon = (ctx, points, color, label = "") => {
+  if (!points || points.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = `${color}24`;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  points.slice(1).forEach((point) => ctx.lineTo(point.x, point.y));
+  if (points.length >= 3) {
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.stroke();
+  if (label) {
+    ctx.font = "700 13px Arial";
+    const textWidth = ctx.measureText(label).width + 14;
+    const x = Math.max(4, points[0].x);
+    const y = Math.max(4, points[0].y - 24);
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, textWidth, 22);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(label, x + 7, y + 15);
+  }
+  ctx.restore();
+};
+
+const drawDetectionBox = (ctx, detection, layout) => {
+  const bbox = detection?.bbox || [];
+  if (bbox.length < 4) return;
+  const p0 = sourcePointToCanvas({ x: Number(bbox[0]), y: Number(bbox[1]) }, layout);
+  const p1 = sourcePointToCanvas({ x: Number(bbox[2]), y: Number(bbox[3]) }, layout);
+  const width = Math.max(1, p1.x - p0.x);
+  const height = Math.max(1, p1.y - p0.y);
+  const riskHit = Array.isArray(detection.roi_hits)
+    ? detection.roi_hits.find((hit) => ["warning_zone", "forbidden_zone"].includes(hit?.roi_type))
+    : null;
+  const color = "#2563eb";
+  const className = detection.class_name || `class_${detection.class_id ?? 0}`;
+  const confidence = Number(detection.confidence || 0);
+  const label = `${className} ${Math.round(confidence * 100)}%`;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.strokeRect(p0.x, p0.y, width, height);
+  ctx.font = "700 13px Arial";
+  const labelWidth = ctx.measureText(label).width + 14;
+  const labelY = Math.max(4, p0.y - 24);
+  ctx.fillStyle = color;
+  ctx.fillRect(p0.x, labelY, labelWidth, 22);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(label, p0.x + 7, labelY + 15);
+
+  if (riskHit) {
+    const warningText = "WARNING";
+    ctx.font = "800 15px Arial";
+    const warningWidth = ctx.measureText(warningText).width + 16;
+    const warningX = Math.max(4, p0.x);
+    const warningY = Math.max(4, p0.y - 50);
+    ctx.fillStyle = "#ef4444";
+    ctx.fillRect(warningX, warningY, warningWidth, 26);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillText(warningText, warningX + 8, warningY + 18);
+  }
+  ctx.restore();
+};
+
+const drawDetectionOverlay = () => {
+  const canvas = videoOverlay.value;
+  if (!canvas) return;
+
+  const sample = getAlignedOverlaySample();
+  const overlay = sample?.overlay || {};
+  const layout = getOverlayLayout(canvas, overlay);
+  if (!layout) {
+    overlayDrawFrame = requestAnimationFrame(drawDetectionOverlay);
+    return;
+  }
+
+  const { ctx } = layout;
+  ctx.clearRect(0, 0, layout.cssWidth, layout.cssHeight);
+  ctx.strokeStyle = "rgba(255,255,255,0.28)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(layout.x, layout.y, layout.width, layout.height);
+
+  const rois = Array.isArray(sample?.rois) ? sample.rois : [];
+  rois
+    .filter((roi) => roi?.enabled !== false)
+    .filter((roi) => ["all", "high", undefined, null, ""].includes(roi?.target))
+    .forEach((roi, index) => {
+      const polygon = Array.isArray(roi.polygon) ? roi.polygon : [];
+      const points = polygon.map((point) => sourcePointToCanvas(
+        roiPointToSource(point, roi, layout),
+        layout
+      ));
+      drawOverlayPolygon(ctx, points, roiColors[index % roiColors.length], roi.name || `ROI${index + 1}`);
+    });
+
+  const detections = Array.isArray(overlay.detections) ? overlay.detections : [];
+  detections.forEach((detection) => drawDetectionBox(ctx, detection, layout));
+
+  overlayDrawFrame = requestAnimationFrame(drawDetectionOverlay);
+};
+
+const fetchDetectionOverlay = async () => {
+  try {
+    const response = await fetch(`${apiBaseUrl.value}/api/detection/overlay?target=high&max_age_sec=2`, {
+      method: "GET",
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.status !== "success") return;
+    const data = payload.data || {};
+    overlayState.value = data;
+    overlaySamples.push({ receivedAt: performance.now(), data });
+    overlaySamples = overlaySamples.slice(-40);
+  } catch {
+    // Keep the last overlay sample during brief backend reconnects.
+  }
+};
+
+const startDetectionOverlay = () => {
+  stopDetectionOverlay();
+  overlaySamples = [];
+  fetchDetectionOverlay();
+  overlayFetchTimer = setInterval(fetchDetectionOverlay, 120);
+  overlayDrawFrame = requestAnimationFrame(drawDetectionOverlay);
+};
+
+const stopDetectionOverlay = () => {
+  if (overlayFetchTimer) {
+    clearInterval(overlayFetchTimer);
+    overlayFetchTimer = null;
+  }
+  if (overlayDrawFrame) {
+    cancelAnimationFrame(overlayDrawFrame);
+    overlayDrawFrame = null;
+  }
+  overlaySamples = [];
+  const canvas = videoOverlay.value;
+  if (canvas) {
+    const ctx = canvas.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
 };
 
 // 关闭现有连接
 const closeWebRTC = () => {
+  stopDetectionOverlay();
   stopFpsMonitor();
   if (firstFrameTimer) {
     clearTimeout(firstFrameTimer);
@@ -709,6 +969,8 @@ const initWebRTC = async () => {
         errorMessage.value = "等待视频画面...";
         currentFps.value = "";
         currentFpsValue.value = 0;
+        currentLatency.value = "";
+        currentLatencyMs.value = 0;
 
         const markVideoReady = () => {
           if (firstFrameTimer) {
@@ -718,6 +980,7 @@ const initWebRTC = async () => {
           videoLoaded.value = true;
           errorMessage.value = "";
           startFpsMonitor();
+          startDetectionOverlay();
         };
 
         video.onloadedmetadata = () => {
@@ -1142,6 +1405,30 @@ onUnmounted(() => {
   background: var(--industrial-danger);
 }
 
+.latency-indicator .status-dot {
+  background: var(--industrial-success);
+}
+
+.latency-indicator.normal {
+  color: var(--industrial-warning);
+  background: var(--industrial-warning-soft);
+  border-color: rgba(183, 121, 31, 0.24);
+}
+
+.latency-indicator.normal .status-dot {
+  background: var(--industrial-warning);
+}
+
+.latency-indicator.poor {
+  color: var(--industrial-danger);
+  background: var(--industrial-danger-soft);
+  border-color: rgba(197, 48, 48, 0.24);
+}
+
+.latency-indicator.poor .status-dot {
+  background: var(--industrial-danger);
+}
+
 .camera-view-area {
   flex: 1;
   min-height: 0;
@@ -1175,6 +1462,14 @@ onUnmounted(() => {
   height: 100%;
   object-fit: contain;
   background: transparent;
+}
+
+.video-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .video-placeholder {
