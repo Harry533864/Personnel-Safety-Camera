@@ -20,6 +20,8 @@ PROTECTED_RULES: tuple[tuple[str, set[str]], ...] = (
     ("/api/detection/detect", {"POST"}),
     ("/api/detection/save_regions", {"POST"}),
     ("/api/detection/exception_output", {"POST"}),
+    ("/api/detection/exception_output/test", {"POST"}),
+    ("/api/detection/exception_output/manual", {"POST"}),
     ("/api/models/upload", {"POST"}),
     ("/api/models/delete", {"POST"}),
     ("/api/record/config", {"POST"}),

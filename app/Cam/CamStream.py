@@ -216,6 +216,9 @@ class CamStream:
     def reload_ai_config(self):
         self.inference.reload_config()
 
+    def get_overlay_state(self, max_age_sec=1.0):
+        return self.inference.overlay_state(max_age_sec=max_age_sec)
+
     # =========================================================
     # 队列与线程控制
     # =========================================================

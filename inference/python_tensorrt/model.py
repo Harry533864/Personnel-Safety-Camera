@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 import yaml
 
-from .runtime import CameraTensorRTInfer, FrameResult
+from .alarm_output import AlarmOutputController
+from .runtime import CameraTensorRTInfer, FrameResult, SystemState
 from .vision_tasks import normalize_vision_pipeline
 
 try:
@@ -49,6 +50,7 @@ class Model:
         self.result_lock = threading.RLock()
         self.render_lock = threading.Lock()
 
+        self.alarm_output: AlarmOutputController | None = None
         self.alarm_gpios: List[int] = []
         self.alarm_level = 1
         self.alarm_idle_level = 0
@@ -57,32 +59,36 @@ class Model:
         self.alarm_end_time: float | None = None
         self.alarm_led_on = False
         self.last_alarm_flag = False
+        self.last_warning_flag = False
+        self.last_system_state = SystemState.SAFE
         self.last_detection_flag = False
         self.last_frame_result = None
         self.last_frame_result_at = 0.0
         self.last_task_results: List[Dict[str, Any]] = []
 
         self._load_config_and_prepare_runtime()
-        self._init_alarm_gpio()
+        self._init_alarm_output()
         self._check_files()
         self._start_python_tensorrt()
         atexit.register(self.close)
 
-    def inference(self, frame: np.ndarray) -> np.ndarray:
+    def inference(self, frame: np.ndarray, render: bool = True) -> np.ndarray | None:
         frame = self._check_frame(frame)
         with self.lock:
             if self.infer_runtime is None:
                 self._start_python_tensorrt()
             if self.infer_runtime is None:
                 raise RuntimeError("Python TensorRT 推理器未启动")
-            infer_result = self.infer_runtime.infer(frame)
+            infer_result = self.infer_runtime.infer(frame, render=render)
             self.last_alarm_flag = bool(infer_result.alarm)
+            self.last_warning_flag = bool(infer_result.warning)
+            self.last_system_state = getattr(infer_result, "system_state", SystemState.SAFE)
             self.last_detection_flag = getattr(infer_result, "has_target", self.last_alarm_flag)
             with self.result_lock:
                 self.last_frame_result = getattr(infer_result, "frame_result", None)
                 self.last_frame_result_at = time.time()
             self.last_task_results = getattr(infer_result, "task_results", [])
-            self._handle_alarm_gpio(self.last_alarm_flag)
+            self._handle_alarm_output_state(self.last_system_state)
             return infer_result.image
 
     def try_render_latest(self, frame: np.ndarray, max_age_sec: float = 1.0) -> np.ndarray | None:
@@ -104,7 +110,7 @@ class Model:
         with self.lock:
             self._release_runtime()
             self._load_config_and_prepare_runtime()
-            self._init_alarm_gpio()
+            self._init_alarm_output()
             self._check_files()
             self._start_python_tensorrt()
 
@@ -118,10 +124,20 @@ class Model:
     def get_config(self) -> Dict[str, Any]:
         return self.cfg
 
+    def set_alarm_output_for_test(self, alarm_flag: bool) -> None:
+        with self.lock:
+            self._handle_alarm_output(bool(alarm_flag))
+
+    def set_alarm_output_channels_for_test(self, states: Dict[str, Any]) -> bool:
+        with self.lock:
+            if self.alarm_output is None:
+                return False
+            return self.alarm_output.set_manual_channels(states)
+
     def close(self) -> None:
         with self.lock:
             self._release_runtime()
-            self._release_alarm_gpio()
+            self._release_alarm_output()
 
     def _release_runtime(self) -> None:
         self.infer_runtime = None
@@ -290,6 +306,24 @@ class Model:
             settle_single_frame=self.settle_single_frame,
         )
 
+    def _init_alarm_output(self) -> None:
+        self._release_alarm_output()
+        cfg = self.cfg.get("exception_output", {}) or {}
+        self.alarm_output = AlarmOutputController(cfg)
+
+    def _handle_alarm_output(self, alarm_flag: bool) -> None:
+        if self.alarm_output is not None:
+            self.alarm_output.set_alarm(alarm_flag)
+
+    def _handle_alarm_output_state(self, state: object) -> None:
+        if self.alarm_output is not None:
+            self.alarm_output.set_state(state)
+
+    def _release_alarm_output(self) -> None:
+        if self.alarm_output is not None:
+            self.alarm_output.close()
+        self.alarm_output = None
+
     def _init_alarm_gpio(self) -> None:
         self._release_alarm_gpio()
         cfg = self.cfg.get("exception_output", {}) or {}
@@ -422,18 +456,38 @@ class Model:
     @staticmethod
     def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     @staticmethod
     def _write_yaml_atomic(path: Path, data: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-        os.replace(tmp_path, path)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def _resolve_path(self, path: str | os.PathLike[str]) -> Path:
         path_obj = Path(path)

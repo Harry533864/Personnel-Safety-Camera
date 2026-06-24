@@ -45,9 +45,34 @@ test:
 model_names:
 - ASV_person_FP16
 exception_output:
-  gpio:
-  - 7
+  gpio: []
   output_level: 1
   duration: 0
+  serial:
+    enabled: true
+    type: ysl301
+    port: auto
+    baudrate: 9600
+    address: 1
+    alarm:
+      red: 'on'
+      yellow: 'off'
+      green: 'off'
+      buzzer: 'on'
+    warning:
+      red: 'off'
+      yellow: 'on'
+      green: 'off'
+      buzzer: 'off'
+    safe:
+      red: 'off'
+      yellow: 'off'
+      green: 'on'
+      buzzer: 'off'
+    idle:
+      red: 'off'
+      yellow: 'off'
+      green: 'off'
+      buzzer: 'off'
 record:
   duration_min: 1.0

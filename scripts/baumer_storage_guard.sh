@@ -5,6 +5,7 @@ RUN_USER="${RUN_USER:-baumer}"
 HOME_DIR="${CAM_HOME_DIR:-/home/$RUN_USER}"
 PROJECT_DIR="${CAM_PROJECT_ROOT:-$HOME_DIR/Cam_flaskvue}"
 LOG_DIR="${CAM_LOG_DIR:-$PROJECT_DIR/logs}"
+VIDEO_BASE_DIR="${CAM_VIDEO_BASE_DIR:-$HOME_DIR}"
 MIN_FREE_MB="${CAM_HOME_MIN_FREE_MB:-120}"
 CRITICAL_FREE_MB="${CAM_HOME_CRITICAL_FREE_MB:-60}"
 MAX_LOG_BYTES="${CAM_LOG_MAX_BYTES:-1048576}"
@@ -65,7 +66,7 @@ cleanup_browser_cache() {
 }
 
 cleanup_old_video() {
-  local video_dir="$HOME_DIR/video"
+  local video_dir="$VIDEO_BASE_DIR/video"
   [[ -d "$video_dir" ]] || return 0
   find "$video_dir" -type f \( -name '*.mkv' -o -name '*.mp4' -o -name '*.avi' \) \
     -mtime "+$VIDEO_RETENTION_DAYS" -delete 2>/dev/null || true

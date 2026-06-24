@@ -218,11 +218,6 @@ const confirmSettings = async () => {
   const outputLevel = Number(form.outputLevel);
   const duration = Number(form.duration);
 
-  if (gpioPins.length === 0) {
-    alert("请选择有效 GPIO 口（Pin 编号）");
-    return;
-  }
-
   if (![0, 1].includes(outputLevel)) {
     alert("输出电平只能选高电平或低电平");
     return;

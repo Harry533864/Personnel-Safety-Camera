@@ -20,6 +20,7 @@ from app.runtime_paths import (
 from app.runtime import (
     build_runtime_status,
     cam_manager,
+    get_detection_overlay,
     get_target_streams,
     reload_enabled_streams,
     start_runtime,
@@ -28,6 +29,14 @@ from app.runtime import (
 )
 from app.services.config_service import ai_config_service
 from app.services.camera_config_service import camera_config_service
+from app import time_sync
+from inference.python_tensorrt.alarm_output import AlarmOutputController
+from inference.python_tensorrt.ysl301 import (
+    CHANNELS as YSL301_CHANNELS,
+    DEFAULT_IDLE_PATTERN as YSL301_IDLE_PATTERN,
+    LIGHT_STATES as YSL301_LIGHT_STATES,
+    normalize_state_name as normalize_ysl301_state,
+)
 
 from app.utils import (
     to_bool,
@@ -46,6 +55,9 @@ logger.info("Video base directory: %s", VIDEO_BASE_PATH)
 
 _mjpeg_client_lock = threading.Lock()
 _mjpeg_active_clients = {}
+_manual_output_lock = threading.Lock()
+_manual_output_controller = None
+_manual_output_signature = None
 
 
 def read_ai_config():
@@ -54,6 +66,171 @@ def read_ai_config():
 
 def update_ai_config(mutator):
     return ai_config_service.update(mutator)
+
+
+def _camera_resolution_key(width, height):
+    return f"{int(width)}x{int(height)}"
+
+
+def _parse_resolution_key(value):
+    text = str(value or "").strip().lower().replace(" ", "")
+    if text in {"", "all", "high", "low"}:
+        return None
+    if text in {"max", "maximum", "auto_max"}:
+        width, height = cam_manager.get_max_resolution()
+        return _camera_resolution_key(width, height)
+
+    parts = text.split("x", 1)
+    if len(parts) != 2:
+        raise ValueError("resolution_key must be WIDTHxHEIGHT")
+
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except (TypeError, ValueError) as error:
+        raise ValueError("resolution_key must be WIDTHxHEIGHT") from error
+
+    if width <= 0 or height <= 0:
+        raise ValueError("resolution_key width and height must be positive")
+
+    return _camera_resolution_key(width, height)
+
+
+def _resolution_key_from_status():
+    status = cam_manager.get_status()
+    return _camera_resolution_key(
+        status.get("width") or 1920,
+        status.get("height") or 1080,
+    )
+
+
+def _normalize_resolution_key(value=None):
+    parsed = _parse_resolution_key(value)
+    return parsed or _resolution_key_from_status()
+
+
+def _ensure_roi_profiles(model_cfg, active_key=None):
+    profiles = model_cfg.get("rois_by_resolution")
+    if not isinstance(profiles, dict):
+        profiles = {}
+        model_cfg["rois_by_resolution"] = profiles
+
+    try:
+        existing_active_key = _normalize_resolution_key(
+            model_cfg.get("active_roi_resolution")
+        )
+    except ValueError:
+        existing_active_key = _resolution_key_from_status()
+
+    current_rois = model_cfg.get("rois", [])
+    if (
+        existing_active_key not in profiles
+        and isinstance(current_rois, list)
+        and current_rois
+    ):
+        profiles[existing_active_key] = current_rois
+
+    active_key = active_key or existing_active_key
+    model_cfg["active_roi_resolution"] = active_key
+
+    return profiles, active_key
+
+
+def _activate_roi_profile(model_cfg, resolution_key):
+    profiles, _ = _ensure_roi_profiles(model_cfg, resolution_key)
+    model_cfg["active_roi_resolution"] = resolution_key
+    model_cfg["rois"] = list(profiles.get(resolution_key, []))
+    return len(model_cfg["rois"])
+
+
+def _roi_display_state_from_zone(roi, zone):
+    if not zone:
+        return "safe", "#22c55e"
+
+    try:
+        person_count = int(zone.get("person_count", 0) or 0)
+    except Exception:
+        person_count = 0
+    try:
+        warning_count = int(zone.get("warning_count", 0) or 0)
+    except Exception:
+        warning_count = 0
+    if person_count <= 0 and warning_count <= 0:
+        return "safe", "#22c55e"
+
+    roi_type = str(zone.get("roi_type") or roi.get("roi_type") or "")
+    if person_count <= 0 or roi_type == "warning_zone":
+        return "warning", "#f59e0b"
+    return "alarm", "#ef4444"
+
+
+def _attach_roi_display_state(rois, overlay):
+    zones = {
+        str(zone.get("roi_id", "")): zone
+        for zone in (overlay or {}).get("zone_summary", []) or []
+        if isinstance(zone, dict)
+    }
+    enriched = []
+    for roi in rois or []:
+        if not isinstance(roi, dict):
+            continue
+        item = dict(roi)
+        zone = zones.get(str(item.get("roi_id", "")))
+        display_status, display_color = _roi_display_state_from_zone(item, zone)
+        item["display_status"] = display_status
+        item["display_color"] = display_color
+        item["person_count"] = int((zone or {}).get("person_count", 0) or 0)
+        item["warning_count"] = int((zone or {}).get("warning_count", 0) or 0)
+        enriched.append(item)
+    return enriched
+
+
+def _first_roi_overlap_rate(rois):
+    if not isinstance(rois, list):
+        return None
+    for roi in rois:
+        if not isinstance(roi, dict) or "overlap_thres" not in roi:
+            continue
+        try:
+            return float(roi["overlap_thres"])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _detection_overlap_rate(model_cfg):
+    for key in ("overlap_thres", "overlapRate", "overlap_rate"):
+        if key not in model_cfg:
+            continue
+        try:
+            return float(model_cfg[key])
+        except (TypeError, ValueError):
+            continue
+
+    profiles = model_cfg.get("rois_by_resolution", {})
+    if isinstance(profiles, dict):
+        try:
+            active_key = _normalize_resolution_key(
+                model_cfg.get("active_roi_resolution")
+            )
+        except ValueError:
+            active_key = _resolution_key_from_status()
+
+        rate = _first_roi_overlap_rate(profiles.get(active_key))
+        if rate is not None:
+            return rate
+
+    rate = _first_roi_overlap_rate(model_cfg.get("rois", []))
+    if rate is not None:
+        return rate
+
+    if isinstance(profiles, dict):
+        for rois in profiles.values():
+            rate = _first_roi_overlap_rate(rois)
+            if rate is not None:
+                return rate
+
+    return 0.1
 
 
 def _current_camera_settings_payload():
@@ -114,6 +291,24 @@ def discover_engine_model_names(model_root: Path):
     return names
 
 
+def _available_model_names():
+    try:
+        return discover_engine_model_names(MODEL_FILE_PATH)
+    except Exception:
+        logger.exception("Failed to discover engine model names")
+        return []
+
+
+def _ensure_existing_model_name(model_name):
+    model_name = validate_model_name(model_name)
+    available = _available_model_names()
+    if available and model_name not in available:
+        raise ValueError(
+            f"模型 '{model_name}' 没有对应的 engine 文件，可用模型: {', '.join(available)}"
+        )
+    return model_name
+
+
 def build_detection_settings_payload(cfg):
     model_cfg = cfg.get("model", {})
     if not isinstance(model_cfg, dict):
@@ -129,17 +324,7 @@ def build_detection_settings_payload(cfg):
     except (TypeError, ValueError):
         detection_threshold = 0.5
 
-    overlap_rate = 0.1
-    rois = model_cfg.get("rois", [])
-    if isinstance(rois, list):
-        for roi in rois:
-            if not isinstance(roi, dict) or "overlap_thres" not in roi:
-                continue
-            try:
-                overlap_rate = float(roi["overlap_thres"])
-                break
-            except (TypeError, ValueError):
-                continue
+    overlap_rate = _detection_overlap_rate(model_cfg)
 
     target = str(model_cfg.get("infer_target") or "all").lower()
     if target not in {"high", "low", "all"}:
@@ -172,6 +357,37 @@ def get_runtime_status():
         "status": "success",
         "data": build_runtime_status(),
     })
+
+
+@app.route("/api/system/time_sync", methods=["GET", "POST"])
+@app.route("/api/system/time", methods=["GET", "POST"])
+def sync_system_time():
+    try:
+        if request.method == "POST":
+            state = time_sync.sync_from_client(request.get_json(silent=True) or {})
+            restarted = []
+            for stream in get_target_streams("all"):
+                recorder = getattr(stream, "recorder", None)
+                if recorder is not None and getattr(recorder, "enabled", False):
+                    recorder.request_restart()
+                    restarted.append(stream.name)
+            state["recorders_restarted"] = restarted
+            message = "time synchronized"
+        else:
+            state = time_sync.status()
+            message = "time sync status"
+
+        return jsonify({
+            "status": "success",
+            "message": message,
+            "data": state,
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "data": time_sync.status(),
+        }), 400
 
 
 @app.route("/api/stream/config", methods=["GET"])
@@ -498,6 +714,7 @@ def set_resolution():
         else:
             width = int(data["width"])
             height = int(data["height"])
+        resolution_key = _camera_resolution_key(width, height)
         target = data.get("target", "high")
         cfg = read_ai_config()
         model_cfg = cfg.get("model", {})
@@ -507,6 +724,8 @@ def set_resolution():
             streams_to_update.extend(get_target_streams(infer_target))
 
         # 让硬件管理器修改参数并重启硬件取流
+        cam_manager.set_resolution(width, height)
+
         cam_manager.set_resolution(width, height)
 
         seen_streams = set()
@@ -524,6 +743,12 @@ def set_resolution():
             "height": height,
             "target": target,
         })
+
+        def activate_profile(cfg):
+            model_cfg = cfg.setdefault("model", {})
+            return _activate_roi_profile(model_cfg, resolution_key)
+
+        cfg, active_roi_count = update_ai_config(activate_profile)
         ai_sync = sync_infer_enable_from_config(cfg)
 
         return jsonify({
@@ -533,10 +758,12 @@ def set_resolution():
                 "width": width,
                 "height": height,
                 "resolution": f"{width}x{height}",
+                "resolution_key": resolution_key,
                 "savedResolution": settings["resolution"],
                 "mode": "max" if settings["resolution"] == "max" else "custom",
                 "target": settings["target"],
                 "updated_streams": updated_streams,
+                "active_roi_count": active_roi_count,
                 "ai_sync": ai_sync,
             },
         })
@@ -640,17 +867,44 @@ def update_inference_configuration():
                 detect_enable = to_bool(model_cfg.get("detect_enable", False))
 
             if "detectionModel" in data:
-                model_cfg["model_name"] = validate_model_name(data["detectionModel"])
+                requested_model = str(data.get("detectionModel") or "").strip()
+                if requested_model:
+                    model_cfg["model_name"] = _ensure_existing_model_name(requested_model)
 
             if "detectionThreshold" in data:
                 model_cfg["conf_thres"] = float(data["detectionThreshold"])
 
             if "overlapRate" in data:
                 overlap_thres = float(data["overlapRate"])
+                if overlap_thres < 0 or overlap_thres > 1:
+                    raise ValueError("overlapRate must be between 0 and 1")
+                model_cfg["overlap_thres"] = overlap_thres
                 for roi in model_cfg.get("rois", []):
                     roi["overlap_thres"] = overlap_thres
+                profiles = model_cfg.get("rois_by_resolution", {})
+                if isinstance(profiles, dict):
+                    for rois in profiles.values():
+                        if not isinstance(rois, list):
+                            continue
+                        for roi in rois:
+                            if isinstance(roi, dict):
+                                roi["overlap_thres"] = overlap_thres
 
-            return {"detect_enable": detect_enable, "target": target}
+            if detect_enable:
+                current_model = str(model_cfg.get("model_name") or "").strip()
+                try:
+                    model_cfg["model_name"] = _ensure_existing_model_name(current_model)
+                except ValueError:
+                    available_models = _available_model_names()
+                    if not available_models:
+                        raise
+                    model_cfg["model_name"] = available_models[0]
+
+            return {
+                "detect_enable": detect_enable,
+                "target": target,
+                "model_name": model_cfg.get("model_name"),
+            }
 
         cfg, result = update_ai_config(mutate)
 
@@ -667,6 +921,7 @@ def update_inference_configuration():
             "data": {
                 "detect_enable": result["detect_enable"],
                 "target": result["target"],
+                "model_name": result["model_name"],
                 "changed_streams": changed_streams
             }
         })
@@ -685,18 +940,79 @@ def get_detection_regions():
     """
     try:
         cfg = read_ai_config()
-        rois = cfg.get("model", {}).get("rois", [])
+        model_cfg = cfg.get("model", {})
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        profiles, active_key = _ensure_roi_profiles(model_cfg)
+        requested_key = _normalize_resolution_key(
+            request.args.get("resolution_key") or active_key
+        )
+        rois = profiles.get(requested_key, model_cfg.get("rois", []))
+        try:
+            overlay = get_detection_overlay(target=request.args.get("target", "high"), max_age_sec=2.0)
+            rois = _attach_roi_display_state(rois, overlay)
+        except Exception:
+            overlay = {
+                "detections": [],
+                "zone_summary": [],
+                "stale": True,
+            }
 
         return jsonify({
             "status": "success",
-            "rois": rois
+            "rois": rois,
+            "overlay": overlay,
+            "active_resolution": active_key,
+            "selected_resolution": requested_key,
+            "rois_by_resolution": profiles,
         })
 
     except Exception as e:
         return jsonify({
             "status": "error",
             "message": f"获取检测区域失败: {e}",
-            "rois": []
+            "rois": [],
+            "rois_by_resolution": {},
+        }), 400
+
+
+@app.route("/api/detection/overlay", methods=["GET"])
+def get_detection_overlay_state():
+    try:
+        target = request.args.get("target", "high")
+        max_age_sec = float(request.args.get("max_age_sec", 1.0))
+        cfg = read_ai_config()
+        model_cfg = cfg.get("model", {})
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        active_resolution = model_cfg.get("active_roi_resolution") or _resolution_key_from_status()
+        rois = model_cfg.get("rois", [])
+        overlay = get_detection_overlay(target=target, max_age_sec=max_age_sec)
+        rois = _attach_roi_display_state(rois, overlay)
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "target": target,
+                "active_resolution": active_resolution,
+                "rois": rois,
+                "overlay": overlay,
+            },
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Failed to fetch detection overlay: {e}",
+            "data": {
+                "target": request.args.get("target", "high"),
+                "rois": [],
+                "overlay": {
+                    "detections": [],
+                    "zone_summary": [],
+                    "stale": True,
+                },
+            },
         }), 400
 
 
@@ -720,17 +1036,36 @@ def update_detection_regions():
 
     try:
         raw_rois = data["rois"]
+        resolution_key = _normalize_resolution_key(
+            data.get("resolution_key") or data.get("target")
+        )
 
         if not isinstance(raw_rois, list):
             raise ValueError("rois 必须是数组")
 
         def mutate(cfg):
             model_cfg = cfg.setdefault("model", {})
-            model_cfg["rois"] = [
-                normalize_roi(roi, index)
-                for index, roi in enumerate(raw_rois)
-            ]
-            return len(model_cfg["rois"])
+            profiles, active_key = _ensure_roi_profiles(model_cfg, resolution_key)
+            default_overlap = _detection_overlap_rate(model_cfg)
+            normalized_rois = []
+            for index, roi in enumerate(raw_rois):
+                source_roi = roi
+                if isinstance(roi, dict) and "overlap_thres" not in roi:
+                    source_roi = {
+                        **roi,
+                        "overlap_thres": default_overlap,
+                    }
+                normalized_rois.append({
+                    **normalize_roi(source_roi, index),
+                    "target": "all",
+                    "resolution_key": resolution_key,
+                })
+            profiles[resolution_key] = normalized_rois
+            model_cfg["rois_by_resolution"] = profiles
+            if active_key == resolution_key:
+                model_cfg["rois"] = normalized_rois
+                model_cfg["active_roi_resolution"] = resolution_key
+            return len(normalized_rois)
 
         cfg, roi_count = update_ai_config(mutate)
 
@@ -741,6 +1076,7 @@ def update_detection_regions():
             "message": "检测区域已保存",
             "data": {
                 "roi_count": roi_count,
+                "resolution_key": resolution_key,
                 "reloaded": reloaded
             }
         })
@@ -914,6 +1250,71 @@ def delete_model():
         }), 500
 
 
+@app.route("/api/detection/exception_output/test", methods=["POST"])
+def test_exception_output_configuration():
+    data = request.get_json(silent=True) or {}
+    active = to_bool(data.get("active", True))
+    duration = float(data.get("duration", data.get("duration_sec", data.get("durationSec", 2))) or 0)
+    if duration < 0:
+        return jsonify({
+            "status": "error",
+            "message": "duration must be greater than or equal to 0",
+        }), 400
+
+    try:
+        target = data.get("target", "high")
+        triggered = []
+        for stream in get_target_streams(target):
+            stream.inference.trigger_alarm_output(active=active, duration=duration)
+            triggered.append(stream.name)
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "active": active,
+                "duration": duration,
+                "target": target,
+                "triggered": triggered,
+            },
+        })
+    except Exception as e:
+        logger.exception("Failed to test exception output")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 400
+
+
+@app.route("/api/detection/exception_output/manual", methods=["POST"])
+def manual_exception_output_control():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        channels = normalize_manual_output_channels(data)
+        target = data.get("target", "all")
+        applied_by = apply_manual_output_channels(channels, target=target)
+        active_channels = [
+            channel for channel, state in channels.items()
+            if normalize_ysl301_state(state) != "off"
+        ]
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "channels": channels,
+                "active_channels": active_channels,
+                "target": target,
+                "applied_by": applied_by,
+            },
+        })
+    except Exception as e:
+        logger.exception("Failed to set manual exception output")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 400
+
+
 # =========================
 # 异常检测GPIO配置接口
 # =========================
@@ -967,10 +1368,134 @@ def normalize_gpio_pins(value):
         if pn > 0:
             out.append(pn)
 
-    out = sorted(list(dict.fromkeys(out)))
-    if not out:
-        raise ValueError("gpio 必须是大于 0 的整数或整数数组")
+    return sorted(list(dict.fromkeys(out)))
+
+
+def normalize_serial_alarm_pattern(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("serial alarm pattern must be an object")
+
+    channels = {"red", "yellow", "green", "buzzer"}
+    out = {}
+    for channel, state in value.items():
+        channel_key = str(channel).strip().lower()
+        if channel_key not in channels:
+            raise ValueError(f"unsupported serial alarm channel: {channel}")
+        out[channel_key] = str(state).strip().lower().replace("-", "_")
     return out
+
+
+def normalize_serial_output(value):
+    if not isinstance(value, dict):
+        raise ValueError("serial must be an object")
+
+    out = {}
+    if "enabled" in value:
+        out["enabled"] = to_bool(value["enabled"])
+    if "type" in value:
+        out["type"] = str(value["type"]).strip().lower()
+    if "port" in value:
+        out["port"] = str(value["port"]).strip() or "auto"
+
+    for field in ("baudrate", "address"):
+        if field in value:
+            out[field] = int(value[field])
+
+    for field in ("timeout", "write_timeout", "writeTimeout", "command_delay", "commandDelay"):
+        if field in value:
+            out[field] = float(value[field])
+
+    for field in ("alarm", "warning", "safe", "idle"):
+        pattern = normalize_serial_alarm_pattern(value.get(field))
+        if pattern is not None:
+            out[field] = pattern
+
+    return out
+
+
+def normalize_manual_output_channels(data):
+    out = dict(YSL301_IDLE_PATTERN)
+    raw_channels = data.get("channels")
+
+    if raw_channels is not None:
+        if not isinstance(raw_channels, dict):
+            raise ValueError("channels must be an object")
+
+        for channel, state in raw_channels.items():
+            channel_key = str(channel).strip().lower()
+            if channel_key not in YSL301_CHANNELS:
+                raise ValueError(f"unsupported manual output channel: {channel}")
+
+            state_key = normalize_ysl301_state(state)
+            if state_key not in YSL301_LIGHT_STATES:
+                raise ValueError(f"unsupported manual output state: {state}")
+
+            out[channel_key] = state_key
+        return out
+
+    channel = str(data.get("channel", "") or "").strip().lower()
+    active = to_bool(data.get("active", False))
+    if not channel:
+        if active:
+            raise ValueError("channel or channels is required")
+        return out
+
+    if channel not in YSL301_CHANNELS:
+        raise ValueError(f"unsupported manual output channel: {channel}")
+
+    default_active_state = "on"
+    raw_state = data.get("state", default_active_state if active else "off")
+    state_key = normalize_ysl301_state(raw_state)
+    if not active:
+        state_key = "off"
+    if state_key not in YSL301_LIGHT_STATES:
+        raise ValueError(f"unsupported manual output state: {raw_state}")
+
+    out[channel] = state_key
+    return out
+
+
+def get_manual_output_controller():
+    global _manual_output_controller, _manual_output_signature
+
+    cfg = dict(read_ai_config().get("exception_output", {}) or {})
+    signature = json.dumps(cfg, sort_keys=True, default=str)
+
+    with _manual_output_lock:
+        if (
+            _manual_output_controller is None
+            or _manual_output_signature != signature
+        ):
+            if _manual_output_controller is not None:
+                _manual_output_controller.close()
+
+            _manual_output_controller = AlarmOutputController(cfg)
+            _manual_output_signature = signature
+
+        return _manual_output_controller
+
+
+def apply_manual_output_channels(channels, target="all"):
+    active = any(
+        normalize_ysl301_state(state) != "off"
+        for state in channels.values()
+    )
+
+    for stream in get_target_streams(target):
+        setter = getattr(stream.inference, "set_alarm_output_channels", None)
+        if callable(setter) and setter(channels):
+            return [stream.name]
+
+    controller = get_manual_output_controller()
+    if controller.set_manual_channels(channels):
+        return ["manual"]
+
+    if not active:
+        return ["noop"]
+
+    raise RuntimeError("serial alarm output is not enabled or unavailable")
 
 
 @app.route("/api/detection/exception_output", methods=["POST"])
@@ -1001,23 +1526,28 @@ def update_exception_output_configuration():
         "duration",
         data.get("duration_sec", data.get("durationSec", 0))
     )
+    serial_raw = data.get("serial", data.get("ysl301"))
 
-    if gpio_raw is None:
+    if gpio_raw is None and serial_raw is None:
         return jsonify({
             "status": "error",
             "message": "缺少 gpio 参数"
         }), 400
 
-    if level_raw is None:
+    if gpio_raw is not None and level_raw is None:
         return jsonify({
             "status": "error",
             "message": "缺少 output_level 参数"
         }), 400
 
     try:
-        gpio_pins = normalize_gpio_pins(gpio_raw)
-
-        output_level = normalize_gpio_output_level(level_raw)
+        exception_output = dict(read_ai_config().get("exception_output", {}) or {})
+        if gpio_raw is not None:
+            exception_output["gpio"] = normalize_gpio_pins(gpio_raw)
+            exception_output["output_level"] = normalize_gpio_output_level(level_raw)
+        else:
+            exception_output.setdefault("gpio", [])
+            exception_output.setdefault("output_level", 1)
 
         duration = float(duration_raw)
         if duration < 0:
@@ -1027,11 +1557,9 @@ def update_exception_output_configuration():
         if duration.is_integer():
             duration = int(duration)
 
-        exception_output = {
-            "gpio": gpio_pins,
-            "output_level": output_level,
-            "duration": duration
-        }
+        exception_output["duration"] = duration
+        if serial_raw is not None:
+            exception_output["serial"] = normalize_serial_output(serial_raw)
 
         def mutate(cfg):
             cfg["exception_output"] = exception_output
@@ -1174,6 +1702,12 @@ def handle_record_config():
 # =========================================================
 
 VALID_RECORD_TARGETS = {"cam_high", "cam_low"}
+RECORD_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi"}
+RECORD_MIME_TYPES = {
+    ".mkv": "video/x-matroska",
+    ".mp4": "video/mp4",
+    ".avi": "video/x-msvideo",
+}
 
 
 def _get_record_target_dir(target):
@@ -1191,9 +1725,18 @@ def _parse_record_timestamp(filename):
         return None
 
 
+def _parse_record_start(metadata, filename):
+    start_at = str((metadata or {}).get("start_at") or "").strip()
+    if start_at:
+        try:
+            return datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return _parse_record_timestamp(filename)
+
+
 def _build_record_item(file_path, target):
     stat = file_path.stat()
-    start_at = _parse_record_timestamp(file_path.name)
     metadata_path = file_path.with_suffix(".json")
     metadata = {}
     if metadata_path.exists():
@@ -1201,6 +1744,7 @@ def _build_record_item(file_path, target):
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except Exception:
             metadata = {}
+    start_at = _parse_record_start(metadata, file_path.name)
 
     return {
         "filename": file_path.name,
@@ -1226,6 +1770,12 @@ def _build_record_item(file_path, target):
             download=0,
             _external=False,
         ),
+        "preview_url": url_for(
+            "preview_record",
+            filename=file_path.name,
+            target=target,
+            _external=False,
+        ),
     }
 
 
@@ -1248,11 +1798,12 @@ def get_record_list():
     if not video_dir.exists():
         return jsonify({"status": "success", "data": [], "target": target, "date_filter": date_str})
 
-    search_pattern = f"{date_prefix}*.mkv" if date_prefix else "*.mkv"
     files_info = [
         _build_record_item(file_path, target)
-        for file_path in video_dir.glob(search_pattern)
+        for file_path in video_dir.iterdir()
         if file_path.is_file()
+        and file_path.suffix.lower() in RECORD_VIDEO_EXTENSIONS
+        and (not date_prefix or file_path.stem.startswith(date_prefix))
     ]
     files_info.sort(key=lambda item: item["filename"], reverse=True)
 
@@ -1262,6 +1813,111 @@ def get_record_list():
         "target": target,
         "date_filter": date_str,
     })
+
+
+def _sanitize_record_filename(filename):
+    filename = str(filename or "").strip()
+    if not filename:
+        raise ValueError("缺少 filename 参数")
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise ValueError("非法的文件名")
+    return filename
+
+
+def _get_record_file(video_dir, filename):
+    filename = _sanitize_record_filename(filename)
+    file_path = video_dir / filename
+    if not file_path.exists() or not file_path.is_file():
+        return filename, None
+    if file_path.suffix.lower() not in RECORD_VIDEO_EXTENSIONS:
+        raise ValueError("不支持的录像文件类型")
+    return filename, file_path
+
+
+def _record_preview_frames(capture, max_width, preview_fps):
+    source_fps = capture.get(cv2.CAP_PROP_FPS) or 0
+    source_fps = source_fps if source_fps > 0 else preview_fps
+    frame_step = max(1, int(round(source_fps / preview_fps)))
+    delay = 1.0 / max(1, preview_fps)
+    frame_index = 0
+
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+
+            if frame_index % frame_step:
+                frame_index += 1
+                continue
+            frame_index += 1
+
+            height, width = frame.shape[:2]
+            if width > max_width:
+                scale = max_width / float(width)
+                frame = cv2.resize(
+                    frame,
+                    (max_width, max(1, int(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 72],
+            )
+            if not ok:
+                continue
+
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-store\r\n\r\n"
+                + encoded.tobytes()
+                + b"\r\n"
+            )
+            time.sleep(delay)
+    finally:
+        capture.release()
+
+
+@app.route("/api/record/preview", methods=["GET"])
+def preview_record():
+    try:
+        target, video_dir = _get_record_target_dir(request.args.get("target", "cam_high"))
+        filename, file_path = _get_record_file(video_dir, request.args.get("filename"))
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
+
+    if file_path is None:
+        return jsonify({"status": "error", "message": "视频文件不存在"}), 404
+
+    try:
+        max_width = int(request.args.get("max_width", 960))
+    except (TypeError, ValueError):
+        max_width = 960
+    max_width = min(1280, max(320, max_width))
+
+    try:
+        preview_fps = int(request.args.get("fps", 8))
+    except (TypeError, ValueError):
+        preview_fps = 8
+    preview_fps = min(15, max(1, preview_fps))
+
+    capture = cv2.VideoCapture(str(file_path))
+    if not capture.isOpened():
+        return jsonify({
+            "status": "error",
+            "message": "低清预览暂不可用，录像分段可能仍在写入",
+            "filename": filename,
+            "target": target,
+        }), 409
+
+    return Response(
+        _record_preview_frames(capture, max_width=max_width, preview_fps=preview_fps),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.route("/api/record/download", methods=["GET"])
@@ -1277,15 +1933,12 @@ def download_record():
     except ValueError as error:
         return jsonify({"status": "error", "message": str(error)}), 400
 
-    filename = (request.args.get("filename") or "").strip()
-    if not filename:
-        return jsonify({"status": "error", "message": "缺少 filename 参数"}), 400
+    try:
+        filename, file_path = _get_record_file(video_dir, request.args.get("filename"))
+    except ValueError as error:
+        return jsonify({"status": "error", "message": str(error)}), 400
 
-    if "/" in filename or "\\" in filename or ".." in filename:
-        return jsonify({"status": "error", "message": "非法的文件名"}), 400
-
-    file_path = video_dir / filename
-    if not file_path.exists() or not file_path.is_file():
+    if file_path is None:
         return jsonify({"status": "error", "message": "视频文件不存在"}), 404
 
     try:
@@ -1295,7 +1948,10 @@ def download_record():
             str(file_path),
             as_attachment=as_attachment,
             download_name=filename,
-            mimetype="video/x-matroska",
+            mimetype=RECORD_MIME_TYPES.get(
+                file_path.suffix.lower(),
+                "application/octet-stream",
+            ),
             conditional=True,
         )
     except Exception as error:

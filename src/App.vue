@@ -1,6 +1,12 @@
 <script setup>
+import { onMounted } from "vue";
 import { RouterView } from "vue-router";
 import AppHeader from "@/components/AppHeader.vue";
+import { syncBackendTime } from "@/stores/settingsStore";
+
+onMounted(() => {
+  syncBackendTime().catch(() => {});
+});
 </script>
 
 <template>

@@ -15,6 +15,7 @@ from app.runtime_paths import (
     MODEL_FILE_PATH,
     VIDEO_BASE_PATH,
 )
+from app import time_sync
 from app.services.camera_config_service import camera_config_service
 from app.services.config_service import ai_config_service
 from app.utils import should_enable_stream_ai, to_bool
@@ -192,6 +193,14 @@ def reload_enabled_streams() -> list[str]:
     return reloaded
 
 
+def get_detection_overlay(target: str = "high", max_age_sec: float = 1.0) -> dict[str, Any]:
+    streams = get_target_streams(target)
+    if not streams:
+        raise ValueError("target must be high, low, or all")
+    stream = streams[0]
+    return stream.get_overlay_state(max_age_sec=max_age_sec)
+
+
 def start_runtime() -> None:
     cam_manager.start()
 
@@ -249,5 +258,6 @@ def build_runtime_status() -> dict[str, Any]:
         },
         "camera": camera_status,
         "streams": [high_status, low_status],
+        "clock": time_sync.status(),
         "status_errors": status_errors,
     }

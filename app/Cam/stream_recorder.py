@@ -6,8 +6,15 @@ from pathlib import Path
 
 import cv2
 
+from app import time_sync
 from app.Cam.stream_publisher import StreamPublisher
 from app.utils import read_record_config
+
+
+FFMPEG_RECORD_CANDIDATES = (
+    ("mp4", "mp4v", "ffmpeg-mp4v"),
+    ("avi", "MJPG", "ffmpeg-mjpg"),
+)
 
 
 class StreamRecorder:
@@ -28,6 +35,7 @@ class StreamRecorder:
 
         self.writer = None
         self.start_time = 0.0
+        self.start_epoch = 0.0
         self.duration_limit = 600.0
         self.need_restart = True
         self.cooldown_until = 0.0
@@ -81,6 +89,18 @@ class StreamRecorder:
         video_dir.mkdir(parents=True, exist_ok=True)
         return video_dir
 
+    def _next_file_path(self, video_dir, timestamp_str, extension):
+        file_path = video_dir / f"{timestamp_str}.{extension}"
+        if not file_path.exists() and not file_path.with_suffix(".json").exists():
+            return file_path
+
+        index = 1
+        while True:
+            candidate = video_dir / f"{timestamp_str}_{index}.{extension}"
+            if not candidate.exists() and not candidate.with_suffix(".json").exists():
+                return candidate
+            index += 1
+
     def _write_metadata(self):
         if self.file_path is None:
             return
@@ -91,12 +111,10 @@ class StreamRecorder:
                 "filename": self.file_path.name,
                 "title": self.file_path.stem,
                 "target": self.name,
-                "start_at": time.strftime(
-                    "%Y-%m-%dT%H:%M:%S",
-                    time.localtime(self.start_time),
-                ),
+                "start_at": time_sync.format_local(self.start_epoch),
                 "duration_sec": max(0, int(round(time.time() - self.start_time))),
                 "has_target": bool(self.has_target),
+                "time_synced": time_sync.is_synced(),
             }
             metadata_path.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -144,51 +162,30 @@ class StreamRecorder:
         if self.need_restart or self.writer is None or time_expired:
             self._open(current_w, current_h, current_fps, stream_stats)
 
-    def _open(self, current_w, current_h, current_fps, stream_stats=None):
-        self.close(stream_stats)
-
+    def _open_gstreamer_writer(self, video_dir, timestamp_str, width, height, fps):
         unavailable_reason = StreamPublisher.unavailable_reason()
         if unavailable_reason:
-            self.last_error = f"record unavailable: {unavailable_reason}"
             if self._last_unavailable_reason != unavailable_reason:
                 self.logger.warning(
-                    "Local recording unavailable: %s; cooling down for 60s",
+                    "GStreamer recording unavailable: %s; trying file fallback",
                     unavailable_reason,
                 )
                 self._last_unavailable_reason = unavailable_reason
             else:
                 self.logger.debug(
-                    "Local recording still unavailable: %s; cooling down for 60s",
+                    "GStreamer recording still unavailable: %s; trying file fallback",
                     unavailable_reason,
                 )
-            self.cooldown_until = time.time() + 60.0
-            return
+            return None, None, None, unavailable_reason
 
-        duration_min = read_record_config(self.ai_config_path)
-        self.duration_limit = duration_min * 60.0
-
-        video_dir = self._video_dir()
-        total, used, free = shutil.disk_usage(str(video_dir))
-        free_mb = free / (1024 * 1024)
-
-        if free_mb < self.min_free_space_mb:
-            self.last_error = f"low disk space: {free_mb:.2f}MB"
-            self.logger.warning(
-                "Disk space is low: %.2f MB free; recording paused for 60s",
-                free_mb,
-            )
-            self.cooldown_until = time.time() + 60.0
-            return
-
-        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-        file_path = video_dir / f"{timestamp_str}.mkv"
-        bitrate = int(self.bitrate_fn(current_w, current_h, current_fps))
+        file_path = self._next_file_path(video_dir, timestamp_str, "mkv")
+        bitrate = int(self.bitrate_fn(width, height, fps))
         encoder = StreamPublisher._select_encoder()
 
         base = (
             f"appsrc is-live=true block=false format=time do-timestamp=true "
-            f"! video/x-raw,format=BGR,width={current_w},height={current_h},framerate={current_fps}/1 "
-            f"! queue leaky=downstream max-size-buffers={current_fps} "
+            f"! video/x-raw,format=BGR,width={width},height={height},framerate={fps}/1 "
+            f"! queue leaky=downstream max-size-buffers={fps} "
         )
 
         if encoder == "nvv4l2h264enc":
@@ -201,7 +198,7 @@ class StreamRecorder:
                 f"! nvv4l2h264enc "
                 f"bitrate={bitrate * 1000} "
                 f"control-rate=1 "
-                f"iframeinterval={current_fps} "
+                f"iframeinterval={fps} "
                 f"insert-sps-pps=true "
                 f"maxperf-enable=true "
                 f"! h264parse "
@@ -229,26 +226,104 @@ class StreamRecorder:
             gst_pipeline,
             cv2.CAP_GSTREAMER,
             0,
-            float(current_fps),
-            (int(current_w), int(current_h)),
+            float(fps),
+            (width, height),
             True,
         )
 
-        if not writer.isOpened():
-            try:
-                writer.release()
-            except Exception:
-                self.logger.exception("Failed to release unopened record writer")
-            self.last_error = f"record writer open failed: {file_path}"
+        if writer.isOpened():
+            return writer, file_path, encoder, None
+
+        try:
+            writer.release()
+        except Exception:
+            self.logger.exception("Failed to release unopened GStreamer record writer")
+        return None, None, None, f"GStreamer record writer open failed: {file_path}"
+
+    def _open_ffmpeg_writer(self, video_dir, timestamp_str, width, height, fps):
+        errors = []
+        api_preferences = []
+        cap_ffmpeg = getattr(cv2, "CAP_FFMPEG", None)
+        if cap_ffmpeg is not None:
+            api_preferences.append((cap_ffmpeg, "CAP_FFMPEG"))
+        api_preferences.append((0, "CAP_ANY"))
+
+        for extension, fourcc_name, encoder_name in FFMPEG_RECORD_CANDIDATES:
+            file_path = self._next_file_path(video_dir, timestamp_str, extension)
+            fourcc = cv2.VideoWriter_fourcc(*fourcc_name)
+            for api_preference, api_name in api_preferences:
+                writer = cv2.VideoWriter(
+                    str(file_path),
+                    api_preference,
+                    fourcc,
+                    float(fps),
+                    (width, height),
+                    True,
+                )
+                if writer.isOpened():
+                    return writer, file_path, f"{encoder_name}:{api_name}", None
+
+                try:
+                    writer.release()
+                except Exception:
+                    self.logger.exception("Failed to release unopened FFmpeg record writer")
+                errors.append(f"{encoder_name}:{api_name} -> {file_path}")
+                try:
+                    if file_path.exists() and file_path.stat().st_size == 0:
+                        file_path.unlink()
+                except Exception:
+                    self.logger.debug("Failed to remove empty record candidate", exc_info=True)
+
+        return None, None, None, "FFmpeg file writer open failed: " + "; ".join(errors)
+
+    def _open(self, current_w, current_h, current_fps, stream_stats=None):
+        self.close(stream_stats)
+
+        duration_min = read_record_config(self.ai_config_path)
+        self.duration_limit = duration_min * 60.0
+
+        video_dir = self._video_dir()
+        total, used, free = shutil.disk_usage(str(video_dir))
+        free_mb = free / (1024 * 1024)
+
+        if free_mb < self.min_free_space_mb:
+            self.last_error = f"low disk space: {free_mb:.2f}MB"
+            self.logger.warning(
+                "Disk space is low: %.2f MB free; recording paused for 60s",
+                free_mb,
+            )
+            self.cooldown_until = time.time() + 60.0
+            return
+
+        width = int(current_w)
+        height = int(current_h)
+        fps = max(1, int(current_fps))
+        start_epoch = time_sync.now_epoch()
+        timestamp_str = time_sync.filename_timestamp(start_epoch)
+
+        writer, file_path, encoder, gst_error = self._open_gstreamer_writer(
+            video_dir, timestamp_str, width, height, fps
+        )
+        if writer is None:
+            writer, file_path, encoder, ffmpeg_error = self._open_ffmpeg_writer(
+                video_dir, timestamp_str, width, height, fps
+            )
+        else:
+            ffmpeg_error = None
+
+        if writer is None:
+            error_parts = [part for part in (gst_error, ffmpeg_error) if part]
+            self.last_error = "record writer open failed: " + " | ".join(error_parts)
             self.logger.warning(
                 "Failed to open local record writer: %s; cooling down for 60s",
-                file_path,
+                self.last_error,
             )
             self.cooldown_until = time.time() + 60.0
             return
 
         self.writer = writer
         self.start_time = time.time()
+        self.start_epoch = start_epoch
         self.file_path = file_path
         self.has_target = False
         self.need_restart = False

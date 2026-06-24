@@ -147,16 +147,14 @@
         </button>
 
         <div class="player-stage">
-          <div class="player-screen" :class="{ 'player-screen-video': activeVideo?.playUrl && !videoPlaybackError }">
-            <video
-              v-if="activeVideo?.playUrl && !videoPlaybackError"
-              class="player-video"
-              :src="activeVideo.playUrl"
-              controls
-              autoplay
-              playsinline
+          <div class="player-screen" :class="{ 'player-screen-video': activeVideo?.previewUrl && !videoPlaybackError }">
+            <img
+              v-if="activeVideo?.previewUrl && !videoPlaybackError"
+              class="player-video player-preview"
+              :src="activeVideo.previewUrl"
+              alt=""
               @error="handleVideoError"
-            ></video>
+            />
             <template v-else>
               <div class="player-overlay-icon">
                 <svg width="36" height="36" viewBox="0 0 24 24" fill="currentColor">
@@ -164,7 +162,7 @@
                 </svg>
               </div>
               <div class="player-tip">
-                {{ videoPlaybackError ? "当前浏览器暂不支持直接播放该视频，请使用下载功能查看。" : (showDetectionResult ? "检测结果显示已开启，等待后端返回结果" : "检测结果显示已关闭") }}
+                {{ videoPlaybackError ? "低清预览暂不可用，请下载高清文件或等待当前分段结束。" : (showDetectionResult ? "检测结果显示已开启，等待后端返回结果" : "检测结果显示已关闭") }}
               </div>
             </template>
           </div>
@@ -185,6 +183,15 @@
         <div class="player-info">
           <div class="player-info-header">
             <h3>{{ activeVideo.title }}</h3>
+            <a
+              v-if="activeVideo.downloadUrl"
+              class="player-download"
+              :href="activeVideo.downloadUrl"
+              :download="activeVideo.filename"
+              @click.stop
+            >
+              高清下载
+            </a>
           </div>
           <p>{{ activeVideo.displayDate }} {{ activeVideo.time }}</p>
           <div class="player-tags">
@@ -241,7 +248,9 @@
 
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
-const API_URL = import.meta.env.VITE_FLASK_BACKEND_URL;
+import { getApiUrl, syncBackendTime } from "@/stores/settingsStore";
+
+const API_URL = getApiUrl();
 const DEFAULT_RECORD_DURATION_MIN = 1;
 const datePickerRef = ref(null);
 const showSettingsModal = ref(false);
@@ -380,6 +389,7 @@ function mapRecordItem(item) {
     hasTarget: typeof item.has_target === "boolean" ? item.has_target : null,
     downloadUrl: buildAbsoluteApiUrl(item.download_url),
     playUrl: buildAbsoluteApiUrl(item.play_url),
+    previewUrl: buildAbsoluteApiUrl(item.preview_url),
   };
 }
 
@@ -396,6 +406,7 @@ function createSliceVideo(id, option, startTimeText, hasTarget) {
     hasTarget,
     downloadUrl: "",
     playUrl: "",
+    previewUrl: "",
   };
 }
 
@@ -728,6 +739,7 @@ watch(filteredVideos, () => {
 });
 
 onMounted(async () => {
+  await syncBackendTime(API_URL).catch(() => {});
   await Promise.allSettled([fetchRecordConfig(), fetchRecordList()]);
 });
 </script>
@@ -1181,6 +1193,10 @@ onMounted(async () => {
   background: #000000;
 }
 
+.player-preview {
+  display: block;
+}
+
 .player-result-toggle {
   position: absolute;
   right: 0;
@@ -1212,6 +1228,24 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+.player-download {
+  margin-left: auto;
+  padding: 7px 12px;
+  border-radius: 10px;
+  border: 1px solid #30363d;
+  background: #21262d;
+  color: #c9d1d9;
+  font-size: 0.88rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.player-download:hover {
+  color: #ffffff;
+  border-color: #1f6feb;
+  background: #1f6feb;
 }
 
 .player-info h3 {
@@ -1668,6 +1702,18 @@ onMounted(async () => {
 
 .player-video {
   border-radius: var(--industrial-radius);
+}
+
+.player-download {
+  color: var(--industrial-muted);
+  background: var(--industrial-surface-subtle);
+  border-color: var(--industrial-border);
+}
+
+.player-download:hover {
+  color: #ffffff;
+  background: var(--industrial-red);
+  border-color: var(--industrial-red);
 }
 
 .result-toggle.off {
