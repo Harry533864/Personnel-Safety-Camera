@@ -3,12 +3,27 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import logging
+import threading
+import time
 
 from app import app
-from flask import request, jsonify, render_template, send_file, url_for
+import cv2
+from flask import request, jsonify, render_template, send_file, url_for, Response
 
+from app.camera_modes import (
+    camera_mode_key,
+    get_supported_resolution_options,
+    normalize_camera_mode,
+    parse_camera_mode_key,
+    sample_stream_fps,
+)
 from app.config_schema import validate_model_name, resolve_model_dir
-from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
+from app.runtime_paths import (
+    AI_CONFIG_PATH,
+    CAMERA_CONFIG_PATH,
+    MODEL_FILE_PATH,
+    VIDEO_BASE_PATH,
+)
 from app.runtime import (
     build_runtime_status,
     cam_manager,
@@ -20,6 +35,18 @@ from app.runtime import (
     sync_infer_enable_from_config,
 )
 from app.services.config_service import ai_config_service
+from app.services.camera_config_service import (
+    camera_config_service,
+    normalize_power_line_frequency,
+    normalize_white_balance,
+)
+from inference.python_tensorrt.alarm_output import AlarmOutputController
+from inference.python_tensorrt.ysl301 import (
+    CHANNELS as YSL301_CHANNELS,
+    DEFAULT_IDLE_PATTERN as YSL301_IDLE_PATTERN,
+    LIGHT_STATES as YSL301_LIGHT_STATES,
+    normalize_state_name as normalize_ysl301_state,
+)
 
 from app.utils import (
     to_bool,
@@ -32,8 +59,15 @@ from app.utils import (
 
 logger = logging.getLogger(__name__)
 logger.info("AI config path: %s", AI_CONFIG_PATH)
+logger.info("Camera config path: %s", CAMERA_CONFIG_PATH)
 logger.info("Model directory: %s", MODEL_FILE_PATH)
 logger.info("Video base directory: %s", VIDEO_BASE_PATH)
+
+_mjpeg_active_clients = {}
+_mjpeg_client_lock = threading.Lock()
+_manual_output_lock = threading.Lock()
+_manual_output_controller = None
+_manual_output_signature = None
 
 
 def read_ai_config():
@@ -42,6 +76,147 @@ def read_ai_config():
 
 def update_ai_config(mutator):
     return ai_config_service.update(mutator)
+
+
+def _current_camera_settings_payload():
+    status = cam_manager.get_status()
+    defaults = {
+        "width": status.get("width", 1920),
+        "height": status.get("height", 1080),
+        "fps": status.get("fps", 60),
+        "exposure": status.get("exposure", 0),
+        "gain": status.get("gain", 0),
+        "white_balance": status.get("white_balance", "continuous"),
+        "power_line_frequency": status.get("power_line_frequency", 1),
+    }
+    persisted = camera_config_service.read(defaults=defaults)
+
+    width = int(status.get("width") or persisted["width"])
+    height = int(status.get("height") or persisted["height"])
+    fps = int(status.get("fps") or persisted["fps"])
+    mode = normalize_camera_mode(width, height, fps)
+    resolution = camera_mode_key(mode["width"], mode["height"])
+    white_balance = normalize_white_balance(
+        status.get("white_balance") or persisted["white_balance"]
+    )
+    power_line_frequency = normalize_power_line_frequency(
+        status.get("power_line_frequency", persisted["power_line_frequency"])
+    )
+
+    return {
+        "resolution": resolution,
+        "width": mode["width"],
+        "height": mode["height"],
+        "fps": mode["fps"],
+        "exposure": int(status.get("exposure", persisted["exposure"]) or 0),
+        "gain": int(status.get("gain", persisted["gain"]) or 0),
+        "white_balance": white_balance,
+        "whiteBalance": white_balance,
+        "power_line_frequency": power_line_frequency,
+        "powerLineFrequency": power_line_frequency,
+        "target": persisted.get("target", "high"),
+        "supported_resolutions": get_supported_resolution_options(),
+    }
+
+
+def _apply_stream_mode(target, width, height, camera_fps):
+    stream_mode = sample_stream_fps(width, height, camera_fps)
+    updated_streams = []
+    for stream in get_target_streams(target):
+        stream.set_fps(stream_mode["fps"])
+        stream.set_resolution(stream_mode["width"], stream_mode["height"])
+        updated_streams.append(stream.name)
+    return {
+        **stream_mode,
+        "updated_streams": updated_streams,
+    }
+
+
+def _resolution_key_from_status():
+    status = cam_manager.get_status()
+    return camera_mode_key(status.get("width") or 1920, status.get("height") or 1080)
+
+
+def _normalize_resolution_key(value=None):
+    if str(value or "").lower() in {"all", "high", "low"}:
+        value = None
+    if value:
+        width, height = parse_camera_mode_key(value)
+        normalize_camera_mode(width, height, 30)
+        return camera_mode_key(width, height)
+    return _resolution_key_from_status()
+
+
+def _ensure_roi_profiles(model_cfg, active_key=None):
+    profiles = model_cfg.get("rois_by_resolution")
+    if not isinstance(profiles, dict):
+        profiles = {}
+        model_cfg["rois_by_resolution"] = profiles
+
+    existing_active_key = str(
+        model_cfg.get("active_roi_resolution") or _resolution_key_from_status()
+    )
+    current_rois = model_cfg.get("rois", [])
+    if (
+        existing_active_key not in profiles
+        and isinstance(current_rois, list)
+        and current_rois
+    ):
+        profiles[existing_active_key] = current_rois
+
+    active_key = active_key or existing_active_key
+    model_cfg["active_roi_resolution"] = active_key
+
+    return profiles, active_key
+
+
+def _activate_roi_profile(model_cfg, resolution_key):
+    profiles, _ = _ensure_roi_profiles(model_cfg, resolution_key)
+    model_cfg["active_roi_resolution"] = resolution_key
+    model_cfg["rois"] = list(profiles.get(resolution_key, []))
+    return len(model_cfg["rois"])
+
+
+def _roi_display_state_from_zone(roi, zone):
+    if not zone:
+        return "safe", "#22c55e"
+
+    try:
+        person_count = int(zone.get("person_count", 0) or 0)
+    except Exception:
+        person_count = 0
+    try:
+        warning_count = int(zone.get("warning_count", 0) or 0)
+    except Exception:
+        warning_count = 0
+    if person_count <= 0 and warning_count <= 0:
+        return "safe", "#22c55e"
+
+    roi_type = str(zone.get("roi_type") or roi.get("roi_type") or "")
+    if person_count <= 0 or roi_type == "warning_zone":
+        return "warning", "#f59e0b"
+    return "alarm", "#ef4444"
+
+
+def _attach_roi_display_state(rois, overlay):
+    zones = {
+        str(zone.get("roi_id", "")): zone
+        for zone in (overlay or {}).get("zone_summary", []) or []
+        if isinstance(zone, dict)
+    }
+    enriched = []
+    for roi in rois or []:
+        if not isinstance(roi, dict):
+            continue
+        item = dict(roi)
+        zone = zones.get(str(item.get("roi_id", "")))
+        display_status, display_color = _roi_display_state_from_zone(item, zone)
+        item["display_status"] = display_status
+        item["display_color"] = display_color
+        item["person_count"] = int((zone or {}).get("person_count", 0) or 0)
+        item["warning_count"] = int((zone or {}).get("warning_count", 0) or 0)
+        enriched.append(item)
+    return enriched
 
 # =========================================================
 # 基础接口
@@ -63,9 +238,128 @@ def get_runtime_status():
         "data": build_runtime_status(),
     })
 
+
+@app.route("/api/stream/config", methods=["GET"])
+def get_stream_config():
+    try:
+        return jsonify({
+            "status": "success",
+            "data": _current_camera_settings_payload(),
+        })
+    except Exception as e:
+        logger.exception("Failed to read camera stream config")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 500
+
 # =========================================================
 # 推流接口
 # =========================================================
+
+@app.route("/api/stream/mjpeg", methods=["GET"])
+def stream_mjpeg_preview():
+    """Low-latency preview stream that always serves the newest frame."""
+    target = request.args.get("target", "high")
+    try:
+        preview_fps = max(1, min(60, int(request.args.get("fps", "30"))))
+    except (TypeError, ValueError):
+        preview_fps = 30
+    try:
+        jpeg_quality = max(35, min(95, int(request.args.get("quality", "65"))))
+    except (TypeError, ValueError):
+        jpeg_quality = 65
+    try:
+        max_width = max(0, int(request.args.get("max_width", "1280")))
+    except (TypeError, ValueError):
+        max_width = 1280
+    include_overlay = to_bool(request.args.get("overlay", "0"))
+
+    streams = get_target_streams(target)
+    stream = streams[0] if streams else None
+
+    if stream is None:
+        return jsonify({
+            "status": "error",
+            "message": "No stream is available for MJPEG preview",
+        }), 404
+
+    client_key = getattr(stream, "name", target)
+    client_id = request.args.get("t") or f"{time.time()}-{id(request)}"
+    with _mjpeg_client_lock:
+        _mjpeg_active_clients[client_key] = client_id
+
+    frame_interval = 1.0 / preview_fps
+
+    def generate():
+        last_frame_time = 0.0
+        next_frame_at = 0.0
+
+        try:
+            while True:
+                with _mjpeg_client_lock:
+                    if _mjpeg_active_clients.get(client_key) != client_id:
+                        break
+
+                frame, frame_time = stream.inference.get_frame_snapshot(
+                    include_overlay=include_overlay,
+                )
+                if frame is None:
+                    time.sleep(0.02)
+                    continue
+
+                if frame_time and frame_time <= last_frame_time:
+                    time.sleep(0.002)
+                    continue
+
+                now = time.perf_counter()
+                if now < next_frame_at:
+                    time.sleep(next_frame_at - now)
+                next_frame_at = time.perf_counter() + frame_interval
+
+                if max_width and frame.shape[1] > max_width:
+                    scale = max_width / frame.shape[1]
+                    frame = cv2.resize(
+                        frame,
+                        (max_width, max(2, int(round(frame.shape[0] * scale / 2) * 2))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+                )
+                if not ok:
+                    time.sleep(0.01)
+                    continue
+
+                frame_bytes = encoded.tobytes()
+                last_frame_time = frame_time or time.time()
+                frame_age_ms = max(0.0, (time.time() - last_frame_time) * 1000.0)
+                if hasattr(stream, "mark_mjpeg_frame"):
+                    stream.mark_mjpeg_frame()
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-store\r\n"
+                    b"X-Frame-Time: " + f"{last_frame_time:.6f}".encode("ascii") + b"\r\n"
+                    b"X-Frame-Age-Ms: " + f"{frame_age_ms:.1f}".encode("ascii") + b"\r\n"
+                    b"Content-Length: " + str(len(frame_bytes)).encode("ascii") + b"\r\n\r\n"
+                    + frame_bytes
+                    + b"\r\n"
+                )
+        finally:
+            with _mjpeg_client_lock:
+                if _mjpeg_active_clients.get(client_key) == client_id:
+                    _mjpeg_active_clients.pop(client_key, None)
+
+    response = Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
 
 @app.route("/api/stream/start", methods=["POST", "GET"])
 def start_streams():
@@ -109,17 +403,128 @@ def set_exposure():
 
     try:
         value = int(data["value"])
+        target = data.get("target", "high")
         cam_manager.set_exposure(value)
+        settings = camera_config_service.update({
+            "exposure": value,
+            "target": target,
+        })
 
         return jsonify({
             "status": "success",
-            "message": f"曝光已设置为: {value}"
+            "message": f"曝光已设置为: {value}",
+            "data": {
+                "exposure": settings["exposure"],
+                "target": settings["target"],
+            },
         })
 
     except Exception as e:
         return jsonify({
             "status": "error",
             "message": f"设置曝光失败: {e}"
+        }), 400
+
+
+@app.route("/api/stream/gain", methods=["POST"])
+def set_gain():
+    data = request.get_json(silent=True) or {}
+
+    if "value" not in data:
+        return jsonify({
+            "status": "error",
+            "message": "缺少 gain 参数"
+        }), 400
+
+    try:
+        value = int(float(data["value"]))
+        if value < 0:
+            raise ValueError("gain must be >= 0")
+
+        target = data.get("target", "high")
+        cam_manager.set_gain(value)
+        settings = camera_config_service.update({
+            "gain": value,
+            "target": target,
+        })
+
+        return jsonify({
+            "status": "success",
+            "message": f"增益已设置为: {settings['gain']}",
+            "data": {
+                "gain": settings["gain"],
+                "target": settings["target"],
+            },
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"设置增益失败: {e}"
+        }), 400
+
+
+@app.route("/api/stream/white_balance", methods=["POST"])
+def set_white_balance():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+
+    if mode is None and "auto" in data:
+        mode = "continuous" if to_bool(data.get("auto")) else "off"
+
+    try:
+        mode = normalize_white_balance(mode)
+        target = data.get("target", "high")
+        cam_manager.set_white_balance(mode)
+        settings = camera_config_service.update({
+            "white_balance": mode,
+            "target": target,
+        })
+
+        return jsonify({
+            "status": "success",
+            "message": f"白平衡已设置为: {settings['white_balance']}",
+            "data": {
+                "mode": settings["white_balance"],
+                "target": settings["target"],
+            },
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"设置白平衡失败: {e}"
+        }), 400
+
+
+@app.route("/api/stream/power_line_frequency", methods=["POST"])
+def set_power_line_frequency():
+    data = request.get_json(silent=True) or {}
+
+    raw_value = data.get("value", data.get("mode", data.get("frequency")))
+
+    try:
+        value = normalize_power_line_frequency(raw_value)
+        target = data.get("target", "high")
+        cam_manager.set_power_line_frequency(value)
+        settings = camera_config_service.update({
+            "power_line_frequency": value,
+            "target": target,
+        })
+
+        return jsonify({
+            "status": "success",
+            "message": f"抗频闪已设置为: {settings['power_line_frequency']}",
+            "data": {
+                "power_line_frequency": settings["power_line_frequency"],
+                "target": settings["target"],
+            },
+        })
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"设置抗频闪失败: {e}"
         }), 400
 
 
@@ -137,16 +542,56 @@ def set_resolution():
         width = int(data["width"])
         height = int(data["height"])
         target = data.get("target", "high")
+        current_fps = int(cam_manager.get_status().get("fps") or 30)
+        mode = normalize_camera_mode(width, height, current_fps)
 
         # 让硬件管理器修改参数并重启硬件取流
-        cam_manager.set_resolution(width, height)
+        cam_manager.set_fps(mode["fps"])
+        cam_manager.set_resolution(mode["width"], mode["height"])
 
-        for stream in get_target_streams(target):
-            stream.set_resolution(width, height)
+        stream_mode = _apply_stream_mode(
+            target,
+            mode["width"],
+            mode["height"],
+            mode["fps"],
+        )
+
+        resolution_key = camera_mode_key(mode["width"], mode["height"])
+
+        def activate_profile(cfg):
+            model_cfg = cfg.setdefault("model", {})
+            return _activate_roi_profile(model_cfg, resolution_key)
+
+        cfg, active_roi_count = update_ai_config(activate_profile)
+        reloaded = reload_enabled_streams()
+        settings = camera_config_service.update({
+            "resolution": resolution_key,
+            "width": mode["width"],
+            "height": mode["height"],
+            "fps": mode["fps"],
+            "target": target,
+        })
 
         return jsonify({
             "status": "success",
-            "message": f"分辨率已设置为 {width}x{height}, target={target}"
+            "message": (
+                f"分辨率已设置为 {mode['width']}x{mode['height']}, "
+                f"fps={mode['fps']}, target={target}"
+            ),
+            "data": {
+                **mode,
+                "resolution_key": resolution_key,
+                "camera_fps": mode["fps"],
+                "stream_fps": stream_mode["fps"],
+                "stream_width": stream_mode["width"],
+                "stream_height": stream_mode["height"],
+                "stream_sampled": stream_mode["sampled"],
+                "stream_sample_reason": stream_mode["sample_reason"],
+                "updated_streams": stream_mode["updated_streams"],
+                "active_roi_count": active_roi_count,
+                "reloaded_streams": reloaded,
+                "saved_resolution": settings["resolution"],
+            },
         })
 
     except Exception as e:
@@ -169,16 +614,43 @@ def set_fps():
     try:
         fps = int(data["value"])
         target = data.get("target", "high")
+        cam_status = cam_manager.get_status()
+        mode = normalize_camera_mode(
+            cam_status.get("width") or 1920,
+            cam_status.get("height") or 1080,
+            fps,
+        )
 
         # 让硬件管理器修改参数并重启硬件取流
-        cam_manager.set_fps(fps)
+        cam_manager.set_fps(mode["fps"])
 
+        stream_mode = sample_stream_fps(
+            mode["width"],
+            mode["height"],
+            mode["fps"],
+        )
         for stream in get_target_streams(target):
-            stream.set_fps(fps)
+            stream.set_fps(stream_mode["fps"])
+        settings = camera_config_service.update({
+            "width": mode["width"],
+            "height": mode["height"],
+            "fps": mode["fps"],
+            "target": target,
+        })
 
         return jsonify({
             "status": "success",
-            "message": f"FPS 已设置为 {fps}, target={target}"
+            "message": f"FPS 已设置为 {mode['fps']}, target={target}",
+            "data": {
+                **mode,
+                "camera_fps": mode["fps"],
+                "stream_fps": stream_mode["fps"],
+                "stream_width": stream_mode["width"],
+                "stream_height": stream_mode["height"],
+                "stream_sampled": stream_mode["sampled"],
+                "stream_sample_reason": stream_mode["sample_reason"],
+                "target": settings["target"],
+            },
         })
 
     except Exception as e:
@@ -238,6 +710,13 @@ def update_inference_configuration():
                 overlap_thres = float(data["overlapRate"])
                 for roi in model_cfg.get("rois", []):
                     roi["overlap_thres"] = overlap_thres
+                profiles = model_cfg.get("rois_by_resolution", {})
+                if isinstance(profiles, dict):
+                    for rois in profiles.values():
+                        if isinstance(rois, list):
+                            for roi in rois:
+                                if isinstance(roi, dict):
+                                    roi["overlap_thres"] = overlap_thres
 
             return {"detect_enable": detect_enable, "target": target}
 
@@ -274,18 +753,28 @@ def get_detection_regions():
     """
     try:
         cfg = read_ai_config()
-        rois = cfg.get("model", {}).get("rois", [])
+        model_cfg = cfg.get("model", {})
+        profiles, active_key = _ensure_roi_profiles(model_cfg)
+        requested_key = _normalize_resolution_key(
+            request.args.get("resolution_key") or active_key
+        )
+        rois = profiles.get(requested_key, model_cfg.get("rois", []))
 
         return jsonify({
             "status": "success",
-            "rois": rois
+            "rois": rois,
+            "active_resolution": active_key,
+            "selected_resolution": requested_key,
+            "rois_by_resolution": profiles,
+            "supported_resolutions": get_supported_resolution_options(),
         })
 
     except Exception as e:
         return jsonify({
             "status": "error",
             "message": f"获取检测区域失败: {e}",
-            "rois": []
+            "rois": [],
+            "rois_by_resolution": {},
         }), 400
 
 
@@ -298,13 +787,17 @@ def get_detection_overlay_state():
         target = request.args.get("target", "high")
         max_age_sec = float(request.args.get("max_age_sec", 1.0))
         cfg = read_ai_config()
-        rois = cfg.get("model", {}).get("rois", [])
+        model_cfg = cfg.get("model", {})
+        active_resolution = model_cfg.get("active_roi_resolution") or _resolution_key_from_status()
+        rois = model_cfg.get("rois", [])
         overlay = get_detection_overlay(target=target, max_age_sec=max_age_sec)
+        rois = _attach_roi_display_state(rois, overlay)
 
         return jsonify({
             "status": "success",
             "data": {
                 "target": target,
+                "active_resolution": active_resolution,
                 "rois": rois,
                 "overlay": overlay,
             },
@@ -346,17 +839,30 @@ def update_detection_regions():
 
     try:
         raw_rois = data["rois"]
+        resolution_key = _normalize_resolution_key(
+            data.get("resolution_key") or data.get("target")
+        )
 
         if not isinstance(raw_rois, list):
             raise ValueError("rois 必须是数组")
 
         def mutate(cfg):
             model_cfg = cfg.setdefault("model", {})
-            model_cfg["rois"] = [
-                normalize_roi(roi, index)
+            profiles, active_key = _ensure_roi_profiles(model_cfg, resolution_key)
+            normalized_rois = [
+                {
+                    **normalize_roi(roi, index),
+                    "target": "all",
+                    "resolution_key": resolution_key,
+                }
                 for index, roi in enumerate(raw_rois)
             ]
-            return len(model_cfg["rois"])
+            profiles[resolution_key] = normalized_rois
+            model_cfg["rois_by_resolution"] = profiles
+            if active_key == resolution_key:
+                model_cfg["rois"] = normalized_rois
+                model_cfg["active_roi_resolution"] = resolution_key
+            return len(normalized_rois)
 
         cfg, roi_count = update_ai_config(mutate)
 
@@ -367,7 +873,8 @@ def update_detection_regions():
             "message": "检测区域已保存",
             "data": {
                 "roi_count": roi_count,
-                "reloaded": reloaded
+                "resolution_key": resolution_key,
+                "reloaded": reloaded,
             }
         })
 
@@ -591,6 +1098,133 @@ def normalize_gpio_pins(value):
     return out
 
 
+def normalize_serial_alarm_pattern(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("serial alarm pattern must be an object")
+
+    channels = {"red", "yellow", "green", "buzzer"}
+    out = {}
+    for channel, state in value.items():
+        channel_key = str(channel).strip().lower()
+        if channel_key not in channels:
+            raise ValueError(f"unsupported serial alarm channel: {channel}")
+        out[channel_key] = str(state).strip().lower().replace("-", "_")
+    return out
+
+
+def normalize_serial_output(value):
+    if not isinstance(value, dict):
+        raise ValueError("serial must be an object")
+
+    out = {}
+    if "enabled" in value:
+        out["enabled"] = to_bool(value["enabled"])
+    if "type" in value:
+        out["type"] = str(value["type"]).strip().lower()
+    if "port" in value:
+        out["port"] = str(value["port"]).strip() or "auto"
+
+    for field in ("baudrate", "address"):
+        if field in value:
+            out[field] = int(value[field])
+
+    for field in ("timeout", "write_timeout", "writeTimeout", "command_delay", "commandDelay"):
+        if field in value:
+            out[field] = float(value[field])
+
+    for field in ("alarm", "warning", "safe", "idle"):
+        pattern = normalize_serial_alarm_pattern(value.get(field))
+        if pattern is not None:
+            out[field] = pattern
+
+    return out
+
+
+def normalize_manual_output_channels(data):
+    out = dict(YSL301_IDLE_PATTERN)
+    raw_channels = data.get("channels")
+
+    if raw_channels is not None:
+        if not isinstance(raw_channels, dict):
+            raise ValueError("channels must be an object")
+
+        for channel, state in raw_channels.items():
+            channel_key = str(channel).strip().lower()
+            if channel_key not in YSL301_CHANNELS:
+                raise ValueError(f"unsupported manual output channel: {channel}")
+
+            state_key = normalize_ysl301_state(state)
+            if state_key not in YSL301_LIGHT_STATES:
+                raise ValueError(f"unsupported manual output state: {state}")
+
+            out[channel_key] = state_key
+        return out
+
+    channel = str(data.get("channel", "") or "").strip().lower()
+    active = to_bool(data.get("active", False))
+    if not channel:
+        if active:
+            raise ValueError("channel or channels is required")
+        return out
+
+    if channel not in YSL301_CHANNELS:
+        raise ValueError(f"unsupported manual output channel: {channel}")
+
+    default_active_state = "on"
+    raw_state = data.get("state", default_active_state if active else "off")
+    state_key = normalize_ysl301_state(raw_state)
+    if not active:
+        state_key = "off"
+    if state_key not in YSL301_LIGHT_STATES:
+        raise ValueError(f"unsupported manual output state: {raw_state}")
+
+    out[channel] = state_key
+    return out
+
+
+def get_manual_output_controller():
+    global _manual_output_controller, _manual_output_signature
+
+    cfg = dict(read_ai_config().get("exception_output", {}) or {})
+    signature = json.dumps(cfg, sort_keys=True, default=str)
+
+    with _manual_output_lock:
+        if (
+            _manual_output_controller is None
+            or _manual_output_signature != signature
+        ):
+            if _manual_output_controller is not None:
+                _manual_output_controller.close()
+
+            _manual_output_controller = AlarmOutputController(cfg)
+            _manual_output_signature = signature
+
+        return _manual_output_controller
+
+
+def apply_manual_output_channels(channels, target="all"):
+    active = any(
+        normalize_ysl301_state(state) != "off"
+        for state in channels.values()
+    )
+
+    for stream in get_target_streams(target):
+        setter = getattr(stream.inference, "set_alarm_output_channels", None)
+        if callable(setter) and setter(channels):
+            return [stream.name]
+
+    controller = get_manual_output_controller()
+    if controller.set_manual_channels(channels):
+        return ["manual"]
+
+    if not active:
+        return ["noop"]
+
+    raise RuntimeError("serial alarm output is not enabled or unavailable")
+
+
 @app.route("/api/detection/exception_output", methods=["POST"])
 def update_exception_output_configuration():
     """
@@ -619,23 +1253,28 @@ def update_exception_output_configuration():
         "duration",
         data.get("duration_sec", data.get("durationSec", 0))
     )
+    serial_raw = data.get("serial", data.get("ysl301"))
 
-    if gpio_raw is None:
+    if gpio_raw is None and serial_raw is None:
         return jsonify({
             "status": "error",
-            "message": "缺少 gpio 参数"
+            "message": "缺少 gpio 或 serial 参数"
         }), 400
 
-    if level_raw is None:
+    if gpio_raw is not None and level_raw is None:
         return jsonify({
             "status": "error",
             "message": "缺少 output_level 参数"
         }), 400
 
     try:
-        gpio_pins = normalize_gpio_pins(gpio_raw)
-
-        output_level = normalize_gpio_output_level(level_raw)
+        exception_output = dict(read_ai_config().get("exception_output", {}) or {})
+        if gpio_raw is not None:
+            exception_output["gpio"] = normalize_gpio_pins(gpio_raw)
+            exception_output["output_level"] = normalize_gpio_output_level(level_raw)
+        else:
+            exception_output.setdefault("gpio", [])
+            exception_output.setdefault("output_level", 1)
 
         duration = float(duration_raw)
         if duration < 0:
@@ -645,11 +1284,9 @@ def update_exception_output_configuration():
         if duration.is_integer():
             duration = int(duration)
 
-        exception_output = {
-            "gpio": gpio_pins,
-            "output_level": output_level,
-            "duration": duration
-        }
+        exception_output["duration"] = duration
+        if serial_raw is not None:
+            exception_output["serial"] = normalize_serial_output(serial_raw)
 
         def mutate(cfg):
             cfg["exception_output"] = exception_output
@@ -673,7 +1310,72 @@ def update_exception_output_configuration():
             "status": "error",
             "message": str(e)
         }), 400
-    
+
+
+@app.route("/api/detection/exception_output/test", methods=["POST"])
+def test_exception_output_configuration():
+    data = request.get_json(silent=True) or {}
+    active = to_bool(data.get("active", True))
+    duration = float(data.get("duration", data.get("duration_sec", data.get("durationSec", 2))) or 0)
+    if duration < 0:
+        return jsonify({
+            "status": "error",
+            "message": "duration must be greater than or equal to 0",
+        }), 400
+
+    try:
+        target = data.get("target", "high")
+        triggered = []
+        for stream in get_target_streams(target):
+            stream.inference.trigger_alarm_output(active=active, duration=duration)
+            triggered.append(stream.name)
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "active": active,
+                "duration": duration,
+                "target": target,
+                "triggered": triggered,
+            },
+        })
+    except Exception as e:
+        logger.exception("Failed to test exception output")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 400
+
+
+@app.route("/api/detection/exception_output/manual", methods=["POST"])
+def manual_exception_output_control():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        channels = normalize_manual_output_channels(data)
+        target = data.get("target", "all")
+        applied_by = apply_manual_output_channels(channels, target=target)
+        active_channels = [
+            channel for channel, state in channels.items()
+            if normalize_ysl301_state(state) != "off"
+        ]
+
+        return jsonify({
+            "status": "success",
+            "data": {
+                "channels": channels,
+                "active_channels": active_channels,
+                "target": target,
+                "applied_by": applied_by,
+            },
+        })
+    except Exception as e:
+        logger.exception("Failed to set manual exception output")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+        }), 400
+
 
 # =========================
 # Flask 默认辅助函数
@@ -717,6 +1419,13 @@ def page_not_found(error):
     """
     Custom 404 page.
     """
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "status": "error",
+            "message": "API endpoint not found",
+            "path": request.path,
+        }), 404
+
     return render_template("404.html"), 404
 
 

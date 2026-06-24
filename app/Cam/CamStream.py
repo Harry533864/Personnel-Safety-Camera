@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 from pathlib import Path
+from app.Cam.fps_meter import FpsMeter
 from app.Cam.inference_worker import InferenceWorker
 from app.Cam.stream_publisher import StreamPublisher
 from app.Cam.stream_recorder import StreamRecorder
@@ -66,6 +67,9 @@ class CamStream:
 
         self._write_frame_count = 0
         self._put_frame_count = 0
+        self._receive_fps = FpsMeter()
+        self._write_fps = FpsMeter()
+        self._mjpeg_fps = FpsMeter()
 
         self.status_lock = threading.Lock()
         self.last_write_success_at = 0.0
@@ -94,6 +98,8 @@ class CamStream:
 
         infer_status = self.inference.status()
         record_status = self.recorder.status()
+        actual_receive_fps = self._receive_fps.fps()
+        actual_write_fps = self._write_fps.fps()
         with self.status_lock:
             status = {
                 "name": self.name,
@@ -127,6 +133,10 @@ class CamStream:
                 "frames_received": self._put_frame_count,
                 "frames_written": self._write_frame_count,
                 "frames_inferred": infer_status["frames_inferred"],
+                "actual_receive_fps": actual_receive_fps,
+                "actual_write_fps": actual_write_fps,
+                "actual_mjpeg_fps": self._mjpeg_fps.fps(),
+                "actual_infer_fps": infer_status.get("actual_infer_fps", 0),
                 "frames_recorded": record_status["frames_recorded"],
                 "record_last_error": record_status["last_error"],
                 "record_encoder": record_status["encoder"],
@@ -225,6 +235,10 @@ class CamStream:
 
         if self.inference.put_frame(frame):
             self._put_frame_count += 1
+            self._receive_fps.mark()
+
+    def mark_mjpeg_frame(self):
+        self._mjpeg_fps.mark()
 
     def start(self):
         if self._is_running:
@@ -326,6 +340,7 @@ class CamStream:
                             self._need_writer_restart = False
 
                     next_time = time.time()
+                    self._write_fps.reset()
                     with self.status_lock:
                         self.writer_opened = True
                         self.last_writer_error = None
@@ -405,6 +420,7 @@ class CamStream:
 
                 writer.write(frame)
                 self._write_frame_count += 1
+                self._write_fps.mark()
                 with self.status_lock:
                     self.writer_opened = True
                     self.last_write_success_at = time.time()

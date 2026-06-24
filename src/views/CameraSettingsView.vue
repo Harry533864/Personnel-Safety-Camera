@@ -2,25 +2,44 @@
   <div class="settings-page">
     <div class="settings-container">
       <div class="settings-header">
-        <h2 class="settings-title">相机设置</h2>
-        <button class="close-btn" @click="goBack">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <div>
+          <h2 class="settings-title">相机设置</h2>
+          <p class="settings-subtitle">采集规格与画面参数</p>
+        </div>
+        <button class="close-btn" @click="goBack" :disabled="isLoading" aria-label="关闭">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"></line>
             <line x1="6" y1="6" x2="18" y2="18"></line>
           </svg>
         </button>
       </div>
-      
+
       <div class="settings-form" :class="{ 'form-loading': isLoading }">
         <div class="form-item">
           <label class="form-label">分辨率：</label>
           <div class="form-control-wrapper">
-            <select v-model="settings.resolution" class="form-select">
-              <option value="1920x1080">1920 x 1080</option>
-              <option value="1280x720">1280 x 720</option>
-              <option value="1024x576">1024 x 576</option>
+            <select v-model="settings.resolution" class="form-select" @change="handleResolutionChange">
+              <option
+                v-for="option in resolutionOptions"
+                :key="option.value"
+                :value="option.value"
+              >
+                {{ option.label }}
+              </option>
             </select>
             <span class="unit">Pix</span>
+          </div>
+        </div>
+
+        <div class="form-item">
+          <label class="form-label">帧率：</label>
+          <div class="form-control-wrapper">
+            <select v-model="settings.fps" class="form-select">
+              <option v-for="option in fpsOptions" :key="option" :value="String(option)">
+                {{ option }}
+              </option>
+            </select>
+            <span class="unit">fps</span>
           </div>
         </div>
 
@@ -36,39 +55,52 @@
               step="1"
               @change="validateExposure"
             />
-            <span class="unit">1 ~ 10000 us；0表示自动。</span>
+            <span class="unit">0 自动；1-10000 us</span>
           </div>
         </div>
 
         <div class="form-item">
-          <label class="form-label">帧率：</label>
+          <label class="form-label">画面增益：</label>
           <div class="form-control-wrapper">
-            <select v-model="settings.fps" class="form-select">
-              <option value="60">60</option>
-              <option value="30">30</option>
-              <option value="15">15</option>
-            </select>
-            <span class="unit">fps</span>
+            <input
+              type="number"
+              v-model.number="settings.gain"
+              class="form-input"
+              min="0"
+              max="255"
+              step="1"
+              @change="validateGain"
+            />
+            <span class="unit">0-255</span>
           </div>
         </div>
 
         <div class="form-item">
-          <label class="form-label">作用域：</label>
+          <label class="form-label">白平衡：</label>
           <div class="form-control-wrapper">
-            <select v-model="settings.target" class="form-select">
-              <option value="high">高分辨率分支（默认）</option>
-              <option value="low">低分辨率分支</option>
-              <option value="all">所有分支</option>
+            <select v-model="settings.whiteBalance" class="form-select">
+              <option value="continuous">自动连续</option>
+              <option value="off">手动锁定</option>
             </select>
-            <span class="unit"></span>
+            <span class="unit">推荐自动</span>
           </div>
         </div>
 
+        <div class="form-item">
+          <label class="form-label">抗频闪：</label>
+          <div class="form-control-wrapper">
+            <select v-model="settings.powerLineFrequency" class="form-select">
+              <option value="1">50 Hz</option>
+              <option value="2">60 Hz</option>
+              <option value="0">关闭</option>
+            </select>
+            <span class="unit">工频补偿</span>
+          </div>
+        </div>
       </div>
 
       <div class="settings-footer">
         <button class="confirm-btn" @click="confirmSettings" :disabled="isLoading">
-          <span v-if="isLoading"></span>
           <span>{{ isLoading ? '保存中...' : '确认' }}</span>
         </button>
       </div>
@@ -77,56 +109,110 @@
 </template>
 
 <script setup>
-import { ref, reactive, onUnmounted } from "vue";
+import { computed, ref, reactive, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
-import { useCameraSettingStore } from '@/stores/settingsStore'
+import { useCameraSettingStore } from "@/stores/settingsStore";
 
 const router = useRouter();
 const cameraSettingStore = useCameraSettingStore();
-const settings = reactive(cameraSettingStore.getSettings());    // 从 store 加载已保存的设置，无则使用默认值
+const settings = reactive(cameraSettingStore.getSettings());
 const isLoading = ref(false);
 let pendingTimer = null;
+
+const resolutionOptions = [
+  { value: "2592x1944", label: "2592 x 1944（500万全视野）", maxFps: 30 },
+  { value: "2048x1536", label: "2048 x 1536（300万全视野）", maxFps: 30 },
+  { value: "2592x1440", label: "2592 x 1440（宽幅高清）", maxFps: 30 },
+  { value: "2304x1296", label: "2304 x 1296（300万宽幅）", maxFps: 30 },
+  { value: "1920x1080", label: "1920 x 1080（200万高清）", maxFps: 60 },
+  { value: "1600x900", label: "1600 x 900（高清预览）", maxFps: 60 },
+  { value: "1280x720", label: "1280 x 720（720P预览）", maxFps: 60 },
+  { value: "1024x576", label: "1024 x 576（低延迟预览）", maxFps: 60 },
+  { value: "640x360", label: "640 x 360（低带宽预览）", maxFps: 60 },
+];
+
+const fpsOptions = computed(() => {
+  const option = resolutionOptions.find((item) => item.value === settings.resolution);
+  const maxFps = option?.maxFps || 60;
+  return [60, 30, 15].filter((fps) => fps <= maxFps);
+});
+
+const normalizeFpsForResolution = () => {
+  const option = resolutionOptions.find((item) => item.value === settings.resolution);
+  if (!option) return;
+  const currentFps = Number(settings.fps || 0);
+  if (currentFps > option.maxFps) {
+    settings.fps = String(option.maxFps);
+  }
+};
+
+const handleResolutionChange = () => {
+  normalizeFpsForResolution();
+};
 
 const goBack = () => {
   if (isLoading.value) return;
   router.push("/");
 };
 
+onMounted(async () => {
+  isLoading.value = true;
+  try {
+    const remoteSettings = await cameraSettingStore.fetchSettings();
+    Object.assign(settings, remoteSettings, { target: "high" });
+    normalizeFpsForResolution();
+  } finally {
+    isLoading.value = false;
+  }
+});
+
 const confirmSettings = async () => {
-  // 如果已经有定时器在等待，直接返回，防止重复触发
   if (pendingTimer) return;
 
+  normalizeFpsForResolution();
+  settings.target = "high";
   isLoading.value = true;
   try {
     const success = await cameraSettingStore.saveSettings(settings);
     if (success) {
-      // 保存成功，等待 3 秒再跳转
       pendingTimer = setTimeout(() => {
         router.push("/");
         pendingTimer = null;
-      }, 5000);
-    } else {
-      alert('保存失败，请重试');
-      isLoading.value = false;
+      }, 1500);
+      return;
     }
+
+    alert(cameraSettingStore.getState().message || "保存失败，请重试");
+    isLoading.value = false;
   } catch (e) {
-    alert('保存异常：' + e.message);
+    alert("保存异常：" + e.message);
     isLoading.value = false;
   }
-
-  // 返回首页
-  // router.push("/");
 };
 
-// 校验曝光值
 const validateExposure = () => {
-  let val = settings.exposure
-  if (val === null || val === undefined || isNaN(val)) {
-    settings.exposure = 1000
+  const val = Number(settings.exposure);
+  if (!Number.isFinite(val)) {
+    settings.exposure = 0;
   } else if (val < 0) {
-    settings.exposure = 0
+    settings.exposure = 0;
   } else if (val > 10000) {
-    settings.exposure = 10000
+    settings.exposure = 10000;
+  } else {
+    settings.exposure = Math.round(val);
+  }
+};
+
+const validateGain = () => {
+  const val = Number(settings.gain);
+  if (!Number.isFinite(val)) {
+    settings.gain = 0;
+  } else if (val < 0) {
+    settings.gain = 0;
+  } else if (val > 255) {
+    settings.gain = 255;
+  } else {
+    settings.gain = Math.round(val);
   }
 };
 
@@ -134,254 +220,6 @@ onUnmounted(() => {
   if (pendingTimer) clearTimeout(pendingTimer);
 });
 </script>
-
-<style scoped>
-.settings-page {
-  min-height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0, 0, 0, 0.5);
-  padding: 20px;
-}
-
-.settings-container {
-  background: #ffffff;
-  border-radius: 8px;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
-  width: 100%;
-  max-width: 500px;
-  padding: 0;
-  overflow: hidden;
-}
-
-.settings-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 20px 24px;
-  border-bottom: 1px solid #e8e8e8;
-}
-
-.settings-title {
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: #333;
-  margin: 0;
-}
-
-.close-btn {
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: #666;
-  padding: 4px;
-  border-radius: 4px;
-  transition: all 0.2s;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.close-btn:hover:not(:disabled) {
-  background: #f0f0f0;
-  color: #333;
-}
-
-.close-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.settings-form {
-  padding: 24px;
-  transition: opacity 0.2s;
-}
-
-.settings-form.form-loading {
-  opacity: 0.6;
-  pointer-events: none;
-}
-
-.form-item {
-  display: flex;
-  align-items: center;
-  margin-bottom: 20px;
-  gap: 16px;
-}
-
-.form-item:last-child {
-  margin-bottom: 0;
-}
-
-.form-label {
-  min-width: 80px;
-  font-size: 0.95rem;
-  color: #555;
-  text-align: right;
-  flex-shrink: 0;
-}
-
-.form-control-wrapper {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.form-select,
-.form-input {
-  flex: 1;
-  padding: 10px 14px;
-  border: 1px solid #d9d9d9;
-  border-radius: 6px;
-  font-size: 0.95rem;
-  color: #333;
-  background: #fff;
-  outline: none;
-  transition: border-color 0.2s;
-}
-
-.form-select:focus,
-.form-input:focus {
-  border-color: #1677ff;
-}
-
-.unit {
-  color: #999;
-  font-size: 0.85rem;
-  min-width: 30px;
-}
-
-.rotation-control {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.number-input {
-  max-width: 120px;
-  text-align: center;
-}
-
-.rotation-buttons {
-  display: flex;
-  gap: 4px;
-}
-
-.rot-btn {
-  width: 32px;
-  height: 32px;
-  border: 1px solid #d9d9d9;
-  background: #fff;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 1rem;
-  color: #555;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-}
-
-.rot-btn:hover {
-  border-color: #1677ff;
-  color: #1677ff;
-}
-
-/* Toggle Switch */
-.toggle-switch {
-  position: relative;
-  display: inline-block;
-  width: 44px;
-  height: 24px;
-}
-
-.toggle-switch input {
-  opacity: 0;
-  width: 0;
-  height: 0;
-}
-
-.toggle-slider {
-  position: absolute;
-  cursor: pointer;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background-color: #ccc;
-  transition: 0.3s;
-  border-radius: 24px;
-}
-
-.toggle-slider:before {
-  position: absolute;
-  content: "";
-  height: 18px;
-  width: 18px;
-  left: 3px;
-  bottom: 3px;
-  background-color: white;
-  transition: 0.3s;
-  border-radius: 50%;
-}
-
-.toggle-switch input:checked + .toggle-slider {
-  background-color: #1677ff;
-}
-
-.toggle-switch input:checked + .toggle-slider:before {
-  transform: translateX(20px);
-}
-
-.settings-footer {
-  padding: 16px 24px 24px;
-  display: flex;
-  justify-content: flex-end;
-}
-
-.confirm-btn {
-  padding: 10px 32px;
-  background: #1677ff;
-  color: white;
-  border: none;
-  border-radius: 6px;
-  font-size: 0.95rem;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-
-.confirm-btn:hover:not(:disabled) {
-  background: #4096ff;
-}
-
-.confirm-btn:disabled {
-  opacity: 0.75;
-  cursor: not-allowed;
-}
-
-@media (max-width: 576px) {
-  .settings-container {
-    max-width: 100%;
-  }
-  
-  .form-item {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
-  }
-  
-  .form-label {
-    text-align: left;
-    min-width: auto;
-  }
-  
-  .form-control-wrapper {
-    width: 100%;
-  }
-}
-</style>
 
 <style scoped>
 .settings-page {
@@ -394,7 +232,7 @@ onUnmounted(() => {
 }
 
 .settings-container {
-  width: min(680px, 100%);
+  width: min(720px, 100%);
   overflow: hidden;
   background: var(--industrial-surface);
   border: 1px solid var(--industrial-border);
@@ -404,7 +242,7 @@ onUnmounted(() => {
 
 .settings-header {
   position: relative;
-  min-height: 62px;
+  min-height: 68px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -431,6 +269,13 @@ onUnmounted(() => {
   font-weight: 800;
 }
 
+.settings-subtitle {
+  margin: 4px 0 0;
+  color: var(--industrial-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .close-btn {
   width: 34px;
   height: 34px;
@@ -449,7 +294,14 @@ onUnmounted(() => {
   border-color: rgba(185, 28, 28, 0.24);
 }
 
+.close-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .settings-form {
+  display: grid;
+  gap: 16px;
   padding: 24px;
   background: var(--industrial-surface);
 }
@@ -461,21 +313,21 @@ onUnmounted(() => {
 
 .form-item {
   display: grid;
-  grid-template-columns: 110px minmax(0, 1fr);
+  grid-template-columns: 112px minmax(0, 1fr);
   align-items: center;
   gap: 14px;
-  margin-bottom: 18px;
 }
 
 .form-label {
   color: var(--industrial-muted);
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 800;
   text-align: right;
 }
 
 .form-control-wrapper {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 126px;
   align-items: center;
   gap: 10px;
   min-width: 0;
@@ -483,18 +335,26 @@ onUnmounted(() => {
 
 .form-select,
 .form-input {
-  min-height: 36px;
-  flex: 1;
+  min-height: 38px;
+  width: 100%;
   padding: 0 12px;
   color: var(--industrial-text);
   background: var(--industrial-surface-subtle);
   border: 1px solid var(--industrial-border);
   border-radius: var(--industrial-radius-sm);
+  outline: none;
+}
+
+.form-select:focus,
+.form-input:focus {
+  border-color: var(--industrial-red);
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.12);
 }
 
 .unit {
-  color: var(--industrial-faint);
+  color: var(--industrial-muted);
   font-size: 12px;
+  font-weight: 600;
   white-space: nowrap;
 }
 
@@ -507,9 +367,9 @@ onUnmounted(() => {
 }
 
 .confirm-btn {
-  min-width: 104px;
-  min-height: 36px;
-  padding: 0 20px;
+  min-width: 108px;
+  min-height: 38px;
+  padding: 0 22px;
   color: #ffffff;
   background: var(--industrial-red);
   border: 1px solid var(--industrial-red);
@@ -544,7 +404,7 @@ onUnmounted(() => {
   }
 
   .form-control-wrapper {
-    flex-wrap: wrap;
+    grid-template-columns: 1fr;
   }
 }
 </style>

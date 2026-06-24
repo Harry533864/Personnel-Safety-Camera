@@ -1,18 +1,18 @@
 # Personnel Safety Camera
 
-Vue + Flask edge camera platform for the Jetson deployment branch.
+Vue + Flask edge camera platform for the Orin nano 8GB deployment branch.
 
 ## Branches
 
-- `jetson`: Jetson Orin Nano deployment.
+- `orin-nano-8gb`: Orin nano 8GB deployment.
 - `baumer`: Baumer smart camera adaptation.
 
 ## Fresh Jetson Setup
 
-Clone the Jetson branch:
+Clone the Orin nano 8GB branch:
 
 ```bash
-git clone -b jetson https://github.com/Harry533864/Personnel-Safety-Camera.git
+git clone -b orin-nano-8gb https://github.com/Harry533864/Personnel-Safety-Camera.git
 cd Personnel-Safety-Camera
 ```
 
@@ -50,6 +50,13 @@ USB_CAMERA_DEVICE=/dev/video0 \
 USB_CAMERA_WIDTH=1920 USB_CAMERA_HEIGHT=1080 USB_CAMERA_FPS=60 \
 RUN_NOW=1 bash scripts/bootstrap_jetson.sh
 
+# Keep 5MP capture/AI internally, but publish a lower-cost frontend preview.
+CAMERA_SOURCE=usb \
+USB_CAMERA_DEVICE=/dev/video1 \
+USB_CAMERA_WIDTH=2592 USB_CAMERA_HEIGHT=1944 USB_CAMERA_FPS=50 \
+STREAM_HIGH_WIDTH=1280 STREAM_HIGH_HEIGHT=960 STREAM_HIGH_FPS=27 \
+RUN_NOW=1 bash scripts/bootstrap_jetson.sh
+
 # Jetson CSI / Argus profile, suitable for a single IMX219 on sensor-id 0.
 CAMERA_SOURCE=csi \
 CSI_SENSOR_ID=0 \
@@ -79,6 +86,16 @@ Install systemd services so the backend and MediaMTX start on power-up:
 INSTALL_SYSTEMD=1 bash scripts/bootstrap_jetson.sh
 ```
 
+Apply factory defaults for the Orin nano 8GB device:
+
+```bash
+sudo RUN_USER=wanan bash scripts/configure_orin_nano_defaults.sh
+```
+
+The default profile sets the device name to `Orin nano 8GB`, configures the
+wired LAN interface as `192.168.1.160/24`, disables desktop USB media popups,
+and enables backend auto-start services.
+
 Useful service commands:
 
 ```bash
@@ -90,7 +107,7 @@ journalctl -u asv-backend -f
 
 ```bash
 cd Personnel-Safety-Camera
-git checkout jetson
+git checkout orin-nano-8gb
 git pull
 bash scripts/bootstrap_jetson.sh
 sudo systemctl restart asv-mediamtx asv-backend

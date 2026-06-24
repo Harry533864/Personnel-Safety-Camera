@@ -6,6 +6,29 @@ from app.utils import to_bool
 
 MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 STREAM_TARGETS = {"high", "low", "all"}
+SERIAL_ALARM_CHANNELS = {"red", "yellow", "green", "buzzer"}
+SERIAL_ALARM_STATES = {
+    "off",
+    "close",
+    "false",
+    "0",
+    "on",
+    "open",
+    "true",
+    "1",
+    "blink2hz",
+    "tweet2hz",
+    "2hz",
+    "blink1hz",
+    "tweet1hz",
+    "1hz",
+    "blink0_5hz",
+    "tweet0_5hz",
+    "0.5hz",
+    "blink0_25hz",
+    "tweet0_25hz",
+    "0.25hz",
+}
 
 
 def validate_model_name(value):
@@ -169,6 +192,51 @@ def _validate_exception_output(cfg):
 
     if "duration" in exception_output:
         _number(exception_output["duration"], "exception_output.duration", 0, 86400)
+
+    if "serial" in exception_output:
+        _validate_exception_serial_output(exception_output["serial"])
+
+
+def _validate_exception_serial_output(serial_cfg):
+    serial_cfg = _ensure_dict(serial_cfg, "exception_output.serial")
+
+    if "enabled" in serial_cfg:
+        to_bool(serial_cfg["enabled"])
+
+    if "type" in serial_cfg:
+        device_type = str(serial_cfg["type"] or "").strip().lower()
+        if device_type not in {"ysl301", "ysl101", ""}:
+            raise ValueError("exception_output.serial.type must be ysl301 or ysl101")
+
+    if "port" in serial_cfg and not str(serial_cfg["port"] or "").strip():
+        raise ValueError("exception_output.serial.port cannot be empty")
+
+    if "baudrate" in serial_cfg:
+        _int(serial_cfg["baudrate"], "exception_output.serial.baudrate", 300, 921600)
+
+    if "address" in serial_cfg:
+        _int(serial_cfg["address"], "exception_output.serial.address", 1, 255)
+
+    for field in ("timeout", "write_timeout", "writeTimeout", "command_delay", "commandDelay"):
+        if field in serial_cfg:
+            _number(serial_cfg[field], f"exception_output.serial.{field}", 0, 60)
+
+    for pattern_name in ("alarm", "warning", "safe", "idle"):
+        pattern = serial_cfg.get(pattern_name)
+        if pattern is None:
+            continue
+        pattern = _ensure_dict(pattern, f"exception_output.serial.{pattern_name}")
+        for channel, state in pattern.items():
+            channel_key = str(channel).strip().lower()
+            if channel_key not in SERIAL_ALARM_CHANNELS:
+                raise ValueError(
+                    f"exception_output.serial.{pattern_name}.{channel} is not a supported channel"
+                )
+            state_key = str(state).strip().lower().replace("-", "_")
+            if state_key not in SERIAL_ALARM_STATES:
+                raise ValueError(
+                    f"exception_output.serial.{pattern_name}.{channel} is not a supported state"
+                )
 
 
 def _validate_record(cfg):

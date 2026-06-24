@@ -2,16 +2,143 @@ import { defineStore } from 'pinia'
 
 // 从环境变量中获取后端路由ip
 const JETSON_ENDPOINT_STORAGE_KEY = 'jetson_runtime_endpoint'
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
 
-const getApiUrl = () => {
+const normalizeBaseUrl = (value) => String(value || '').trim().replace(/\/+$/, '')
+
+const getUrlHost = (value) => {
   try {
-    const saved = JSON.parse(localStorage.getItem(JETSON_ENDPOINT_STORAGE_KEY) || 'null')
-    if (saved?.api && new URL(saved.api).hostname === '10.10.10.2') return saved.api
+    return new URL(value).hostname
   } catch {
-    // Ignore malformed localStorage data and use the configured fallback.
+    return ''
+  }
+}
+
+const isLocalApiUrl = (value) => LOCAL_HOSTS.has(getUrlHost(value))
+
+const getStoredEndpoint = () => {
+  try {
+    return JSON.parse(localStorage.getItem(JETSON_ENDPOINT_STORAGE_KEY) || 'null')
+  } catch {
+    return null
+  }
+}
+
+const pushUniqueUrl = (items, value) => {
+  const normalized = normalizeBaseUrl(value)
+  if (normalized && !items.includes(normalized)) {
+    items.push(normalized)
+  }
+}
+
+export const getApiUrl = () => {
+  const configured = normalizeBaseUrl(import.meta.env.VITE_FLASK_BACKEND_URL)
+  const configuredIsJetson = configured && !isLocalApiUrl(configured)
+  if (configuredIsJetson) {
+    return configured
   }
 
-  return import.meta.env.VITE_FLASK_BACKEND_URL
+  const saved = getStoredEndpoint()
+  const savedApi = normalizeBaseUrl(saved?.api)
+
+  if (savedApi) {
+    const savedIsLocal = isLocalApiUrl(savedApi)
+    if (!savedIsLocal) {
+      return savedApi
+    }
+  }
+
+  return configured
+}
+
+export const getApiUrlCandidates = () => {
+  const urls = []
+  pushUniqueUrl(urls, getApiUrl())
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const { protocol, hostname } = window.location
+    if (protocol === 'http:' || protocol === 'https:') {
+      pushUniqueUrl(urls, `${protocol}//${hostname}:5000`)
+    }
+
+    if (['localhost', '127.0.0.1', '::1'].includes(hostname)) {
+      pushUniqueUrl(urls, 'http://127.0.0.1:5000')
+      pushUniqueUrl(urls, 'http://localhost:5000')
+    }
+  }
+
+  return urls
+}
+
+export const getHardwareApiUrlCandidates = () => {
+  const urls = []
+  const saved = getStoredEndpoint()
+  const configured = normalizeBaseUrl(import.meta.env.VITE_FLASK_BACKEND_URL)
+  const configuredIsJetson = configured && !isLocalApiUrl(configured)
+
+  pushUniqueUrl(urls, configured)
+
+  if (
+    !configuredIsJetson
+    &&
+    saved?.api
+    && !isLocalApiUrl(saved.api)
+  ) {
+    pushUniqueUrl(urls, saved.api)
+  }
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const { protocol, hostname } = window.location
+    if (!LOCAL_HOSTS.has(hostname) && (protocol === 'http:' || protocol === 'https:')) {
+      pushUniqueUrl(urls, `${protocol}//${hostname}:5000`)
+    }
+  }
+
+  return urls.length ? urls : getApiUrlCandidates()
+}
+
+export const rememberApiUrl = (api, options = {}) => {
+  if (typeof localStorage === 'undefined') return
+  if (options.hardware && isLocalApiUrl(api)) return
+
+  try {
+    const saved = getStoredEndpoint() || {}
+    localStorage.setItem(
+      JETSON_ENDPOINT_STORAGE_KEY,
+      JSON.stringify({
+        ...saved,
+        api: normalizeBaseUrl(api),
+      })
+    )
+  } catch {
+    localStorage.setItem(
+      JETSON_ENDPOINT_STORAGE_KEY,
+      JSON.stringify({ api: normalizeBaseUrl(api) })
+    )
+  }
+}
+
+const fetchJsonFromApiCandidates = async (path, options = {}, candidates = getApiUrlCandidates()) => {
+  const failures = []
+
+  for (const baseUrl of candidates) {
+    try {
+      const response = await fetch(`${baseUrl}${path}`, options)
+      const text = await response.text()
+      const data = text ? JSON.parse(text) : {}
+
+      if (!response.ok) {
+        throw new Error(data.message || `HTTP ${response.status}`)
+      }
+
+      rememberApiUrl(baseUrl, { hardware: !isLocalApiUrl(baseUrl) })
+      return { response, data, baseUrl }
+    } catch (error) {
+      failures.push(`${baseUrl}: ${error.message}`)
+    }
+  }
+
+  throw new Error(failures.join('; ') || 'Failed to fetch')
 }
 
 export function sleep(ms) {
@@ -33,14 +160,19 @@ const STORAGE_KEY_EXCEPTION_OUTPUT = 'exception_output_settings'
 const STORAGE_KEY_EXCEPTION_OUTPUT_STATE = 'exception_output_save_result'
 
 const cloneValue = (value) => JSON.parse(JSON.stringify(value))
+const DEFAULT_ROI_RESOLUTION = '1920x1080'
+
+const isResolutionKey = (value) => /^\d+x\d+$/.test(String(value || ''))
+
+const normalizeResolutionKey = (value) => (
+  isResolutionKey(value) ? String(value) : DEFAULT_ROI_RESOLUTION
+)
 
 const normalizeDetectionRegionData = (raw) => {
   const defaults = {
-    currentTarget: 'all',
+    currentTarget: DEFAULT_ROI_RESOLUTION,
     byTarget: {
-      all: [],
-      high: [],
-      low: [],
+      [DEFAULT_ROI_RESOLUTION]: [],
     },
   }
 
@@ -50,22 +182,28 @@ const normalizeDetectionRegionData = (raw) => {
 
   if (Array.isArray(raw)) {
     return {
-      currentTarget: 'all',
+      currentTarget: DEFAULT_ROI_RESOLUTION,
       byTarget: {
-        all: cloneValue(raw),
-        high: [],
-        low: [],
+        [DEFAULT_ROI_RESOLUTION]: cloneValue(raw),
       },
     }
   }
 
+  const sourceProfiles = raw.byResolution || raw.byTarget || {}
+  const byTarget = {}
+  Object.entries(sourceProfiles).forEach(([key, regions]) => {
+    if (Array.isArray(regions)) {
+      byTarget[normalizeResolutionKey(key)] = cloneValue(regions)
+    }
+  })
+
+  if (Array.isArray(raw.byTarget?.all) && !byTarget[DEFAULT_ROI_RESOLUTION]?.length) {
+    byTarget[DEFAULT_ROI_RESOLUTION] = cloneValue(raw.byTarget.all)
+  }
+
   return {
-    currentTarget: raw.currentTarget || 'all',
-    byTarget: {
-      all: Array.isArray(raw.byTarget?.all) ? cloneValue(raw.byTarget.all) : [],
-      high: Array.isArray(raw.byTarget?.high) ? cloneValue(raw.byTarget.high) : [],
-      low: Array.isArray(raw.byTarget?.low) ? cloneValue(raw.byTarget.low) : [],
-    },
+    currentTarget: normalizeResolutionKey(raw.currentTarget),
+    byTarget: Object.keys(byTarget).length ? byTarget : cloneValue(defaults.byTarget),
   }
 }
 
@@ -95,112 +233,260 @@ const clearStorage = () => {
 const CAMERA_DEFAULTS = {
   resolution: '1920x1080',
   exposure: '0',
+  gain: '0',
+  whiteBalance: 'continuous',
+  powerLineFrequency: '1',
   fps: '60',
   target: 'high',
 }
 
+const normalizeCameraSettings = (raw = {}) => {
+  const whiteBalance = raw.whiteBalance || raw.white_balance || CAMERA_DEFAULTS.whiteBalance
+  const powerLineFrequency = raw.powerLineFrequency
+    ?? raw.power_line_frequency
+    ?? CAMERA_DEFAULTS.powerLineFrequency
+
+  return {
+    resolution: String(raw.resolution || CAMERA_DEFAULTS.resolution).replace(/\s+/g, ''),
+    exposure: String(raw.exposure ?? CAMERA_DEFAULTS.exposure),
+    gain: String(raw.gain ?? CAMERA_DEFAULTS.gain),
+    whiteBalance: String(whiteBalance || CAMERA_DEFAULTS.whiteBalance),
+    powerLineFrequency: String(powerLineFrequency ?? CAMERA_DEFAULTS.powerLineFrequency),
+    fps: String(raw.fps ?? CAMERA_DEFAULTS.fps),
+    target: String(raw.target || CAMERA_DEFAULTS.target),
+  }
+}
+
 export const useCameraSettingStore = defineStore('cameraSetting', {
   state: () => ({
-    settings: loadFromStorage(STORAGE_KEY_CAMERA, CAMERA_DEFAULTS),
+    settings: normalizeCameraSettings(loadFromStorage(STORAGE_KEY_CAMERA, CAMERA_DEFAULTS)),
     lastSaveResult: loadFromStorage(STORAGE_KEY_CAMERA_STATE, { unset: true }),
   }),
   actions: {
+    async fetchSettings() {
+      try {
+        const response = await fetch(`${getApiUrl()}/api/stream/config`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+        })
+        const data = await response.json()
+        if (!response.ok || data.status !== 'success') {
+          throw new Error(data.message || `HTTP ${response.status}`)
+        }
+        this.settings = normalizeCameraSettings(data.data || {})
+        saveToStorage(STORAGE_KEY_CAMERA, this.settings)
+        return { ...this.settings }
+      } catch (error) {
+        this.lastSaveResult = { success: false, message: error.message }
+        saveToStorage(STORAGE_KEY_CAMERA_STATE, this.lastSaveResult)
+        return { ...this.settings }
+      }
+    },
     async saveSettings(settings) {
       // 用临时对象记录本次实际要保存的值，失败回滚为旧值
-      const finalSettings = { ...settings }
+      const previousSettings = normalizeCameraSettings(this.settings)
+      const nextSettings = normalizeCameraSettings(settings)
+      const finalSettings = { ...nextSettings }
       const messages = []
       let exposureSuccess = true
+      let gainSuccess = true
+      let whiteBalanceSuccess = true
+      let powerLineSuccess = true
       let resolutionSuccess = true
       let fpsSuccess = true
 
       try {
-        if (settings.exposure !== this.settings.exposure) {
+        if (nextSettings.exposure !== previousSettings.exposure) {
           console.log("设置曝光...")
           try {
             const response = await fetch(`${getApiUrl()}/api/stream/exposure`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                value: parseInt(settings.exposure),
-                target: settings.target || CAMERA_DEFAULTS.target
+                value: parseInt(nextSettings.exposure),
+                target: nextSettings.target || CAMERA_DEFAULTS.target
               }),
             })
             const data = await response.json()
             if (data.status === 'success') {
-              // 成功，保留新值
+              finalSettings.exposure = String(data.data?.exposure ?? nextSettings.exposure)
             } else {
               throw new Error(data.message || '曝光设置失败')
             }
           } catch (err) {
             // 接口异常或业务失败，回滚曝光值
-            finalSettings.exposure = this.settings.exposure
+            finalSettings.exposure = previousSettings.exposure
             exposureSuccess = false
             messages.push(`曝光设置失败: ${err.message}`)
           }
         }
 
-        // ---- 处理分辨率 ----
-        if (settings.resolution !== this.settings.resolution) {
+        if (nextSettings.gain !== previousSettings.gain) {
+          console.log("设置增益...")
+          try {
+            const response = await fetch(`${getApiUrl()}/api/stream/gain`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                value: parseInt(nextSettings.gain),
+                target: nextSettings.target || CAMERA_DEFAULTS.target
+              }),
+            })
+            const data = await response.json()
+            if (data.status === 'success') {
+              finalSettings.gain = String(data.data?.gain ?? nextSettings.gain)
+            } else {
+              throw new Error(data.message || '增益设置失败')
+            }
+          } catch (err) {
+            finalSettings.gain = previousSettings.gain
+            gainSuccess = false
+            messages.push(`增益设置失败: ${err.message}`)
+          }
+        }
+
+        if (nextSettings.whiteBalance !== previousSettings.whiteBalance) {
+          console.log("设置白平衡...")
+          try {
+            const response = await fetch(`${getApiUrl()}/api/stream/white_balance`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                mode: nextSettings.whiteBalance || CAMERA_DEFAULTS.whiteBalance,
+                target: nextSettings.target || CAMERA_DEFAULTS.target
+              }),
+            })
+            const data = await response.json()
+            if (data.status === 'success') {
+              finalSettings.whiteBalance = String(data.data?.mode ?? nextSettings.whiteBalance)
+            } else {
+              throw new Error(data.message || '白平衡设置失败')
+            }
+          } catch (err) {
+            finalSettings.whiteBalance = previousSettings.whiteBalance
+            whiteBalanceSuccess = false
+            messages.push(`白平衡设置失败: ${err.message}`)
+          }
+        }
+
+        if (nextSettings.powerLineFrequency !== previousSettings.powerLineFrequency) {
+          console.log("设置抗频闪...")
+          try {
+            const response = await fetch(`${getApiUrl()}/api/stream/power_line_frequency`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                value: parseInt(nextSettings.powerLineFrequency),
+                target: nextSettings.target || CAMERA_DEFAULTS.target
+              }),
+            })
+            const data = await response.json()
+            if (data.status === 'success') {
+              finalSettings.powerLineFrequency = String(
+                data.data?.power_line_frequency ?? nextSettings.powerLineFrequency
+              )
+            } else {
+              throw new Error(data.message || '抗频闪设置失败')
+            }
+          } catch (err) {
+            finalSettings.powerLineFrequency = previousSettings.powerLineFrequency
+            powerLineSuccess = false
+            messages.push(`抗频闪设置失败: ${err.message}`)
+          }
+        }
+
+        const setResolution = async () => {
           console.log("设置分辨率...")
           try {
-            const [width, height] = settings.resolution.split('x').map(Number)
+            const [width, height] = nextSettings.resolution.split('x').map(Number)
             const response = await fetch(`${getApiUrl()}/api/stream/resolution`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 width,
                 height,
-                target: settings.target
+                target: nextSettings.target
               }),
             })
             const data = await response.json()
             if (data.status === 'success') {
-              // 成功，保留新值
+              if (data.data?.fps) {
+                finalSettings.fps = String(data.data.fps)
+              }
+              if (data.data?.width && data.data?.height) {
+                finalSettings.resolution = `${data.data.width}x${data.data.height}`
+              }
             } else {
               throw new Error(data.message || '分辨率设置失败')
             }
           } catch (err) {
             // 回滚分辨率
-            finalSettings.resolution = this.settings.resolution
+            finalSettings.resolution = previousSettings.resolution
             resolutionSuccess = false
             messages.push(`分辨率设置失败: ${err.message}`)
           }
         }
 
-        // ---- 处理帧率 ----
-        if (settings.fps !== this.settings.fps) {
+        const setFps = async () => {
           console.log("设置帧率...")
           try {
             const response = await fetch(`${getApiUrl()}/api/stream/fps`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                value: parseInt(settings.fps),
-                target: settings.target || CAMERA_DEFAULTS.target
+                value: parseInt(nextSettings.fps),
+                target: nextSettings.target || CAMERA_DEFAULTS.target
               }),
             })
             const data = await response.json()
             if (data.status === 'success') {
-              // 成功，保留新值
+              if (data.data?.fps) {
+                finalSettings.fps = String(data.data.fps)
+              }
             } else {
               throw new Error(data.message || '帧率设置失败')
             }
           } catch (err) {
-            // 接口异常或业务失败，回滚曝光值
-            finalSettings.fps = this.settings.fps
+            // 接口异常或业务失败，回滚帧率值
+            finalSettings.fps = previousSettings.fps
             fpsSuccess = false
             messages.push(`帧率设置失败: ${err.message}`)
           }
         }
 
+        // ---- 处理分辨率 / 帧率 ----
+        const resolutionChanged = nextSettings.resolution !== previousSettings.resolution
+        const fpsChanged = nextSettings.fps !== previousSettings.fps
+        const currentFps = parseInt(previousSettings.fps)
+        const nextFps = parseInt(nextSettings.fps)
+
+        // 从高帧率切到高像素时，先降帧再切分辨率，避免临时组合超出相机能力。
+        if (fpsChanged && nextFps < currentFps) {
+          await setFps()
+        }
+
+        if (resolutionChanged) {
+          await setResolution()
+        }
+
+        if (fpsChanged && nextFps >= currentFps) {
+          await setFps()
+        }
+
         // ---- 更新 store 和持久化 ----
-        const allSuccess = exposureSuccess && resolutionSuccess && fpsSuccess
+        const allSuccess = exposureSuccess
+          && gainSuccess
+          && whiteBalanceSuccess
+          && powerLineSuccess
+          && resolutionSuccess
+          && fpsSuccess
         if (allSuccess) {
           // 全部成功：完全替换 settings
-          this.settings = { ...finalSettings }
+          this.settings = normalizeCameraSettings(finalSettings)
         } else {
           // 部分成功：只写入成功的字段（失败的已回滚为旧值）
-          this.settings = { ...finalSettings }
+          this.settings = normalizeCameraSettings(finalSettings)
         }
 
         saveToStorage(STORAGE_KEY_CAMERA, this.settings)
@@ -218,7 +504,7 @@ export const useCameraSettingStore = defineStore('cameraSetting', {
       }
     },
     getSettings() {
-      return { ...this.settings }
+      return normalizeCameraSettings(this.settings)
     },
     getState() {
       return { ...this.lastSaveResult }
@@ -500,11 +786,9 @@ export const useExceptionOutputStore = defineStore('exceptionOutput', {
 
 // ========== 检测区域 ==========
 const DETECTION_REGION_DEFAULTS = {
-  currentTarget: 'all',
+  currentTarget: DEFAULT_ROI_RESOLUTION,
   byTarget: {
-    all: [(0, 0), (1280, 720)],
-    high: [],
-    low: [],
+    [DEFAULT_ROI_RESOLUTION]: [],
   },
 }
 
@@ -518,37 +802,38 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
   actions: {
     async fetchRegions() {
       try {
-        const response = await fetch(`${getApiUrl()}/api/detection/fetch_regions`, {
+        const { data } = await fetchJsonFromApiCandidates('/api/detection/fetch_regions', {
           method: 'GET',
           headers: { 'Content-Type': 'application/json' },
-        })
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
-        }
-
-        const data = await response.json()
+        }, getHardwareApiUrlCandidates())
         const rois = Array.isArray(data?.rois)
           ? data.rois
           : (Array.isArray(data?.config?.rois) ? data.config.rois : [])
+        const profiles = data?.rois_by_resolution && typeof data.rois_by_resolution === 'object'
+          ? data.rois_by_resolution
+          : {}
+        const currentTarget = normalizeResolutionKey(
+          data?.selected_resolution || data?.active_resolution || this.data.currentTarget
+        )
 
         const nextData = {
-          currentTarget: this.data.currentTarget || 'all',
-          byTarget: {
-            all: [],
-            high: [],
-            low: [],
-          },
+          currentTarget,
+          byTarget: {},
         }
 
-        rois.forEach((roi) => {
-          const target = ['all', 'high', 'low'].includes(roi?.target) ? roi.target : 'all'
-          nextData.byTarget[target].push(cloneValue(roi))
+        Object.entries(profiles).forEach(([key, value]) => {
+          if (Array.isArray(value)) {
+            nextData.byTarget[normalizeResolutionKey(key)] = cloneValue(value)
+          }
         })
+
+        if (!nextData.byTarget[currentTarget]) {
+          nextData.byTarget[currentTarget] = cloneValue(rois)
+        }
 
         this.data = nextData
         saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
-        return cloneValue(rois)
+        return cloneValue(this.data.byTarget[currentTarget] || [])
       } catch (error) {
         this.lastSaveResult = { success: false, message: error.message }
         saveToStorage(STORAGE_KEY_DETECTION_REGION_STATE, this.lastSaveResult)
@@ -556,28 +841,24 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
       }
     },
     async saveRegions(rois, options = {}) {
-      const target = options.target || this.data.currentTarget || 'all'
+      const target = normalizeResolutionKey(options.target || this.data.currentTarget)
       const clear = Boolean(options.clear)
 
       try {
-        const response = await fetch(`${getApiUrl()}/api/detection/save_regions`, {
+        const { data } = await fetchJsonFromApiCandidates('/api/detection/save_regions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            target,
+            resolution_key: target,
             clear,
             rois: clear ? [] : cloneValue(rois),
           }),
-        })
-
-        const data = await response.json()
-        if (!response.ok) {
-          throw new Error(data.message || `HTTP ${response.status}`)
-        }
+        }, getHardwareApiUrlCandidates())
 
         if (data.status === 'success') {
-          this.data.currentTarget = target
-          this.data.byTarget[target] = clear ? [] : cloneValue(rois)
+          const savedTarget = normalizeResolutionKey(data?.data?.resolution_key || target)
+          this.data.currentTarget = savedTarget
+          this.data.byTarget[savedTarget] = clear ? [] : cloneValue(rois)
           saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
           this.lastSaveResult = { success: true, message: data.message || '保存成功' }
           saveToStorage(STORAGE_KEY_DETECTION_REGION_STATE, this.lastSaveResult)
@@ -595,13 +876,13 @@ export const useDetectionRegionStore = defineStore('detectionRegion', {
       return this.saveRegions([], { ...options, clear: true })
     },
     getRegions(target = this.data.currentTarget || 'all') {
-      return cloneValue(this.data.byTarget[target] || [])
+      return cloneValue(this.data.byTarget[normalizeResolutionKey(target)] || [])
     },
     getCurrentTarget() {
-      return this.data.currentTarget || 'all'
+      return normalizeResolutionKey(this.data.currentTarget)
     },
     setCurrentTarget(target) {
-      this.data.currentTarget = target || 'all'
+      this.data.currentTarget = normalizeResolutionKey(target)
       saveToStorage(STORAGE_KEY_DETECTION_REGION, this.data)
     },
     getState() {

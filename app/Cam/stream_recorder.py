@@ -165,7 +165,7 @@ class StreamRecorder:
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
         file_path = video_dir / f"{timestamp_str}.mkv"
         bitrate = int(self.bitrate_fn(current_w, current_h, current_fps))
-        encoder = StreamPublisher._select_encoder()
+        encoder = StreamPublisher._encoder_candidates()[0]
 
         base = (
             f"appsrc is-live=true block=false format=time do-timestamp=true "

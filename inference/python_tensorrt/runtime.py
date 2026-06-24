@@ -28,6 +28,7 @@ class Detection:
     center: Tuple[float, float] = (0.0, 0.0)
     foot_point: Tuple[float, float] = (0.0, 0.0)
     roi_hits: List[Dict[str, Any]] = field(default_factory=list)
+    roi_contacts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -48,10 +49,15 @@ class ZoneStatus:
     roi_name: str
     roi_type: str
     person_count: int = 0
+    warning_count: int = 0
     raw_active: bool = False
+    raw_warning: bool = False
     stable_active: bool = False
+    stable_warning: bool = False
     enter_counter: int = 0
     exit_counter: int = 0
+    warning_enter_counter: int = 0
+    warning_exit_counter: int = 0
 
 
 @dataclass
@@ -93,7 +99,7 @@ class InferenceConfig:
 
 @dataclass
 class CameraInferResult:
-    image: np.ndarray
+    image: np.ndarray | None
     alarm: bool = False
     warning: bool = False
     system_state: SystemState = SystemState.SAFE
@@ -158,15 +164,18 @@ class ROIManager:
     def apply(self, detections: List[Detection], image_shape: Tuple[int, ...]) -> List[Detection]:
         for detection in detections:
             hits: List[Dict[str, Any]] = []
+            contacts: List[Dict[str, Any]] = []
             for roi in self.roi_rules:
                 polygon = self.resolve_polygon(roi, image_shape)
+                overlap_ratio = self.bbox_overlap_ratio(detection.bbox, roi, image_shape)
+                overlap_thres = max(0.0, float(roi.overlap_thres))
                 inside = False
                 if roi.judge_method == "foot_point":
                     inside = self.point_in_polygon(detection.foot_point, polygon)
                 elif roi.judge_method == "center_point":
                     inside = self.point_in_polygon(detection.center, polygon)
                 elif roi.judge_method == "overlap":
-                    inside = self.bbox_overlap_ratio(detection.bbox, roi, image_shape) >= roi.overlap_thres
+                    inside = overlap_ratio >= overlap_thres
 
                 if inside:
                     hits.append(
@@ -176,23 +185,49 @@ class ROIManager:
                             "roi_type": roi.roi_type,
                             "inside": True,
                             "method": roi.judge_method,
+                            "overlap_ratio": overlap_ratio,
+                            "overlap_thres": overlap_thres,
+                        }
+                    )
+                elif overlap_ratio > 0.0:
+                    contacts.append(
+                        {
+                            "roi_id": roi.roi_id,
+                            "roi_name": roi.name,
+                            "roi_type": roi.roi_type,
+                            "inside": False,
+                            "method": roi.judge_method,
+                            "overlap_ratio": overlap_ratio,
+                            "overlap_thres": overlap_thres,
                         }
                     )
             detection.roi_hits = hits
+            detection.roi_contacts = contacts
         return detections
 
-    def draw_rois(self, image: np.ndarray) -> None:
+    @staticmethod
+    def _roi_display_color(roi: ROIRule, zone_by_id: Dict[str, ZoneStatus]) -> Tuple[int, int, int]:
+        zone = zone_by_id.get(roi.roi_id)
+        if zone is None:
+            return (0, 255, 0)
+        if int(getattr(zone, "person_count", 0)) > 0:
+            if roi.roi_type == "warning_zone":
+                return (0, 255, 255)
+            return (0, 0, 255)
+        if int(getattr(zone, "warning_count", 0)) > 0:
+            return (0, 255, 255)
+        return (0, 255, 0)
+
+    def draw_rois(self, image: np.ndarray, zone_summary: Sequence[ZoneStatus] | None = None) -> None:
+        zone_by_id = {
+            zone.roi_id: zone
+            for zone in (zone_summary or [])
+        }
         for roi in self.roi_rules:
             polygon = self.resolve_polygon(roi, image.shape)
             if len(polygon) < 3:
                 continue
-            color = (
-                (0, 0, 255)
-                if roi.roi_type == "forbidden_zone"
-                else (0, 255, 255)
-                if roi.roi_type == "warning_zone"
-                else (0, 255, 0)
-            )
+            color = self._roi_display_color(roi, zone_by_id)
             polygon_np = np.array(polygon, dtype=np.int32)
             cv2.polylines(image, [polygon_np], True, color, 2)
             cv2.putText(image, roi.name, polygon[0], cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
@@ -210,6 +245,7 @@ class AlarmLogic:
     def update_zone_counts(self, detections: Sequence[Detection]) -> None:
         for zone in self.zone_status:
             zone.person_count = 0
+            zone.warning_count = 0
 
         for detection in detections:
             for hit in detection.roi_hits:
@@ -217,9 +253,15 @@ class AlarmLogic:
                     if zone.roi_id == hit["roi_id"]:
                         zone.person_count += 1
                         break
+            for contact in getattr(detection, "roi_contacts", []) or []:
+                for zone in self.zone_status:
+                    if zone.roi_id == contact["roi_id"]:
+                        zone.warning_count += 1
+                        break
 
         for zone in self.zone_status:
             zone.raw_active = zone.person_count > 0
+            zone.raw_warning = (not zone.raw_active) and zone.warning_count > 0
 
     def update_state_machine(self) -> None:
         for zone in self.zone_status:
@@ -228,11 +270,26 @@ class AlarmLogic:
                 zone.exit_counter = 0
                 if zone.enter_counter >= self.enter_frames:
                     zone.stable_active = True
+                zone.warning_enter_counter = 0
+                zone.warning_exit_counter += 1
+                if zone.warning_exit_counter >= self.exit_frames:
+                    zone.stable_warning = False
             else:
                 zone.exit_counter += 1
                 zone.enter_counter = 0
                 if zone.exit_counter >= self.exit_frames:
                     zone.stable_active = False
+
+                if zone.raw_warning:
+                    zone.warning_enter_counter += 1
+                    zone.warning_exit_counter = 0
+                    if zone.warning_enter_counter >= self.enter_frames:
+                        zone.stable_warning = True
+                else:
+                    zone.warning_exit_counter += 1
+                    zone.warning_enter_counter = 0
+                    if zone.warning_exit_counter >= self.exit_frames:
+                        zone.stable_warning = False
 
     def evaluate(self, detections: List[Detection], prestart_mode: bool = False) -> FrameResult:
         self.update_zone_counts(detections)
@@ -248,9 +305,10 @@ class AlarmLogic:
                 has_clear_zone = True
                 clear_active = clear_active or zone.stable_active
             elif zone.roi_type == "warning_zone":
-                warning_active = warning_active or zone.stable_active
+                warning_active = warning_active or zone.stable_active or zone.stable_warning
             elif zone.roi_type == "forbidden_zone":
                 forbidden_active = forbidden_active or zone.stable_active
+                warning_active = warning_active or zone.stable_warning
 
         clear_confirmed = has_clear_zone
         for zone in self.zone_status:
@@ -552,13 +610,12 @@ class CameraTensorRTInfer:
             )
         return rules
 
-    def infer(self, input_img: np.ndarray) -> CameraInferResult:
+    def infer(self, input_img: np.ndarray, render: bool = True) -> CameraInferResult:
         if input_img is None or input_img.size == 0:
             raise ValueError("Input image is empty")
 
-        frame = input_img.copy()
-        detections = self.detector.infer(frame)
-        detections = self.roi_manager.apply(detections, frame.shape)
+        detections = self.detector.infer(input_img)
+        detections = self.roi_manager.apply(detections, input_img.shape)
         person_detections = [
             detection
             for detection in detections
@@ -583,10 +640,14 @@ class CameraTensorRTInfer:
         elif task_warning and system_state == SystemState.SAFE:
             system_state = SystemState.WARNING
 
-        self._draw_result(frame, frame_result)
+        frame = None
+        if render:
+            frame = input_img.copy()
+            self._draw_result(frame, frame_result)
+
         return CameraInferResult(
             image=frame,
-            alarm=frame_result.warning or frame_result.alarm or task_alarm,
+            alarm=frame_result.alarm or task_alarm,
             warning=frame_result.warning or task_warning,
             system_state=system_state,
             has_target=len(frame_result.detections) > 0,
@@ -603,7 +664,7 @@ class CameraTensorRTInfer:
         return frame
 
     def _draw_result(self, frame: np.ndarray, frame_result: FrameResult) -> None:
-        self.roi_manager.draw_rois(frame)
+        self.roi_manager.draw_rois(frame, frame_result.zone_summary)
         for detection in frame_result.detections:
             x0, y0, x1, y1 = [int(round(v)) for v in detection.bbox]
             cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 0, 0), 2)

@@ -21,11 +21,15 @@
           <div class="panel-toolbar">
             <span>{{ `原视频分辨率：${sourceResolution.width} x ${sourceResolution.height}` }}</span>
             <div class="toolbar-actions">
-              <span class="toolbar-label">作用域：</span>
+              <span class="toolbar-label">ROI分辨率：</span>
               <select v-model="selectedTarget" class="target-select" :disabled="isSaving">
-                <option value="all">所有分支</option>
-                <option value="high">高分辨率分支</option>
-                <option value="low">低分辨率分支</option>
+                <option
+                  v-for="option in resolutionOptions"
+                  :key="option.value"
+                  :value="option.value"
+                >
+                  {{ option.label }}
+                </option>
               </select>
               <div class="draw-mode-tabs" role="group" aria-label="ROI draw mode">
                 <button
@@ -56,33 +60,40 @@
               muted
               playsinline
             ></video>
+            <img
+              ref="frameImageRef"
+              class="frame-image"
+              :class="{ visible: frameMode === 'mjpeg' }"
+              alt=""
+            />
             <canvas
               ref="canvasRef"
-              :width="CANVAS_WIDTH"
-              :height="CANVAS_HEIGHT"
-              @mousedown="beginDraw"
-              @mousemove="updateDraw"
-              @mouseup="finishDraw"
-              @click="addPolygonPoint"
-              @mouseleave="handleCanvasLeave"
+              :width="canvasWidth"
+              :height="canvasHeight"
+              @pointerdown="handleCanvasPointerDown"
+              @pointermove="handleCanvasPointerMove"
+              @pointerup="handleCanvasPointerUp"
+              @pointercancel="handleCanvasPointerCancel"
+              @pointerleave="handleCanvasPointerLeave"
             />
           </div>
 
           <div class="button-row">
-            <button class="primary-btn" @click="addDetectionRegions" :disabled="isSaving">
+            <button type="button" class="primary-btn" @click="addDetectionRegions" :disabled="isSaving">
               {{ isSaving ? "提交中..." : "添加检测区域" }}
             </button>
-            <button class="secondary-btn" @click="cancelCurrentBoxes" :disabled="isSaving">
+            <button type="button" class="secondary-btn" @click="cancelCurrentBoxes" :disabled="isSaving">
               取消当前框
             </button>
             <button
+              type="button"
               class="secondary-btn"
               @click="finishPolygon"
               :disabled="isSaving || drawMode !== 'polygon' || draftPolygon.length < MIN_POLYGON_POINTS"
             >
               完成多边形
             </button>
-            <button class="danger-btn" @click="openConfirmClear" :disabled="isSaving">
+            <button type="button" class="danger-btn" @click="clearAllRegions" :disabled="isSaving">
               清除所有检测区域
             </button>
           </div>
@@ -125,6 +136,31 @@
             <h3>保存状态</h3>
             <p class="status-text" :class="saveStatusClass">{{ saveStatusText }}</p>
           </div>
+
+          <div class="info-card manual-output-card">
+            <h3>手动声光</h3>
+            <div class="manual-output-grid">
+              <button
+                v-for="item in manualOutputButtons"
+                :key="item.channel"
+                type="button"
+                class="manual-output-btn"
+                :class="[item.channel, { active: manualOutputs[item.channel] }]"
+                :aria-pressed="manualOutputs[item.channel]"
+                @pointerdown="pressManualOutput(item.channel, $event)"
+                @pointerup="releaseManualOutput(item.channel, $event)"
+                @pointercancel="releaseManualOutput(item.channel, $event)"
+                @lostpointercapture="releaseManualOutput(item.channel, $event)"
+                @contextmenu.prevent
+              >
+                <span class="manual-output-dot"></span>
+                <span>{{ item.label }}</span>
+              </button>
+            </div>
+            <p class="manual-output-status" :class="{ error: manualOutputError }">
+              {{ manualOutputStatus }}
+            </p>
+          </div>
         </aside>
       </div>
     </div>
@@ -166,24 +202,53 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import {
+  getApiUrl,
+  getHardwareApiUrlCandidates,
+  rememberApiUrl,
   useCameraSettingStore,
   useDetectionSettingStore,
   useDetectionRegionStore,
 } from "@/stores/settingsStore";
 
-const CANVAS_WIDTH = 960;
-const CANVAS_HEIGHT = 540;
+const CANVAS_BASE_WIDTH = 960;
+const CANVAS_DEFAULT_HEIGHT = 540;
 const MAX_REGIONS = 3;
 const MIN_RECT_SIZE = 10;
 const MIN_POLYGON_POINTS = 3;
 const POLYGON_CLOSE_DISTANCE = 14;
-const STREAM_URL = import.meta.env.VITE_VIDEO_STREAM_URL;
-const MEDIAMTX_WHEP_URL = `${STREAM_URL}/cam_high/whep`;
+const MJPEG_PREVIEW_FPS = 15;
+const MJPEG_PREVIEW_QUALITY = 70;
+const MJPEG_PREVIEW_MAX_WIDTH = 1280;
+const MANUAL_OUTPUT_HEARTBEAT_MS = 1000;
+const MANUAL_OUTPUT_API_TIMEOUT_MS = 6000;
+const resolutionOptions = [
+  { value: "2592x1944", label: "2592 x 1944（500万）", maxFps: 30 },
+  { value: "2048x1536", label: "2048 x 1536（300万）", maxFps: 30 },
+  { value: "2592x1440", label: "2592 x 1440（宽幅高清）", maxFps: 30 },
+  { value: "2304x1296", label: "2304 x 1296（300万宽幅）", maxFps: 30 },
+  { value: "1920x1080", label: "1920 x 1080（200万）", maxFps: 60 },
+  { value: "1600x900", label: "1600 x 900", maxFps: 60 },
+  { value: "1280x720", label: "1280 x 720", maxFps: 60 },
+  { value: "1024x576", label: "1024 x 576", maxFps: 60 },
+  { value: "640x360", label: "640 x 360", maxFps: 60 },
+];
 const regionColors = {
   1: "#22c55e",
   2: "#3b82f6",
   3: "#f97316",
 };
+const MANUAL_OUTPUT_IDLE = {
+  red: false,
+  yellow: false,
+  green: false,
+  buzzer: false,
+};
+const manualOutputButtons = [
+  { channel: "red", label: "红灯" },
+  { channel: "yellow", label: "黄灯" },
+  { channel: "green", label: "绿灯" },
+  { channel: "buzzer", label: "蜂鸣器" },
+];
 
 const router = useRouter();
 const cameraSettingStore = useCameraSettingStore();
@@ -192,10 +257,13 @@ const detectionRegionStore = useDetectionRegionStore();
 
 const canvasRef = ref(null);
 const frameVideoRef = ref(null);
+const frameImageRef = ref(null);
+const frameSourceResolution = ref({ width: 0, height: 0 });
 const isDrawing = ref(false);
 const isSaving = ref(false);
 const frameLoaded = ref(false);
 const frameError = ref("");
+const frameMode = ref("none");
 const startPoint = ref({ x: 0, y: 0 });
 const draftRect = ref(null);
 const draftPolygon = ref([]);
@@ -204,8 +272,14 @@ const drawMode = ref("rect");
 const candidateRegions = ref([]);
 const committedRegions = ref([]);
 const successFeedback = ref("");
+const manualOutputs = ref({ ...MANUAL_OUTPUT_IDLE });
+const manualOutputError = ref("");
 let framePc = null;
 let frameRefreshTimer = null;
+let isInitializing = true;
+let manualOutputQueue = Promise.resolve();
+let manualOutputHeartbeatTimer = null;
+const activeManualPointers = new Map();
 
 const modalState = ref({
   visible: false,
@@ -223,15 +297,41 @@ const availableIds = computed(() => {
   return [1, 2, 3].filter((id) => !usedIds.has(id));
 });
 
-const selectedTarget = ref(detectionRegionStore.getCurrentTarget() || "all");
+function normalizeResolutionKey(value) {
+  return resolutionOptions.some((option) => option.value === value)
+    ? value
+    : "1920x1080";
+}
 
-const sourceResolution = computed(() => {
-  const value = cameraSettingStore.settings.resolution || "1920x1080";
+function getMaxFpsForResolution(value) {
+  return resolutionOptions.find((option) => option.value === value)?.maxFps || 60;
+}
+
+const selectedTarget = ref(normalizeResolutionKey(
+  cameraSettingStore.settings.resolution || detectionRegionStore.getCurrentTarget()
+));
+
+const savedSourceResolution = computed(() => {
+  const value = selectedTarget.value || cameraSettingStore.settings.resolution || "1920x1080";
   const [width, height] = value.split("x").map(Number);
   return {
     width: width || 1920,
     height: height || 1080,
   };
+});
+
+const sourceResolution = computed(() => {
+  if (frameSourceResolution.value.width > 0 && frameSourceResolution.value.height > 0) {
+    return frameSourceResolution.value;
+  }
+  return savedSourceResolution.value;
+});
+
+const canvasWidth = computed(() => CANVAS_BASE_WIDTH);
+const canvasHeight = computed(() => {
+  const { width, height } = sourceResolution.value;
+  if (!width || !height) return CANVAS_DEFAULT_HEIGHT;
+  return Math.round((CANVAS_BASE_WIDTH * height) / width);
 });
 
 const saveStatusText = computed(() => {
@@ -249,6 +349,16 @@ const saveStatusClass = computed(() => {
   const state = detectionRegionStore.getState();
   if (state.unset) return "status-muted";
   return state.success ? "status-success" : "status-error";
+});
+
+const manualOutputStatus = computed(() => {
+  if (manualOutputError.value) return manualOutputError.value;
+
+  const activeLabels = manualOutputButtons
+    .filter((item) => manualOutputs.value[item.channel])
+    .map((item) => item.label);
+
+  return activeLabels.length ? `${activeLabels.join("、")}输出中` : "全部关闭";
 });
 
 function clonePoint(point = {}) {
@@ -272,12 +382,14 @@ function clamp(value, min, max) {
 
 function getCanvasPoint(event) {
   const rect = canvasRef.value.getBoundingClientRect();
-  const scaleX = CANVAS_WIDTH / rect.width;
-  const scaleY = CANVAS_HEIGHT / rect.height;
+  const width = canvasWidth.value;
+  const height = canvasHeight.value;
+  const scaleX = width / rect.width;
+  const scaleY = height / rect.height;
 
   return {
-    x: clamp((event.clientX - rect.left) * scaleX, 0, CANVAS_WIDTH),
-    y: clamp((event.clientY - rect.top) * scaleY, 0, CANVAS_HEIGHT),
+    x: clamp((event.clientX - rect.left) * scaleX, 0, width),
+    y: clamp((event.clientY - rect.top) * scaleY, 0, height),
   };
 }
 
@@ -309,10 +421,10 @@ function pointsToRect(points = []) {
 
   const xs = validPoints.map((point) => point.x);
   const ys = validPoints.map((point) => point.y);
-  const minX = clamp(Math.min(...xs), 0, CANVAS_WIDTH);
-  const maxX = clamp(Math.max(...xs), 0, CANVAS_WIDTH);
-  const minY = clamp(Math.min(...ys), 0, CANVAS_HEIGHT);
-  const maxY = clamp(Math.max(...ys), 0, CANVAS_HEIGHT);
+  const minX = clamp(Math.min(...xs), 0, canvasWidth.value);
+  const maxX = clamp(Math.max(...xs), 0, canvasWidth.value);
+  const minY = clamp(Math.min(...ys), 0, canvasHeight.value);
+  const maxY = clamp(Math.max(...ys), 0, canvasHeight.value);
 
   return {
     x: minX,
@@ -355,9 +467,11 @@ function getRegionDisplayName(id) {
 }
 
 function normalizePoint(x, y) {
+  const width = canvasWidth.value;
+  const height = canvasHeight.value;
   return [
-    Number((clamp(x, 0, CANVAS_WIDTH) / CANVAS_WIDTH).toFixed(4)),
-    Number((clamp(y, 0, CANVAS_HEIGHT) / CANVAS_HEIGHT).toFixed(4)),
+    Number((clamp(x, 0, width) / width).toFixed(4)),
+    Number((clamp(y, 0, height) / height).toFixed(4)),
   ];
 }
 
@@ -373,8 +487,8 @@ function normalizedPolygonToPoints(polygon = []) {
       const y = Number(point[1]);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
       return {
-        x: clamp(x * CANVAS_WIDTH, 0, CANVAS_WIDTH),
-        y: clamp(y * CANVAS_HEIGHT, 0, CANVAS_HEIGHT),
+        x: clamp(x * canvasWidth.value, 0, canvasWidth.value),
+        y: clamp(y * canvasHeight.value, 0, canvasHeight.value),
       };
     })
     .filter(Boolean);
@@ -395,7 +509,8 @@ function toBackendRoi(region) {
     coordinate_mode: "normalized",
     polygon: pointsToNormalizedPolygon(getRegionPoints(region)),
     overlap_thres: getOverlapThreshold(),
-    target: selectedTarget.value,
+    target: "all",
+    resolution_key: selectedTarget.value,
   };
 }
 
@@ -413,10 +528,10 @@ function fromStoredRegion(region = {}) {
 
   const rect = region.rect || {};
   const safeRect = {
-    x: clamp(rect.x || 0, 0, CANVAS_WIDTH),
-    y: clamp(rect.y || 0, 0, CANVAS_HEIGHT),
-    w: clamp(rect.w || 0, 0, CANVAS_WIDTH),
-    h: clamp(rect.h || 0, 0, CANVAS_HEIGHT),
+    x: clamp(rect.x || 0, 0, canvasWidth.value),
+    y: clamp(rect.y || 0, 0, canvasHeight.value),
+    w: clamp(rect.w || 0, 0, canvasWidth.value),
+    h: clamp(rect.h || 0, 0, canvasHeight.value),
   };
 
   return createRegionShape({
@@ -469,15 +584,206 @@ function closeFrameStream() {
   if (frameVideoRef.value) {
     frameVideoRef.value.srcObject = null;
   }
+
+  if (frameImageRef.value) {
+    frameImageRef.value.onload = null;
+    frameImageRef.value.onerror = null;
+    frameImageRef.value.removeAttribute("src");
+  }
+
+  frameMode.value = "none";
+}
+
+function manualStateToChannels(state) {
+  return {
+    red: state.red ? "on" : "off",
+    yellow: state.yellow ? "on" : "off",
+    green: state.green ? "on" : "off",
+    buzzer: state.buzzer ? "on" : "off",
+  };
+}
+
+async function postManualOutputs(state, options = {}) {
+  const payload = JSON.stringify({
+    target: "all",
+    channels: manualStateToChannels(state),
+  });
+  const failures = new Set();
+
+  for (const baseUrl of getHardwareApiUrlCandidates()) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), MANUAL_OUTPUT_API_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${baseUrl}/api/detection/exception_output/manual`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+        keepalive: Boolean(options.keepalive),
+        signal: controller.signal,
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.status !== "success") {
+        const message = data.message || `HTTP ${response.status}`;
+        failures.add(`${baseUrl}: ${message}`);
+        if ([400, 401, 403].includes(response.status)) {
+          break;
+        }
+        continue;
+      }
+
+      rememberApiUrl(baseUrl, { hardware: true });
+      return;
+    } catch (error) {
+      failures.add(`${baseUrl}: ${error.message}`);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  throw new Error(Array.from(failures).join("；") || "后端连接失败");
+}
+
+function formatManualOutputError(error) {
+  const message = error?.message || "未知错误";
+  if (message.includes("CH340 USB serial adapter")) {
+    return "CH340 已连接，但 Jetson 没有生成 /dev/ttyUSB*，需要加载 ch341/usbserial 驱动后才能控制 YSL301";
+  }
+  if (message.includes("serial alarm output is not enabled or unavailable")) {
+    return "未检测到串口声光设备，请确认 YSL301/RS485 已连接，并安装 pyserial 或设置正确串口";
+  }
+  if (message.includes("No YSL301 serial port found")) {
+    return "未找到 YSL301 串口，请确认 USB-RS485 已连接或手动配置串口";
+  }
+  return message;
+}
+
+function queueManualOutputs(options = {}) {
+  const snapshot = { ...manualOutputs.value };
+  manualOutputQueue = manualOutputQueue
+    .catch(() => {})
+    .then(async () => {
+      try {
+        await postManualOutputs(snapshot, options);
+        manualOutputError.value = "";
+      } catch (error) {
+        manualOutputError.value = `声光控制失败：${formatManualOutputError(error)}`;
+      }
+    });
+  return manualOutputQueue;
+}
+
+function setManualOutput(channel, active, options = {}) {
+  if (!Object.prototype.hasOwnProperty.call(MANUAL_OUTPUT_IDLE, channel)) return;
+  manualOutputs.value = {
+    ...manualOutputs.value,
+    [channel]: Boolean(active),
+  };
+  queueManualOutputs(options);
+}
+
+function stopAllManualOutputs(options = {}) {
+  activeManualPointers.clear();
+  manualOutputs.value = { ...MANUAL_OUTPUT_IDLE };
+  return queueManualOutputs(options);
+}
+
+function pressManualOutput(channel, event) {
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+
+  event.currentTarget?.setPointerCapture?.(event.pointerId);
+  activeManualPointers.set(event.pointerId, channel);
+  setManualOutput(channel, true);
+}
+
+function releaseManualOutput(channel, event) {
+  const activeChannel = activeManualPointers.get(event.pointerId) || channel;
+  activeManualPointers.delete(event.pointerId);
+
+  const stillPressed = Array.from(activeManualPointers.values()).includes(activeChannel);
+  if (!stillPressed) {
+    setManualOutput(activeChannel, false);
+  }
+}
+
+function handleManualOutputCancel() {
+  if (activeManualPointers.size) {
+    stopAllManualOutputs({ keepalive: true });
+  }
+}
+
+function startManualOutputHeartbeat() {
+  if (manualOutputHeartbeatTimer) {
+    clearInterval(manualOutputHeartbeatTimer);
+  }
+
+  manualOutputHeartbeatTimer = setInterval(() => {
+    queueManualOutputs();
+  }, MANUAL_OUTPUT_HEARTBEAT_MS);
+}
+
+function stopManualOutputHeartbeat() {
+  if (manualOutputHeartbeatTimer) {
+    clearInterval(manualOutputHeartbeatTimer);
+    manualOutputHeartbeatTimer = null;
+  }
+}
+
+function refreshFrameGeometry() {
+  const video = frameVideoRef.value;
+  const width = Number(video?.videoWidth || 0);
+  const height = Number(video?.videoHeight || 0);
+  if (!width || !height) return;
+
+  const oldWidth = frameSourceResolution.value.width;
+  const oldHeight = frameSourceResolution.value.height;
+  if (oldWidth === width && oldHeight === height) return;
+
+  frameSourceResolution.value = { width, height };
+  loadSavedRegions();
+  nextTick(() => redrawCanvas());
+}
+
+function buildMjpegPreviewUrl() {
+  const params = new URLSearchParams({
+    target: "high",
+    fps: String(MJPEG_PREVIEW_FPS),
+    quality: String(MJPEG_PREVIEW_QUALITY),
+    max_width: String(MJPEG_PREVIEW_MAX_WIDTH),
+    t: String(Date.now()),
+  });
+  return `${getApiUrl()}/api/stream/mjpeg?${params.toString()}`;
 }
 
 async function initFrameStream() {
-  if (!frameVideoRef.value) return;
+  if (!frameImageRef.value) return;
 
   closeFrameStream();
   frameLoaded.value = false;
   frameError.value = "";
+  frameMode.value = "mjpeg";
 
+  const image = frameImageRef.value;
+  image.onload = () => {
+    frameLoaded.value = true;
+    redrawCanvas();
+  };
+  image.onerror = () => {
+    frameError.value = "褰撳墠瑙嗛甯у姞杞藉け璐ワ紝宸插垏鎹负绀烘剰搴曞浘";
+    frameLoaded.value = false;
+    frameMode.value = "none";
+    redrawCanvas();
+  };
+  image.src = buildMjpegPreviewUrl();
+
+  frameRefreshTimer = setInterval(() => {
+    redrawCanvas();
+  }, 200);
+  redrawCanvas();
+}
+
+/*
+async function initWhepFrameStream() {
   try {
     framePc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -492,11 +798,13 @@ async function initFrameStream() {
       frameVideoRef.value.srcObject = stream;
 
       frameVideoRef.value.onloadeddata = () => {
+        refreshFrameGeometry();
         frameLoaded.value = true;
         redrawCanvas();
       };
 
       event.track.onunmute = () => {
+        refreshFrameGeometry();
         frameLoaded.value = true;
         redrawCanvas();
       };
@@ -546,29 +854,37 @@ async function initFrameStream() {
     closeFrameStream();
   }
 }
+*/
 
 function drawBackground(ctx) {
   const video = frameVideoRef.value;
+  const image = frameImageRef.value;
+  const width = canvasWidth.value;
+  const height = canvasHeight.value;
+  if (frameMode.value === "mjpeg" && image?.naturalWidth && image?.naturalHeight) {
+    frameLoaded.value = true;
+    return;
+  }
   if (frameLoaded.value && video && video.readyState >= 2) {
-    ctx.drawImage(video, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    ctx.drawImage(video, 0, 0, width, height);
     return;
   }
 
   ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  ctx.fillRect(0, 0, width, height);
 
   ctx.strokeStyle = "rgba(143, 17, 23, 0.12)";
   ctx.lineWidth = 1;
-  for (let x = 0; x <= CANVAS_WIDTH; x += 48) {
+  for (let x = 0; x <= width; x += 48) {
     ctx.beginPath();
     ctx.moveTo(x, 0);
-    ctx.lineTo(x, CANVAS_HEIGHT);
+    ctx.lineTo(x, height);
     ctx.stroke();
   }
-  for (let y = 0; y <= CANVAS_HEIGHT; y += 48) {
+  for (let y = 0; y <= height; y += 48) {
     ctx.beginPath();
     ctx.moveTo(0, y);
-    ctx.lineTo(CANVAS_WIDTH, y);
+    ctx.lineTo(width, y);
     ctx.stroke();
   }
 
@@ -651,7 +967,7 @@ function redrawCanvas() {
   const ctx = getCanvasContext();
   if (!ctx) return;
 
-  ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+  ctx.clearRect(0, 0, canvasWidth.value, canvasHeight.value);
   drawBackground(ctx);
 
   committedRegions.value.forEach((region) => {
@@ -712,6 +1028,30 @@ async function syncRegionsFromServer() {
   return true;
 }
 
+async function switchCameraResolutionForRoi(resolutionKey) {
+  const currentSettings = cameraSettingStore.getSettings();
+  const maxFps = getMaxFpsForResolution(resolutionKey);
+  const nextFps = Math.min(Number(currentSettings.fps || maxFps), maxFps);
+
+  const success = await cameraSettingStore.saveSettings({
+    ...currentSettings,
+    resolution: resolutionKey,
+    fps: String(nextFps),
+    target: "high",
+  });
+
+  if (!success) {
+    openAlert(cameraSettingStore.getState().message || "分辨率切换失败");
+    return false;
+  }
+
+  frameSourceResolution.value = { width: 0, height: 0 };
+  closeFrameStream();
+  await nextTick();
+  await initFrameStream();
+  return true;
+}
+
 function beginDraw(event) {
   if (drawMode.value !== "rect" || isSaving.value) return;
 
@@ -724,6 +1064,71 @@ function beginDraw(event) {
   startPoint.value = point;
   draftRect.value = { x: point.x, y: point.y, w: 0, h: 0 };
   isDrawing.value = true;
+  redrawCanvas();
+}
+
+function captureCanvasPointer(event) {
+  try {
+    event.currentTarget?.setPointerCapture?.(event.pointerId);
+  } catch {
+    // Pointer capture is best-effort; drawing still works without it.
+  }
+}
+
+function releaseCanvasPointer(event) {
+  try {
+    event.currentTarget?.releasePointerCapture?.(event.pointerId);
+  } catch {
+    // The pointer may already be released by the browser.
+  }
+}
+
+function handleCanvasPointerDown(event) {
+  if (isSaving.value) return;
+  event.preventDefault();
+
+  if (drawMode.value === "polygon") {
+    addPolygonPoint(event);
+    return;
+  }
+
+  captureCanvasPointer(event);
+  beginDraw(event);
+}
+
+function handleCanvasPointerMove(event) {
+  if (isSaving.value) return;
+  updateDraw(event);
+}
+
+function handleCanvasPointerUp(event) {
+  if (drawMode.value === "rect") {
+    finishDraw(event);
+    releaseCanvasPointer(event);
+  }
+}
+
+function handleCanvasPointerCancel(event) {
+  releaseCanvasPointer(event);
+  if (drawMode.value !== "rect") {
+    hoverPoint.value = null;
+    redrawCanvas();
+    return;
+  }
+
+  isDrawing.value = false;
+  draftRect.value = null;
+  redrawCanvas();
+}
+
+function handleCanvasPointerLeave(event) {
+  if (drawMode.value === "rect" && isDrawing.value) {
+    finishDraw(event);
+    releaseCanvasPointer(event);
+    return;
+  }
+
+  hoverPoint.value = null;
   redrawCanvas();
 }
 
@@ -838,6 +1243,36 @@ function finishPolygon() {
   redrawCanvas();
 }
 
+function promoteDraftRegion() {
+  if (draftRect.value && draftRect.value.w >= MIN_RECT_SIZE && draftRect.value.h >= MIN_RECT_SIZE) {
+    candidateRegions.value.push(
+      createRegionShape({
+        tempId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        shape: "rect",
+        points: rectToPoints(draftRect.value),
+      })
+    );
+    draftRect.value = null;
+    isDrawing.value = false;
+    return true;
+  }
+
+  if (drawMode.value === "polygon" && draftPolygon.value.length >= MIN_POLYGON_POINTS) {
+    candidateRegions.value.push(
+      createRegionShape({
+        tempId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        shape: "polygon",
+        points: draftPolygon.value,
+      })
+    );
+    draftPolygon.value = [];
+    hoverPoint.value = null;
+    return true;
+  }
+
+  return false;
+}
+
 function handleCanvasLeave(event) {
   if (drawMode.value === "rect") {
     finishDraw(event);
@@ -861,10 +1296,15 @@ function cancelCurrentBoxes() {
   draftPolygon.value = [];
   hoverPoint.value = null;
   isDrawing.value = false;
+  successFeedback.value = "已取消当前候选区域";
   redrawCanvas();
 }
 
 async function addDetectionRegions() {
+  if (!candidateRegions.value.length) {
+    promoteDraftRegion();
+  }
+
   if (!candidateRegions.value.length || isSaving.value) {
     if (!isSaving.value) {
       openAlert("请先在画面上拖出一个新的候选区域");
@@ -915,10 +1355,16 @@ async function addDetectionRegions() {
   }
 }
 
-async function confirmClearAll() {
+async function clearAllRegions() {
   if (isSaving.value) return;
 
   closeModal();
+  candidateRegions.value = [];
+  draftRect.value = null;
+  draftPolygon.value = [];
+  hoverPoint.value = null;
+  isDrawing.value = false;
+
   isSaving.value = true;
   try {
     const success = await detectionRegionStore.clearRegions({
@@ -945,6 +1391,10 @@ async function confirmClearAll() {
   }
 }
 
+async function confirmClearAll() {
+  await clearAllRegions();
+}
+
 function goBack() {
   if (isSaving.value) return;
   router.push("/");
@@ -952,13 +1402,22 @@ function goBack() {
 
 onMounted(async () => {
   await nextTick();
+  window.addEventListener("pointerup", handleManualOutputCancel);
+  window.addEventListener("pointercancel", handleManualOutputCancel);
+  window.addEventListener("blur", handleManualOutputCancel);
+  await stopAllManualOutputs();
+  startManualOutputHeartbeat();
+  selectedTarget.value = normalizeResolutionKey(cameraSettingStore.settings.resolution);
+  detectionRegionStore.setCurrentTarget(selectedTarget.value);
   await initFrameStream();
   await syncRegionsFromServer();
   loadSavedRegions();
   redrawCanvas();
+  isInitializing = false;
 });
 
 watch(selectedTarget, async () => {
+  if (isInitializing) return;
   detectionRegionStore.setCurrentTarget(selectedTarget.value);
   candidateRegions.value = [];
   draftRect.value = null;
@@ -966,10 +1425,22 @@ watch(selectedTarget, async () => {
   hoverPoint.value = null;
   isDrawing.value = false;
   successFeedback.value = "";
+  isSaving.value = true;
+  try {
+    const switched = await switchCameraResolutionForRoi(selectedTarget.value);
+    if (!switched) return;
+  } finally {
+    isSaving.value = false;
+  }
   await syncRegionsFromServer();
 });
 
 onUnmounted(() => {
+  window.removeEventListener("pointerup", handleManualOutputCancel);
+  window.removeEventListener("pointercancel", handleManualOutputCancel);
+  window.removeEventListener("blur", handleManualOutputCancel);
+  stopManualOutputHeartbeat();
+  stopAllManualOutputs({ keepalive: true });
   closeFrameStream();
 });
 </script>
@@ -1139,11 +1610,30 @@ onUnmounted(() => {
   pointer-events: none;
 }
 
+.frame-image {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.frame-image.visible {
+  opacity: 1;
+}
+
 canvas {
+  position: relative;
+  z-index: 2;
   display: block;
   width: 100%;
   max-width: 100%;
   cursor: crosshair;
+  touch-action: none;
+  user-select: none;
 }
 
 .button-row {
@@ -1222,6 +1712,110 @@ button:disabled {
   margin: 0 0 12px;
   font-size: 1rem;
   color: #333;
+}
+
+.manual-output-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.manual-output-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #f9fafb;
+  color: #1f2937;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  touch-action: none;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.16s ease;
+}
+
+.manual-output-btn.active {
+  transform: translateY(1px);
+}
+
+.manual-output-dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  border-radius: 999px;
+  background: #9ca3af;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.14);
+}
+
+.manual-output-btn.red.active {
+  border-color: #dc2626;
+  background: #dc2626;
+  color: #ffffff;
+  box-shadow: 0 8px 18px rgba(220, 38, 38, 0.2);
+}
+
+.manual-output-btn.yellow.active {
+  border-color: #ca8a04;
+  background: #facc15;
+  color: #3f2f02;
+  box-shadow: 0 8px 18px rgba(202, 138, 4, 0.2);
+}
+
+.manual-output-btn.green.active {
+  border-color: #16a34a;
+  background: #16a34a;
+  color: #ffffff;
+  box-shadow: 0 8px 18px rgba(22, 163, 74, 0.2);
+}
+
+.manual-output-btn.buzzer.active {
+  border-color: #2563eb;
+  background: #2563eb;
+  color: #ffffff;
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.2);
+}
+
+.manual-output-btn.red .manual-output-dot {
+  background: #ef4444;
+}
+
+.manual-output-btn.yellow .manual-output-dot {
+  background: #facc15;
+}
+
+.manual-output-btn.green .manual-output-dot {
+  background: #22c55e;
+}
+
+.manual-output-btn.buzzer .manual-output-dot {
+  background: #60a5fa;
+}
+
+.manual-output-btn.active .manual-output-dot {
+  background: #ffffff;
+}
+
+.manual-output-status {
+  min-height: 18px;
+  margin: 12px 0 0;
+  color: #4b5563;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.manual-output-status.error {
+  color: #dc2626;
 }
 
 .region-list {

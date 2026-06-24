@@ -1,8 +1,10 @@
 import logging
+import os
 import threading
 import time
 from pathlib import Path
 
+from app.Cam.fps_meter import FpsMeter
 from inference.python_tensorrt.model import Model
 
 
@@ -33,6 +35,7 @@ class InferenceWorker:
         self._last_latency_ms = None
         self._last_error = None
         self._frame_count = 0
+        self._infer_fps = FpsMeter()
         self._latest_overlay = {
             "detections": [],
             "zone_summary": [],
@@ -54,6 +57,15 @@ class InferenceWorker:
     def model_loaded(self):
         with self._ai_lock:
             return self._model is not None
+
+    @staticmethod
+    def _render_overlay_in_stream():
+        return str(os.environ.get("CAM_RENDER_OVERLAY_IN_STREAM", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _format_time(self, timestamp):
         if not timestamp:
@@ -86,6 +98,7 @@ class InferenceWorker:
                 "last_infer_latency_ms": self._last_latency_ms,
                 "last_infer_error": self._last_error,
                 "frames_inferred": self._frame_count,
+                "actual_infer_fps": self._infer_fps.fps(),
             }
 
     @staticmethod
@@ -118,19 +131,43 @@ class InferenceWorker:
             "roi_hits": InferenceWorker._json_value(
                 getattr(detection, "roi_hits", []) or []
             ),
+            "roi_contacts": InferenceWorker._json_value(
+                getattr(detection, "roi_contacts", []) or []
+            ),
         }
 
     @staticmethod
+    def _zone_display_state(zone):
+        person_count = int(getattr(zone, "person_count", 0))
+        warning_count = int(getattr(zone, "warning_count", 0))
+        roi_type = str(getattr(zone, "roi_type", ""))
+        if person_count > 0:
+            if roi_type == "warning_zone":
+                return "warning", "#f59e0b"
+            return "alarm", "#ef4444"
+        if warning_count > 0:
+            return "warning", "#f59e0b"
+        return "safe", "#22c55e"
+
+    @staticmethod
     def _serialize_zone(zone):
+        display_status, display_color = InferenceWorker._zone_display_state(zone)
         return {
             "roi_id": str(getattr(zone, "roi_id", "")),
             "roi_name": str(getattr(zone, "roi_name", "")),
             "roi_type": str(getattr(zone, "roi_type", "")),
             "person_count": int(getattr(zone, "person_count", 0)),
+            "warning_count": int(getattr(zone, "warning_count", 0)),
             "raw_active": bool(getattr(zone, "raw_active", False)),
+            "raw_warning": bool(getattr(zone, "raw_warning", False)),
             "stable_active": bool(getattr(zone, "stable_active", False)),
+            "stable_warning": bool(getattr(zone, "stable_warning", False)),
             "enter_counter": int(getattr(zone, "enter_counter", 0)),
             "exit_counter": int(getattr(zone, "exit_counter", 0)),
+            "warning_enter_counter": int(getattr(zone, "warning_enter_counter", 0)),
+            "warning_exit_counter": int(getattr(zone, "warning_exit_counter", 0)),
+            "display_status": display_status,
+            "display_color": display_color,
         }
 
     @classmethod
@@ -219,6 +256,9 @@ class InferenceWorker:
         if frame is None:
             return None
 
+        if not self._render_overlay_in_stream():
+            return frame
+
         with self._ai_lock:
             enable_infer = self._enabled
             model = self._model
@@ -232,6 +272,33 @@ class InferenceWorker:
         except Exception:
             self.logger.exception("Failed to render latest AI overlay; streaming raw frame")
             return frame
+
+    def get_frame_snapshot(self, include_overlay=False):
+        with self._frame_lock:
+            frame = self._latest_stream_frame
+
+        with self._status_lock:
+            frame_time = self._last_raw_frame_at
+
+        if frame is None:
+            return None, frame_time
+
+        if not include_overlay:
+            return frame, frame_time
+
+        with self._ai_lock:
+            enable_infer = self._enabled
+            model = self._model
+
+        if not enable_infer or model is None:
+            return frame, frame_time
+
+        try:
+            rendered = model.try_render_latest(frame)
+            return (rendered if rendered is not None else frame), frame_time
+        except Exception:
+            self.logger.exception("Failed to render latest AI overlay; streaming raw frame")
+            return frame, frame_time
 
     def start(self):
         if self._running:
@@ -309,6 +376,24 @@ class InferenceWorker:
             model.reload_config()
             self.logger.info("AI config reloaded")
 
+    def trigger_alarm_output(self, active=True, duration=0):
+        with self._ai_lock:
+            model = self._ensure_model_locked()
+
+        model.set_alarm_output_for_test(bool(active))
+        if active and duration > 0:
+            time.sleep(duration)
+            model.set_alarm_output_for_test(False)
+
+    def set_alarm_output_channels(self, states):
+        with self._ai_lock:
+            model = self._model
+
+        if model is None:
+            return False
+
+        return model.set_alarm_output_channels_for_test(states)
+
     def close_model(self):
         with self._ai_lock:
             self._close_model_locked()
@@ -377,8 +462,9 @@ class InferenceWorker:
                 result = frame
             else:
                 try:
+                    render_in_stream = self._render_overlay_in_stream()
                     infer_start = time.perf_counter()
-                    result = model.inference(frame)
+                    result = model.inference(frame, render=render_in_stream)
                     infer_end = time.perf_counter()
 
                     if result is None:
@@ -392,6 +478,7 @@ class InferenceWorker:
 
                     with self._status_lock:
                         self._frame_count += 1
+                        self._infer_fps.mark()
                         self._last_success_at = time.time()
                         self._last_latency_ms = round(
                             (infer_end - infer_start) * 1000,

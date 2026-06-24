@@ -43,17 +43,33 @@ class StreamPublisher:
         return available
 
     @classmethod
-    def _select_encoder(cls):
+    def _encoder_candidates(cls):
+        requested = str(os.environ.get("STREAM_ENCODER", "auto")).strip().lower()
+        aliases = {
+            "hardware": "nvv4l2h264enc",
+            "hw": "nvv4l2h264enc",
+            "openh264": "openh264enc",
+            "x264": "x264enc",
+        }
+        requested = aliases.get(requested, requested)
+
+        if requested != "auto":
+            return [requested]
+
         if cls._encoder_probe is not None:
             return cls._encoder_probe
 
-        cls._encoder_probe = (
-            "nvv4l2h264enc"
-            if cls._has_gst_element("nvv4l2h264enc")
-            and cls._has_gst_element("nvvidconv")
-            else "x264enc"
-        )
-        return cls._encoder_probe
+        candidates = []
+        if cls._has_gst_element("nvv4l2h264enc") and cls._has_gst_element("nvvidconv"):
+            candidates.append("nvv4l2h264enc")
+        if cls._has_gst_element("x264enc"):
+            candidates.append("x264enc")
+        if cls._has_gst_element("openh264enc"):
+            candidates.append("openh264enc")
+        if not candidates:
+            candidates.append("x264enc")
+        cls._encoder_probe = candidates
+        return candidates
 
     @staticmethod
     def suggest_bitrate_kbps(w, h, fps):
@@ -80,19 +96,28 @@ class StreamPublisher:
         raw = os.environ.get("STREAM_X264_SLICED_THREADS", "0")
         return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
-    def build_pipeline(self, current_w, current_h, current_fps):
+    @staticmethod
+    def _openh264_threads():
+        raw = os.environ.get("STREAM_OPENH264_THREADS", "4")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 4
+
+    def build_pipeline(self, current_w, current_h, current_fps, encoder=None):
         current_w = int(current_w)
         current_h = int(current_h)
         current_fps = max(1, int(current_fps))
         bitrate_kbps = self.suggest_bitrate_kbps(current_w, current_h, current_fps)
-        encoder = self._select_encoder()
+        encoder = encoder or self._encoder_candidates()[0]
         x264_threads = self._x264_threads()
         x264_sliced_threads = str(self._x264_sliced_threads()).lower()
+        openh264_threads = self._openh264_threads()
 
         base = (
             f"appsrc is-live=true block=false format=time do-timestamp=true "
             f"! video/x-raw,format=BGR,width={current_w},height={current_h},framerate={current_fps}/1 "
-            f"! queue leaky=downstream max-size-buffers=2 "
+            f"! queue leaky=downstream max-size-buffers=1 "
         )
 
         if encoder == "nvv4l2h264enc":
@@ -113,6 +138,30 @@ class StreamPublisher:
                 f"! flvmux streamable=true "
                 f"! rtmpsink location={self.url} sync=false async=false"
             )
+        elif encoder == "openh264enc":
+            bitrate_bps = bitrate_kbps * 1000
+            pipeline = (
+                f"{base}"
+                f"! videoconvert "
+                f"! video/x-raw,format=I420 "
+                f"! openh264enc "
+                f"bitrate={bitrate_bps} "
+                f"max-bitrate={bitrate_bps} "
+                f"rate-control=bitrate "
+                f"complexity=low "
+                f"gop-size={current_fps} "
+                f"multi-thread={openh264_threads} "
+                f"slice-mode=auto "
+                f"enable-frame-skip=false "
+                f"background-detection=false "
+                f"adaptive-quantization=false "
+                f"scene-change-detection=false "
+                f"deblocking=off "
+                f"! video/x-h264,profile=baseline "
+                f"! h264parse config-interval=1 "
+                f"! flvmux streamable=true "
+                f"! rtmpsink location={self.url} sync=false async=false"
+            )
         else:
             pipeline = (
                 f"{base}"
@@ -122,6 +171,9 @@ class StreamPublisher:
                 f"bitrate={bitrate_kbps} "
                 f"speed-preset=ultrafast "
                 f"tune=zerolatency "
+                f"vbv-buf-capacity=50 "
+                f"rc-lookahead=0 "
+                f"sync-lookahead=0 "
                 f"key-int-max={current_fps} "
                 f"bframes=0 "
                 f"threads={x264_threads} "
@@ -137,38 +189,47 @@ class StreamPublisher:
         return pipeline
 
     def open_writer(self, current_w, current_h, current_fps):
-        pipeline = self.build_pipeline(
-            current_w=current_w,
-            current_h=current_h,
-            current_fps=current_fps,
-        )
-
-        self.logger.info("Opening GStreamer writer: %s", pipeline)
-        writer = cv2.VideoWriter(
-            pipeline,
-            cv2.CAP_GSTREAMER,
-            0,
-            float(current_fps),
-            (int(current_w), int(current_h)),
-            True,
-        )
-
-        if not writer.isOpened():
-            self.last_error = "GStreamer VideoWriter open failed"
-            raise RuntimeError(
-                f"[{self.name}] Unable to open GStreamer VideoWriter. "
-                "Check x264enc / rtmpsink / flvmux / MediaMTX."
+        errors = []
+        for encoder in self._encoder_candidates():
+            pipeline = self.build_pipeline(
+                current_w=current_w,
+                current_h=current_h,
+                current_fps=current_fps,
+                encoder=encoder,
             )
 
-        self.last_error = None
-        self.logger.info(
-            "GStreamer writer started: %sx%s@%s url=%s",
-            current_w,
-            current_h,
-            current_fps,
-            self.url,
+            self.logger.info("Opening GStreamer writer with %s: %s", encoder, pipeline)
+            writer = cv2.VideoWriter(
+                pipeline,
+                cv2.CAP_GSTREAMER,
+                0,
+                float(current_fps),
+                (int(current_w), int(current_h)),
+                True,
+            )
+
+            if writer.isOpened():
+                self.last_error = None
+                self.last_encoder = encoder
+                self.logger.info(
+                    "GStreamer writer started: %sx%s@%s encoder=%s url=%s",
+                    current_w,
+                    current_h,
+                    current_fps,
+                    encoder,
+                    self.url,
+                )
+                return writer
+
+            writer.release()
+            errors.append(f"{encoder}: open failed")
+            self.logger.warning("GStreamer writer open failed with %s", encoder)
+
+        self.last_error = "; ".join(errors) or "GStreamer VideoWriter open failed"
+        raise RuntimeError(
+            f"[{self.name}] Unable to open GStreamer VideoWriter. "
+            f"Tried: {', '.join(self._encoder_candidates())}."
         )
-        return writer
 
     def close_writer(self, writer):
         if writer is None:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import json
 import os
-import sys
 import threading
 import time
 from pathlib import Path
@@ -13,13 +12,9 @@ import cv2
 import numpy as np
 import yaml
 
-from .runtime import CameraTensorRTInfer, FrameResult
+from .alarm_output import AlarmOutputController
+from .runtime import CameraTensorRTInfer, FrameResult, SystemState
 from .vision_tasks import normalize_vision_pipeline
-
-try:
-    import Jetson.GPIO as GPIO
-except Exception:
-    GPIO = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -45,40 +40,38 @@ class Model:
         self.result_lock = threading.RLock()
         self.render_lock = threading.Lock()
 
-        self.alarm_gpios: List[int] = []
-        self.alarm_level = 1
-        self.alarm_idle_level = 0
-        self.alarm_duration = 0.0
-        self.alarm_active = False
-        self.alarm_end_time: float | None = None
-        self.alarm_led_on = False
+        self.alarm_output: AlarmOutputController | None = None
         self.last_alarm_flag = False
+        self.last_warning_flag = False
+        self.last_system_state = SystemState.SAFE
         self.last_detection_flag = False
         self.last_frame_result = None
         self.last_frame_result_at = 0.0
         self.last_task_results: List[Dict[str, Any]] = []
 
         self._load_config_and_prepare_runtime()
-        self._init_alarm_gpio()
+        self._init_alarm_output()
         self._check_files()
         self._start_python_tensorrt()
         atexit.register(self.close)
 
-    def inference(self, frame: np.ndarray) -> np.ndarray:
+    def inference(self, frame: np.ndarray, render: bool = True) -> np.ndarray | None:
         frame = self._check_frame(frame)
         with self.lock:
             if self.infer_runtime is None:
                 self._start_python_tensorrt()
             if self.infer_runtime is None:
                 raise RuntimeError("Python TensorRT 推理器未启动")
-            infer_result = self.infer_runtime.infer(frame)
+            infer_result = self.infer_runtime.infer(frame, render=render)
             self.last_alarm_flag = bool(infer_result.alarm)
+            self.last_warning_flag = bool(infer_result.warning)
+            self.last_system_state = getattr(infer_result, "system_state", SystemState.SAFE)
             self.last_detection_flag = getattr(infer_result, "has_target", self.last_alarm_flag)
             with self.result_lock:
                 self.last_frame_result = getattr(infer_result, "frame_result", None)
                 self.last_frame_result_at = time.time()
             self.last_task_results = getattr(infer_result, "task_results", [])
-            self._handle_alarm_gpio(self.last_alarm_flag)
+            self._handle_alarm_output_state(self.last_system_state)
             return infer_result.image
 
     def try_render_latest(self, frame: np.ndarray, max_age_sec: float = 1.0) -> np.ndarray | None:
@@ -100,7 +93,7 @@ class Model:
         with self.lock:
             self._release_runtime()
             self._load_config_and_prepare_runtime()
-            self._init_alarm_gpio()
+            self._init_alarm_output()
             self._check_files()
             self._start_python_tensorrt()
 
@@ -114,10 +107,20 @@ class Model:
     def get_config(self) -> Dict[str, Any]:
         return self.cfg
 
+    def set_alarm_output_for_test(self, alarm_flag: bool) -> None:
+        with self.lock:
+            self._handle_alarm_output(bool(alarm_flag))
+
+    def set_alarm_output_channels_for_test(self, states: Dict[str, Any]) -> bool:
+        with self.lock:
+            if self.alarm_output is None:
+                return False
+            return self.alarm_output.set_manual_channels(states)
+
     def close(self) -> None:
         with self.lock:
             self._release_runtime()
-            self._release_alarm_gpio()
+            self._release_alarm_output()
 
     def _release_runtime(self) -> None:
         self.infer_runtime = None
@@ -264,75 +267,23 @@ class Model:
             settle_single_frame=self.settle_single_frame,
         )
 
-    def _init_alarm_gpio(self) -> None:
-        self._release_alarm_gpio()
+    def _init_alarm_output(self) -> None:
+        self._release_alarm_output()
         cfg = self.cfg.get("exception_output", {}) or {}
-        gpio = cfg.get("gpio")
-        if not gpio:
-            return
-        if GPIO is None:
-            print("[alarm_gpio] Jetson.GPIO 未安装，跳过 GPIO 报警输出", file=sys.stderr)
-            return
+        self.alarm_output = AlarmOutputController(cfg)
 
-        pins = gpio if isinstance(gpio, list) else [gpio]
-        normalized_pins = []
-        for pin in pins:
-            try:
-                pin_number = int(pin)
-            except Exception:
-                continue
-            if pin_number > 0:
-                normalized_pins.append(pin_number)
-        pins = sorted(set(normalized_pins))
-        if not pins:
-            return
+    def _handle_alarm_output(self, alarm_flag: bool) -> None:
+        if self.alarm_output is not None:
+            self.alarm_output.set_alarm(alarm_flag)
 
-        self.alarm_gpios = pins
-        self.alarm_level = 1 if int(cfg.get("output_level", 1)) else 0
-        self.alarm_idle_level = 0 if self.alarm_level == 1 else 1
-        self.alarm_duration = float(cfg.get("duration", 0))
+    def _handle_alarm_output_state(self, state: object) -> None:
+        if self.alarm_output is not None:
+            self.alarm_output.set_state(state)
 
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BOARD)
-        for pin in self.alarm_gpios:
-            GPIO.setup(pin, GPIO.OUT, initial=self.alarm_idle_level)
-
-    def _handle_alarm_gpio(self, alarm_flag: bool) -> None:
-        if not self.alarm_gpios or GPIO is None:
-            return
-
-        now = time.monotonic()
-        if not alarm_flag:
-            if self.alarm_led_on:
-                for pin in self.alarm_gpios:
-                    GPIO.output(pin, self.alarm_idle_level)
-            self.alarm_active = False
-            self.alarm_led_on = False
-            self.alarm_end_time = None
-            return
-
-        if not self.alarm_active:
-            self.alarm_active = True
-            self.alarm_led_on = True
-            for pin in self.alarm_gpios:
-                GPIO.output(pin, self.alarm_level)
-            self.alarm_end_time = now + self.alarm_duration if self.alarm_duration > 0 else None
-            return
-
-        if self.alarm_duration > 0 and self.alarm_led_on and self.alarm_end_time is not None and now >= self.alarm_end_time:
-            for pin in self.alarm_gpios:
-                GPIO.output(pin, self.alarm_idle_level)
-            self.alarm_led_on = False
-
-    def _release_alarm_gpio(self) -> None:
-        if self.alarm_gpios and GPIO is not None:
-            try:
-                for pin in self.alarm_gpios:
-                    GPIO.output(pin, self.alarm_idle_level)
-                GPIO.cleanup(self.alarm_gpios)
-            except Exception:
-                pass
-        self.alarm_gpios = []
+    def _release_alarm_output(self) -> None:
+        if self.alarm_output is not None:
+            self.alarm_output.close()
+        self.alarm_output = None
 
     def _check_frame(self, frame: np.ndarray) -> np.ndarray:
         if frame is None:

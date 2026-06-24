@@ -3,9 +3,21 @@ import { fileURLToPath, URL } from 'url'
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+const serveRootIndex = () => ({
+  name: 'serve-root-index',
+  configureServer(server) {
+    server.middlewares.use((req, _res, next) => {
+      if (req.url === '/' || req.url?.startsWith('/?')) {
+        req.url = '/index.html'
+      }
+      next()
+    })
+  }
+})
+
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [serveRootIndex(), vue()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))

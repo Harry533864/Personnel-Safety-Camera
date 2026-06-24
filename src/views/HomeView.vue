@@ -120,7 +120,11 @@
 
         </div>
 
-        <div class="status-indicator fps-indicator" :class="currentFpsClass">
+        <div
+          class="status-indicator fps-indicator"
+          :class="currentFpsClass"
+          title="后端相机实际采集帧率"
+        >
           <span class="status-dot"></span>
           <span class="status-text">{{ currentFps || '-- fps' }}</span>
         </div>
@@ -141,13 +145,18 @@
     <div class="camera-view-area">
       <div class="video-container" ref="videoContainer">
         <video
-          v-show="videoLoaded"
+          v-show="videoLoaded && !mjpegMode"
           ref="videoPlayer"
           class="video-player"
           autoplay
           muted
           playsinline
         ></video>
+        <canvas
+          v-show="videoLoaded && mjpegMode"
+          ref="mjpegCanvas"
+          class="video-player mjpeg-player"
+        ></canvas>
         <canvas
           v-show="videoLoaded"
           ref="videoOverlay"
@@ -203,8 +212,11 @@ import {
 
 const router = useRouter();
 const videoPlayer = ref(null);
+const mjpegCanvas = ref(null);
 const videoOverlay = ref(null);
 const videoLoaded = ref(false);
+const mjpegMode = ref(false);
+const mjpegToken = ref(Date.now());
 const videoResolution = ref("");
 const currentFps = ref("");
 const currentFpsValue = ref(0);
@@ -216,6 +228,7 @@ const networkStatus = ref("normal");
 const errorMessage = ref("");
 
 const JETSON_ENDPOINT_STORAGE_KEY = "jetson_runtime_endpoint";
+const PREFERRED_JETSON_HOST = "192.168.1.180";
 
 const getStoredJetsonEndpoint = () => {
   try {
@@ -235,6 +248,14 @@ const normalizeBaseUrl = (url, fallbackPort) => {
   }
 };
 
+const getHostFromBaseUrl = (url) => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+};
+
 const makeEndpoint = (host) => ({
   host,
   label: host === "192.168.55.1" ? "USB TCP" : "LAN TCP",
@@ -242,14 +263,28 @@ const makeEndpoint = (host) => ({
   stream: `http://${host}:8889`,
 });
 
+const configuredApiBaseUrl = normalizeBaseUrl(import.meta.env.VITE_FLASK_BACKEND_URL, "5000");
+const configuredStreamBaseUrl = normalizeBaseUrl(import.meta.env.VITE_VIDEO_STREAM_URL, "8889");
+const configuredJetsonHost = getHostFromBaseUrl(configuredApiBaseUrl);
 const storedEndpoint = getStoredJetsonEndpoint();
-const storedLanEndpoint = storedEndpoint?.host === "10.10.10.2" ? storedEndpoint : null;
-const apiBaseUrl = ref(
-  storedLanEndpoint?.api || normalizeBaseUrl(import.meta.env.VITE_FLASK_BACKEND_URL, "5000")
-);
+const storedEndpointHost = storedEndpoint?.host || getHostFromBaseUrl(storedEndpoint?.api);
+const storedLanEndpoint = storedEndpointHost && !configuredJetsonHost ? storedEndpoint : null;
+const apiBaseUrl = ref(storedLanEndpoint?.api || configuredApiBaseUrl);
 const streamBaseUrl = ref(
-  storedLanEndpoint?.stream || normalizeBaseUrl(import.meta.env.VITE_VIDEO_STREAM_URL, "8889")
+  storedLanEndpoint?.stream || configuredStreamBaseUrl
 );
+const mjpegPreviewUrl = computed(() => {
+  if (!apiBaseUrl.value) return "";
+  const params = new URLSearchParams({
+    target: "high",
+    fps: "30",
+    quality: "65",
+    max_width: "1280",
+    overlay: "0",
+    t: String(mjpegToken.value),
+  });
+  return `${apiBaseUrl.value}/api/stream/mjpeg?${params.toString()}`;
+});
 const discoveredJetsons = ref([]);
 const isScanningJetson = ref(false);
 const showJetsonResults = ref(false);
@@ -280,12 +315,18 @@ let timeInterval = null;
 let speedInterval = null;
 let runtimeStatusInterval = null;
 let videoFrameCallbackId = null;
-let fpsFallbackInterval = null;
 let firstFrameTimer = null;
-let fpsSample = { frames: 0, time: 0 };
+let backendFpsSample = { frames: 0, time: 0, signature: "" };
 let overlayFetchTimer = null;
 let overlayDrawFrame = null;
 let overlaySamples = [];
+let activeStreamSignature = "";
+let mjpegLastRefreshAt = 0;
+let mjpegAbortController = null;
+let mjpegStreamToken = 0;
+let mjpegDecodeBusy = false;
+let mjpegPendingFrame = null;
+const MJPEG_REFRESH_MIN_INTERVAL = 1200;
 const overlayState = ref({
   rois: [],
   overlay: {
@@ -370,7 +411,7 @@ const loadFromSaveState = (saveState, curState) => {
 const formatFps = (value) => {
   const fps = Number(value);
   if (!Number.isFinite(fps) || fps <= 0) return "";
-  return `${Math.round(fps)} fps`;
+  return `${fps.toFixed(1)} fps`;
 };
 
 const setCurrentFps = (value) => {
@@ -378,6 +419,56 @@ const setCurrentFps = (value) => {
   if (!Number.isFinite(fps) || fps <= 0) return;
   currentFpsValue.value = fps;
   currentFps.value = formatFps(fps);
+};
+
+const resetBackendFpsSample = () => {
+  backendFpsSample = { frames: 0, time: 0, signature: "" };
+  currentFps.value = "";
+  currentFpsValue.value = 0;
+};
+
+const updateBackendStreamFps = (camera, stream, signature = "") => {
+  const actualCaptureFps = Number(camera?.actual_capture_fps);
+  if (Number.isFinite(actualCaptureFps) && actualCaptureFps > 0) {
+    setCurrentFps(actualCaptureFps);
+    backendFpsSample.signature = signature || backendFpsSample.signature;
+    return;
+  }
+
+  const actualReceiveFps = Number(stream?.actual_receive_fps);
+  if (Number.isFinite(actualReceiveFps) && actualReceiveFps > 0) {
+    setCurrentFps(actualReceiveFps);
+    backendFpsSample.signature = signature || backendFpsSample.signature;
+    return;
+  }
+
+  const actualWriteFps = Number(stream?.actual_write_fps);
+  if (Number.isFinite(actualWriteFps) && actualWriteFps > 0) {
+    setCurrentFps(actualWriteFps);
+    backendFpsSample.signature = signature || backendFpsSample.signature;
+    return;
+  }
+
+  const frames = Number(stream?.frames_written ?? stream?.frames_received ?? 0);
+  const now = performance.now();
+  if (!Number.isFinite(frames) || frames <= 0) return;
+
+  if (signature && backendFpsSample.signature && signature !== backendFpsSample.signature) {
+    backendFpsSample = { frames, time: now, signature };
+    currentFps.value = "";
+    currentFpsValue.value = 0;
+    return;
+  }
+
+  if (backendFpsSample.frames > 0 && now > backendFpsSample.time) {
+    const deltaFrames = frames - backendFpsSample.frames;
+    const deltaTime = (now - backendFpsSample.time) / 1000;
+    if (deltaFrames >= 0 && deltaTime >= 1) {
+      setCurrentFps(deltaFrames / deltaTime);
+    }
+  }
+
+  backendFpsSample = { frames, time: now, signature };
 };
 
 const setCurrentLatency = (metadata) => {
@@ -392,6 +483,37 @@ const setCurrentLatency = (metadata) => {
   currentLatency.value = `${Math.round(latencyMs)} ms`;
 };
 
+const setMeasuredLatency = (latencyMs) => {
+  const latency = Number(latencyMs);
+  if (!Number.isFinite(latency) || latency < 0 || latency > 10000) return;
+  currentLatencyMs.value = latency;
+  currentLatency.value = `${Math.round(latency)} ms`;
+};
+
+const formatResolution = (source) => {
+  const width = Number(source?.width);
+  const height = Number(source?.height);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return "";
+  }
+  return `${Math.round(width)}x${Math.round(height)}`;
+};
+
+const updateRuntimeResolution = (camera, fallbackStream = null) => {
+  const resolution = formatResolution(camera) || formatResolution(fallbackStream);
+  if (resolution) {
+    videoResolution.value = resolution;
+  }
+};
+
+const getStreamSignature = (stream, camera = null) => {
+  const width = Number(stream?.width || camera?.width || 0);
+  const height = Number(stream?.height || camera?.height || 0);
+  const fps = Number(stream?.fps || camera?.fps || 0);
+  if (!width || !height) return "";
+  return `${width}x${height}@${fps || ""}`;
+};
+
 const currentFpsClass = computed(() => ({
   danger: currentFpsValue.value > 0 && currentFpsValue.value < 10,
 }));
@@ -400,6 +522,231 @@ const currentLatencyClass = computed(() => ({
   normal: currentLatencyMs.value > 250 && currentLatencyMs.value <= 500,
   poor: currentLatencyMs.value > 500,
 }));
+
+const shouldUseMjpegPreview = (streamStatus, camera = null) => {
+  if (!streamStatus?.has_stream_frame) return false;
+  const width = Number(camera?.width || streamStatus?.width || 0);
+  const height = Number(camera?.height || streamStatus?.height || 0);
+  const encoder = String(streamStatus?.publisher_encoder || "").toLowerCase();
+  return encoder === "x264enc" || width * height > 1920 * 1080;
+};
+
+const stopMjpegCanvasStream = () => {
+  mjpegStreamToken += 1;
+  if (mjpegAbortController) {
+    mjpegAbortController.abort();
+    mjpegAbortController = null;
+  }
+  mjpegDecodeBusy = false;
+  mjpegPendingFrame = null;
+};
+
+const decodeJpegFrame = async (frameBytes) => {
+  const blob = new Blob([frameBytes], { type: "image/jpeg" });
+  if (typeof createImageBitmap === "function") {
+    return createImageBitmap(blob);
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("MJPEG frame decode failed"));
+    };
+    image.src = url;
+  });
+};
+
+const drawMjpegFrame = async (framePayload, token) => {
+  if (mjpegDecodeBusy) {
+    mjpegPendingFrame = framePayload;
+    return;
+  }
+
+  mjpegDecodeBusy = true;
+  let nextFrame = framePayload;
+
+  try {
+    while (nextFrame && token === mjpegStreamToken && mjpegMode.value) {
+      const frame = nextFrame;
+      const bitmap = await decodeJpegFrame(frame.bytes);
+      nextFrame = null;
+
+      if (token !== mjpegStreamToken || !mjpegMode.value) {
+        if (typeof bitmap.close === "function") bitmap.close();
+        break;
+      }
+
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+
+      const canvas = mjpegCanvas.value;
+      const ctx = canvas?.getContext("2d");
+      if (canvas && ctx) {
+        const width = bitmap.width || bitmap.naturalWidth;
+        const height = bitmap.height || bitmap.naturalHeight;
+        if (width && height) {
+          if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+          }
+          ctx.drawImage(bitmap, 0, 0, width, height);
+          if (!videoLoaded.value) {
+            videoLoaded.value = true;
+            startDetectionOverlay();
+          }
+          errorMessage.value = "";
+          if (Number.isFinite(frame.serverAgeMs)) {
+            setMeasuredLatency(frame.serverAgeMs + performance.now() - frame.receivedAt);
+          }
+        }
+      }
+
+      if (typeof bitmap.close === "function") bitmap.close();
+
+      if (mjpegPendingFrame) {
+        nextFrame = mjpegPendingFrame;
+        mjpegPendingFrame = null;
+      }
+    }
+  } catch {
+    if (token === mjpegStreamToken && mjpegMode.value) {
+      handleMjpegError();
+    }
+  } finally {
+    mjpegDecodeBusy = false;
+  }
+};
+
+const appendBytes = (left, right) => {
+  if (!left.length) return right;
+  const merged = new Uint8Array(left.length + right.length);
+  merged.set(left);
+  merged.set(right, left.length);
+  return merged;
+};
+
+const findHeaderEnd = (buffer) => {
+  for (let i = 0; i < buffer.length - 3; i += 1) {
+    if (
+      buffer[i] === 13 &&
+      buffer[i + 1] === 10 &&
+      buffer[i + 2] === 13 &&
+      buffer[i + 3] === 10
+    ) {
+      return i;
+    }
+  }
+  return -1;
+};
+
+const startMjpegCanvasStream = async () => {
+  if (!apiBaseUrl.value || !mjpegMode.value) return;
+
+  stopMjpegCanvasStream();
+  const token = mjpegStreamToken;
+  const controller = new AbortController();
+  mjpegAbortController = controller;
+
+  try {
+    const response = await fetch(mjpegPreviewUrl.value, {
+      method: "GET",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`MJPEG stream failed: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("ascii");
+    let buffer = new Uint8Array(0);
+
+    while (token === mjpegStreamToken && mjpegMode.value) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer = appendBytes(buffer, value);
+
+      while (token === mjpegStreamToken && mjpegMode.value) {
+        const headerEnd = findHeaderEnd(buffer);
+        if (headerEnd < 0) break;
+
+        const header = decoder.decode(buffer.slice(0, headerEnd));
+        const match = header.match(/Content-Length:\s*(\d+)/i);
+        if (!match) {
+          buffer = buffer.slice(headerEnd + 4);
+          continue;
+        }
+
+        const frameLength = Number(match[1]);
+        const frameStart = headerEnd + 4;
+        const frameEnd = frameStart + frameLength;
+        if (buffer.length < frameEnd) break;
+
+        const frameBytes = buffer.slice(frameStart, frameEnd);
+        buffer = buffer.slice(frameEnd);
+        const ageMatch = header.match(/X-Frame-Age-Ms:\s*([\d.]+)/i);
+        drawMjpegFrame({
+          bytes: frameBytes,
+          serverAgeMs: ageMatch ? Number(ageMatch[1]) : NaN,
+          receivedAt: performance.now(),
+        }, token);
+      }
+
+      if (buffer.length > 1024 * 1024 * 4) {
+        buffer = new Uint8Array(0);
+      }
+    }
+  } catch (error) {
+    if (error?.name !== "AbortError" && token === mjpegStreamToken && mjpegMode.value) {
+      handleMjpegError();
+    }
+  }
+};
+
+const refreshMjpegPreview = (force = false, showLoading = false) => {
+  if (!apiBaseUrl.value || !mjpegMode.value) return;
+  const now = Date.now();
+  if (showLoading) {
+    videoLoaded.value = false;
+    errorMessage.value = "棰勮鍒囨崲涓?..";
+  }
+  if (!force && now - mjpegLastRefreshAt < MJPEG_REFRESH_MIN_INTERVAL) return;
+  mjpegLastRefreshAt = now;
+  mjpegToken.value = now;
+  startMjpegCanvasStream();
+};
+
+const startMjpegPreview = () => {
+  if (!apiBaseUrl.value || mjpegMode.value) return;
+  closeWebRTC();
+  mjpegMode.value = true;
+  mjpegLastRefreshAt = Date.now();
+  mjpegToken.value = mjpegLastRefreshAt;
+  videoLoaded.value = false;
+  errorMessage.value = "棰勮杩炴帴涓?..";
+  startMjpegCanvasStream();
+};
+
+const stopMjpegPreview = () => {
+  stopMjpegCanvasStream();
+  mjpegMode.value = false;
+  mjpegLastRefreshAt = 0;
+};
+
+const handleMjpegError = () => {
+  if (!mjpegMode.value) return;
+  videoLoaded.value = false;
+  errorMessage.value = "棰勮杩炴帴澶辫触锛屾鍦ㄩ噸杩?..";
+  setTimeout(() => {
+    if (!mjpegMode.value) return;
+    refreshMjpegPreview(true, true);
+  }, 1000);
+};
 
 const getHostFromUrl = (url) => {
   try {
@@ -417,12 +764,17 @@ const buildJetsonCandidates = () => {
 
   addHost(getHostFromUrl(apiBaseUrl.value));
   addHost(getHostFromUrl(import.meta.env.VITE_FLASK_BACKEND_URL));
-  addHost("10.10.10.2");
+  addHost(PREFERRED_JETSON_HOST);
+  addHost("192.168.18.100");
 
   const pageHost = window.location.hostname;
-  if (pageHost.startsWith("10.10.10.")) addHost(pageHost);
+  if (
+    pageHost.startsWith("192.168.18.") ||
+    pageHost.startsWith("192.168.1.") ||
+    pageHost.startsWith("10.10.10.")
+  ) addHost(pageHost);
 
-  const subnetPrefixes = new Set(["10.10.10"]);
+  const subnetPrefixes = new Set(["192.168.18", "192.168.1"]);
   const pageMatch = pageHost.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/);
   if (pageMatch) subnetPrefixes.add(pageMatch[1]);
 
@@ -467,6 +819,7 @@ const applyJetsonEndpoint = async (device, reconnectNow = true) => {
   streamBaseUrl.value = device.stream;
   activeJetsonOnline.value = true;
   showJetsonResults.value = false;
+  resetBackendFpsSample();
 
   localStorage.setItem(
     JETSON_ENDPOINT_STORAGE_KEY,
@@ -478,10 +831,8 @@ const applyJetsonEndpoint = async (device, reconnectNow = true) => {
     })
   );
 
-  const source = device.streamStatus || device.camera;
-  if (source?.width && source?.height) {
-    videoResolution.value = `${source.width}x${source.height}`;
-  }
+  updateRuntimeResolution(device.camera, device.streamStatus);
+  activeStreamSignature = getStreamSignature(device.streamStatus, device.camera);
 
   if (reconnectNow) {
     reconnectAttempts = 0;
@@ -518,7 +869,8 @@ const scanJetsons = async () => {
 
   if (found.length) {
     const preferred =
-      found.find((item) => item.host === "10.10.10.2") ||
+      found.find((item) => item.host === PREFERRED_JETSON_HOST) ||
+      found.find((item) => item.host === "192.168.18.100") ||
       found.find((item) => item.host === getHostFromUrl(apiBaseUrl.value)) ||
       found[0];
     await applyJetsonEndpoint(preferred, !videoLoaded.value);
@@ -538,7 +890,8 @@ const connectPreferredDevice = async () => {
     }
   };
 
-  addCandidate(makeEndpoint("10.10.10.2"));
+  addCandidate(makeEndpoint(PREFERRED_JETSON_HOST));
+  addCandidate(makeEndpoint("192.168.18.100"));
   addCandidate(makeEndpoint(getHostFromUrl(import.meta.env.VITE_FLASK_BACKEND_URL)));
   addCandidate(makeEndpoint(getHostFromUrl(apiBaseUrl.value)));
 
@@ -571,14 +924,41 @@ const syncRuntimeStreamStatus = async () => {
 
     const highStream = (payload.data?.streams || []).find((stream) => stream.name === "cam_high");
     const camera = payload.data?.camera;
-    const source = highStream || camera;
-    if (!source) return;
+    updateRuntimeResolution(camera, highStream);
 
-    if (source.width && source.height) {
-      videoResolution.value = `${source.width}x${source.height}`;
+    const nextSignature = getStreamSignature(highStream, camera);
+    updateBackendStreamFps(camera, highStream, nextSignature);
+    const useMjpegPreview = shouldUseMjpegPreview(highStream, camera);
+
+    if (useMjpegPreview) {
+      if (!mjpegMode.value) {
+        startMjpegPreview();
+      } else if (!videoLoaded.value) {
+        refreshMjpegPreview(false, true);
+      }
+    } else if (mjpegMode.value) {
+      stopMjpegPreview();
+      reconnectAttempts = 0;
+      scheduleReconnect();
+      return;
+    }
+    if (nextSignature && activeStreamSignature && nextSignature !== activeStreamSignature) {
+      activeStreamSignature = nextSignature;
+      if (mjpegMode.value) {
+        reconnectAttempts = 0;
+        refreshMjpegPreview(true, true);
+        return;
+      }
+      errorMessage.value = "视频参数已变化，正在重新连接...";
+      reconnectAttempts = 0;
+      scheduleReconnect();
+      return;
+    }
+    if (nextSignature && !activeStreamSignature) {
+      activeStreamSignature = nextSignature;
     }
 
-    if (!videoLoaded.value && !isConnecting && !reconnectTimer) {
+    if (!videoLoaded.value && !mjpegMode.value && !isConnecting && !reconnectTimer) {
       reconnectAttempts = Math.min(reconnectAttempts, 3);
       scheduleReconnect();
     }
@@ -595,44 +975,12 @@ const startFpsMonitor = () => {
 
   stopFpsMonitor();
 
-  fpsSample = { frames: 0, time: 0 };
-
   if (typeof video.requestVideoFrameCallback !== "function") {
-    fpsFallbackInterval = setInterval(() => {
-      if (typeof video.getVideoPlaybackQuality !== "function") return;
-
-      const quality = video.getVideoPlaybackQuality();
-      const frames = Number(quality.totalVideoFrames || 0);
-      const time = performance.now();
-
-      if (fpsSample.frames > 0 && time > fpsSample.time) {
-        const deltaFrames = frames - fpsSample.frames;
-        const deltaTime = (time - fpsSample.time) / 1000;
-        if (deltaFrames >= 0 && deltaTime > 0) {
-          setCurrentFps(deltaFrames / deltaTime);
-        }
-      }
-
-      fpsSample = { frames, time };
-    }, 1000);
     return;
   }
 
   const update = (_now, metadata) => {
-    const frames = Number(metadata.presentedFrames || 0);
-    const time = performance.now();
     setCurrentLatency(metadata);
-
-    if (fpsSample.frames && time > fpsSample.time) {
-      const deltaFrames = frames - fpsSample.frames;
-      const deltaTime = (time - fpsSample.time) / 1000;
-      if (deltaTime >= 0.8 && deltaFrames > 0) {
-        setCurrentFps(deltaFrames / deltaTime);
-        fpsSample = { frames, time };
-      }
-    } else {
-      fpsSample = { frames, time };
-    }
 
     videoFrameCallbackId = video.requestVideoFrameCallback(update);
   };
@@ -650,16 +998,15 @@ const stopFpsMonitor = () => {
     video.cancelVideoFrameCallback(videoFrameCallbackId);
   }
   videoFrameCallbackId = null;
-  if (fpsFallbackInterval) {
-    clearInterval(fpsFallbackInterval);
-    fpsFallbackInterval = null;
-  }
-  fpsSample = { frames: 0, time: 0 };
   currentLatency.value = "";
   currentLatencyMs.value = 0;
 };
 
-const roiColors = ["#f97316", "#22c55e", "#38bdf8", "#eab308", "#a855f7"];
+const ROI_STATUS_COLORS = {
+  safe: "#22c55e",
+  warning: "#f59e0b",
+  alarm: "#ef4444",
+};
 
 const sourcePointToCanvas = (point, layout) => ({
   x: layout.x + point.x * layout.scale,
@@ -668,10 +1015,11 @@ const sourcePointToCanvas = (point, layout) => ({
 
 const getOverlayLayout = (canvas, overlay) => {
   const video = videoPlayer.value;
+  const mjpeg = mjpegCanvas.value;
   const cssWidth = canvas.clientWidth || 0;
   const cssHeight = canvas.clientHeight || 0;
-  const sourceWidth = Number(overlay?.source_width || video?.videoWidth || 0);
-  const sourceHeight = Number(overlay?.source_height || video?.videoHeight || 0);
+  const sourceWidth = Number(overlay?.source_width || video?.videoWidth || mjpeg?.width || 0);
+  const sourceHeight = Number(overlay?.source_height || video?.videoHeight || mjpeg?.height || 0);
 
   if (!cssWidth || !cssHeight || !sourceWidth || !sourceHeight) return null;
 
@@ -705,16 +1053,7 @@ const getOverlayLayout = (canvas, overlay) => {
 
 const getAlignedOverlaySample = () => {
   if (!overlaySamples.length) return overlayState.value;
-  const latency = Number(currentLatencyMs.value || 350);
-  const targetTime = performance.now() - Math.min(Math.max(latency, 120), 900);
-  let selected = overlaySamples[overlaySamples.length - 1];
-  for (let index = overlaySamples.length - 1; index >= 0; index -= 1) {
-    if (overlaySamples[index].receivedAt <= targetTime) {
-      selected = overlaySamples[index];
-      break;
-    }
-  }
-  return selected.data;
+  return overlaySamples[overlaySamples.length - 1].data;
 };
 
 const roiPointToSource = (point, roi, layout) => {
@@ -725,6 +1064,25 @@ const roiPointToSource = (point, roi, layout) => {
     x: normalized ? x * layout.sourceWidth : x,
     y: normalized ? y * layout.sourceHeight : y,
   };
+};
+
+const getRoiZoneState = (roi, overlay) => {
+  const roiId = String(roi?.roi_id || roi?.id || "");
+  const zones = Array.isArray(overlay?.zone_summary) ? overlay.zone_summary : [];
+  return zones.find((zone) => String(zone?.roi_id || "") === roiId) || null;
+};
+
+const getRoiOverlayColor = (roi, overlay) => {
+  if (roi?.display_color) return roi.display_color;
+
+  const zone = getRoiZoneState(roi, overlay);
+  if (zone?.display_color) return zone.display_color;
+  if (Number(zone?.warning_count || 0) > 0) return ROI_STATUS_COLORS.warning;
+  if (Number(zone?.person_count || 0) <= 0) return ROI_STATUS_COLORS.safe;
+
+  const roiType = zone?.roi_type || roi?.roi_type;
+  if (roiType === "warning_zone") return ROI_STATUS_COLORS.warning;
+  return ROI_STATUS_COLORS.alarm;
 };
 
 const drawOverlayPolygon = (ctx, points, color, label = "") => {
@@ -764,6 +1122,9 @@ const drawDetectionBox = (ctx, detection, layout) => {
   const riskHit = Array.isArray(detection.roi_hits)
     ? detection.roi_hits.find((hit) => ["warning_zone", "forbidden_zone"].includes(hit?.roi_type))
     : null;
+  const riskContact = Array.isArray(detection.roi_contacts)
+    ? detection.roi_contacts.find((hit) => ["warning_zone", "forbidden_zone"].includes(hit?.roi_type))
+    : null;
   const color = "#2563eb";
   const className = detection.class_name || `class_${detection.class_id ?? 0}`;
   const confidence = Number(detection.confidence || 0);
@@ -781,13 +1142,13 @@ const drawDetectionBox = (ctx, detection, layout) => {
   ctx.fillStyle = "#ffffff";
   ctx.fillText(label, p0.x + 7, labelY + 15);
 
-  if (riskHit) {
-    const warningText = "WARNING";
+  if (riskHit || riskContact) {
+    const warningText = riskHit ? "ALARM" : "WARNING";
     ctx.font = "800 15px Arial";
     const warningWidth = ctx.measureText(warningText).width + 16;
     const warningX = Math.max(4, p0.x);
     const warningY = Math.max(4, p0.y - 50);
-    ctx.fillStyle = "#ef4444";
+    ctx.fillStyle = riskHit ? "#ef4444" : "#f59e0b";
     ctx.fillRect(warningX, warningY, warningWidth, 26);
     ctx.fillStyle = "#ffffff";
     ctx.fillText(warningText, warningX + 8, warningY + 18);
@@ -823,7 +1184,7 @@ const drawDetectionOverlay = () => {
         roiPointToSource(point, roi, layout),
         layout
       ));
-      drawOverlayPolygon(ctx, points, roiColors[index % roiColors.length], roi.name || `ROI${index + 1}`);
+      drawOverlayPolygon(ctx, points, getRoiOverlayColor(roi, overlay), roi.name || `ROI${index + 1}`);
     });
 
   const detections = Array.isArray(overlay.detections) ? overlay.detections : [];
@@ -843,7 +1204,7 @@ const fetchDetectionOverlay = async () => {
     const data = payload.data || {};
     overlayState.value = data;
     overlaySamples.push({ receivedAt: performance.now(), data });
-    overlaySamples = overlaySamples.slice(-40);
+    overlaySamples = overlaySamples.slice(-8);
   } catch {
     // Keep the last overlay sample during brief backend reconnects.
   }
@@ -853,7 +1214,7 @@ const startDetectionOverlay = () => {
   stopDetectionOverlay();
   overlaySamples = [];
   fetchDetectionOverlay();
-  overlayFetchTimer = setInterval(fetchDetectionOverlay, 120);
+  overlayFetchTimer = setInterval(fetchDetectionOverlay, 60);
   overlayDrawFrame = requestAnimationFrame(drawDetectionOverlay);
 };
 
@@ -948,6 +1309,7 @@ const handleConnectionFailed = () => {
 // ---------- WebRTC 初始化 ----------
 const initWebRTC = async () => {
   if (!videoPlayer.value) return;
+  stopMjpegPreview();
   // 先关闭可能存在的旧连接
   closeWebRTC();
 
@@ -967,8 +1329,6 @@ const initWebRTC = async () => {
         const video = videoPlayer.value;
         video.srcObject = stream;
         errorMessage.value = "等待视频画面...";
-        currentFps.value = "";
-        currentFpsValue.value = 0;
         currentLatency.value = "";
         currentLatencyMs.value = 0;
 
@@ -984,9 +1344,6 @@ const initWebRTC = async () => {
         };
 
         video.onloadedmetadata = () => {
-          if (video.videoWidth && video.videoHeight) {
-            videoResolution.value = `${video.videoWidth}x${video.videoHeight}`;
-          }
           video.play().catch(() => {});
         };
         video.onplaying = markVideoReady;
@@ -1000,15 +1357,6 @@ const initWebRTC = async () => {
 
         video.play().catch(() => {});
 
-        // 监听分辨率变化（当视频元数据加载后）
-        event.track.onunmute = () => {
-          setTimeout(() => {
-            const settings = event.track.getSettings();
-            if (settings.width && settings.height) {
-              videoResolution.value = `${settings.width}x${settings.height}`;
-            }
-          }, 500);
-        };
       }
     };
 
@@ -1080,6 +1428,10 @@ const manualReconnect = () => {
   // 重置重试计数，立即重连
   reconnectAttempts = 0;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (mjpegMode.value) {
+    refreshMjpegPreview(true, true);
+    return;
+  }
   reconnect();
 };
 
@@ -1103,8 +1455,10 @@ onMounted(async () => {
   loadFromSaveState(saveExceptionOutputState, exceptionOutputState);
 
   await connectPreferredDevice();
-  reconnect();
-  syncRuntimeStreamStatus();
+  await syncRuntimeStreamStatus();
+  if (!mjpegMode.value) {
+    reconnect();
+  }
   runtimeStatusInterval = setInterval(syncRuntimeStreamStatus, 3000);
 
   // 尝试获取设置的分辨率值
@@ -1119,6 +1473,7 @@ onUnmounted(() => {
   clearInterval(speedInterval);
   if (runtimeStatusInterval) clearInterval(runtimeStatusInterval);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  stopMjpegPreview();
   closeWebRTC();
 });
 </script>
@@ -1462,6 +1817,10 @@ onUnmounted(() => {
   height: 100%;
   object-fit: contain;
   background: transparent;
+}
+
+.mjpeg-player {
+  image-rendering: auto;
 }
 
 .video-overlay {

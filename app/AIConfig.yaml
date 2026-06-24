@@ -8,7 +8,7 @@ model:
   camera_id: cam_demo_001
   detect_enable: true
   infer_target: all
-  model_name: Asva_person_v0518
+  model_name: yolo11n_person
   imgsz: 640
   conf_thres: 0.5
   iou_thres: 0.1
@@ -43,11 +43,37 @@ test:
   show: false
   save_path: ../outputs/python_tensorrt_result.jpg
 model_names:
-- Asva_person_v0518
+- yolo11n_person
 exception_output:
   gpio:
   - 7
   output_level: 1
   duration: 0
+  serial:
+    enabled: true
+    type: ysl301
+    port: /dev/ttyUSB0
+    baudrate: 9600
+    address: 1
+    alarm:
+      red: 'on'
+      yellow: 'off'
+      green: 'off'
+      buzzer: 'on'
+    warning:
+      red: 'off'
+      yellow: 'on'
+      green: 'off'
+      buzzer: 'off'
+    safe:
+      red: 'off'
+      yellow: 'off'
+      green: 'on'
+      buzzer: 'off'
+    idle:
+      red: 'off'
+      yellow: 'off'
+      green: 'off'
+      buzzer: 'off'
 record:
   duration_min: 1.0

@@ -9,7 +9,14 @@ from typing import Any
 
 from app.Cam.CamManager import CamManager
 from app.Cam.CamStream import CamStream
-from app.runtime_paths import AI_CONFIG_PATH, MODEL_FILE_PATH, VIDEO_BASE_PATH
+from app.camera_modes import normalize_camera_mode, sample_stream_fps
+from app.runtime_paths import (
+    AI_CONFIG_PATH,
+    CAMERA_CONFIG_PATH,
+    MODEL_FILE_PATH,
+    VIDEO_BASE_PATH,
+)
+from app.services.camera_config_service import camera_config_service
 from app.services.config_service import ai_config_service
 from app.utils import should_enable_stream_ai, to_bool
 
@@ -86,6 +93,49 @@ else:
     ORI_HEIGHT = _source_env_int("CAMERA_HEIGHT", "usb", 1080)
     ORI_FPS = _source_env_int("CAMERA_FPS", "usb", 60)
 
+if CAMERA_SOURCE == "usb":
+    _initial_mode = normalize_camera_mode(ORI_WIDTH, ORI_HEIGHT, ORI_FPS)
+    ORI_WIDTH = _initial_mode["width"]
+    ORI_HEIGHT = _initial_mode["height"]
+    ORI_FPS = _initial_mode["fps"]
+
+ENV_CAMERA_DEFAULTS = {
+    "width": ORI_WIDTH,
+    "height": ORI_HEIGHT,
+    "fps": ORI_FPS,
+    "exposure": int(os.environ.get("CAMERA_EXPOSURE", "0") or 0),
+    "gain": int(os.environ.get("CAMERA_GAIN", "0") or 0),
+    "white_balance": os.environ.get("CAMERA_WHITE_BALANCE", "continuous"),
+    "power_line_frequency": os.environ.get("CAMERA_POWER_LINE_FREQUENCY", "1"),
+    "target": "high",
+}
+
+try:
+    STARTUP_CAMERA_CONFIG = camera_config_service.read(defaults=ENV_CAMERA_DEFAULTS)
+except Exception:
+    logger.exception(
+        "Failed to read camera config from %s; using environment defaults",
+        CAMERA_CONFIG_PATH,
+    )
+    STARTUP_CAMERA_CONFIG = camera_config_service.write(ENV_CAMERA_DEFAULTS)
+
+ORI_WIDTH = int(STARTUP_CAMERA_CONFIG["width"])
+ORI_HEIGHT = int(STARTUP_CAMERA_CONFIG["height"])
+ORI_FPS = int(STARTUP_CAMERA_CONFIG["fps"])
+
+logger.info(
+    "Camera startup config path=%s width=%s height=%s fps=%s exposure=%s gain=%s "
+    "white_balance=%s power_line_frequency=%s",
+    CAMERA_CONFIG_PATH,
+    STARTUP_CAMERA_CONFIG["width"],
+    STARTUP_CAMERA_CONFIG["height"],
+    STARTUP_CAMERA_CONFIG["fps"],
+    STARTUP_CAMERA_CONFIG["exposure"],
+    STARTUP_CAMERA_CONFIG["gain"],
+    STARTUP_CAMERA_CONFIG["white_balance"],
+    STARTUP_CAMERA_CONFIG["power_line_frequency"],
+)
+
 CSI_SENSOR_ID = _env_int("CSI_SENSOR_ID", 0)
 CSI_FLIP_METHOD = _env_int("CSI_FLIP_METHOD", 0)
 CSI_DIRECT_STREAM = to_bool(os.environ.get("CSI_DIRECT_STREAM", "0"))
@@ -102,7 +152,31 @@ STREAM_HIGH_RECORD = to_bool(
         "0" if CAMERA_SOURCE == "csi" and CSI_DIRECT_STREAM else "1",
     )
 )
+STREAM_HIGH_WIDTH = _env_int("STREAM_HIGH_WIDTH", ORI_WIDTH)
+STREAM_HIGH_HEIGHT = _env_int("STREAM_HIGH_HEIGHT", ORI_HEIGHT)
+STREAM_HIGH_FPS = _env_int("STREAM_HIGH_FPS", ORI_FPS)
+if CAMERA_SOURCE == "usb":
+    _stream_high_mode = normalize_camera_mode(
+        STREAM_HIGH_WIDTH,
+        STREAM_HIGH_HEIGHT,
+        STREAM_HIGH_FPS,
+    )
+    STREAM_HIGH_WIDTH = _stream_high_mode["width"]
+    STREAM_HIGH_HEIGHT = _stream_high_mode["height"]
+    STREAM_HIGH_FPS = _stream_high_mode["fps"]
+    _stream_high_preview_mode = sample_stream_fps(
+        STREAM_HIGH_WIDTH,
+        STREAM_HIGH_HEIGHT,
+        STREAM_HIGH_FPS,
+    )
+    STREAM_HIGH_WIDTH = _stream_high_preview_mode["width"]
+    STREAM_HIGH_HEIGHT = _stream_high_preview_mode["height"]
+    STREAM_HIGH_FPS = _stream_high_preview_mode["fps"]
 CAMERA_FOURCC = _source_env("CAMERA_FOURCC", CAMERA_SOURCE) or "MJPG"
+USB_CAMERA_DECODER = os.environ.get(
+    "USB_CAMERA_DECODER",
+    os.environ.get("CAMERA_DECODER", "auto"),
+)
 
 cam_manager = CamManager(
     camera_id=_camera_id(),
@@ -118,16 +192,21 @@ cam_manager = CamManager(
     height=ORI_HEIGHT,
     fps=ORI_FPS,
     fourcc=CAMERA_FOURCC,
+    usb_decoder=USB_CAMERA_DECODER,
 )
+cam_manager.set_exposure(int(STARTUP_CAMERA_CONFIG["exposure"]))
+cam_manager.set_gain(int(STARTUP_CAMERA_CONFIG["gain"]))
+cam_manager.set_white_balance(STARTUP_CAMERA_CONFIG["white_balance"])
+cam_manager.set_power_line_frequency(STARTUP_CAMERA_CONFIG["power_line_frequency"])
 
 AI_INFER_ENABLE, AI_INFER_TARGET = _read_ai_startup_state()
 
 stream_high = CamStream(
     name="cam_high",
     url=URL_HIGH,
-    width=ORI_WIDTH,
-    height=ORI_HEIGHT,
-    fps=ORI_FPS,
+    width=STREAM_HIGH_WIDTH,
+    height=STREAM_HIGH_HEIGHT,
+    fps=STREAM_HIGH_FPS,
     enable_infer=should_enable_stream_ai("cam_high", AI_INFER_ENABLE, AI_INFER_TARGET),
     enable_publish=STREAM_HIGH_PUBLISH,
     ai_config_path=str(AI_CONFIG_PATH),
